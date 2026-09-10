@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Table of Contents Comparison — Production vs Staging</title>
+<style>
+  :root { --line: #e6e8ec; --muted: #667085; --prod: #a01515; --stage: #1a7a34; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; color: #1a1a1a; background: #f5f6f8; font-size: 13px; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 18px 22px 120px; }
+  h1 { font-size: 19px; margin: 0 0 4px; }
+  .files { color: var(--muted); font-size: 12px; margin-bottom: 14px; }
+  .files b.p { color: var(--prod); } .files b.s { color: var(--stage); }
+  .nav { margin-bottom: 14px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .nav a { font-size: 12px; text-decoration: none; color: #2d6cdf; border: 1px solid #cdddf7; border-radius: 6px; padding: 4px 10px; }
+  .nav a:hover { background: #eef4fe; }
+
+  .cards { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+  .card { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; min-width: 110px; }
+  .card .n { font-size: 22px; font-weight: 700; line-height: 1; }
+  .card .l { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; margin-top: 4px; }
+  .card.ok .n { color: var(--stage); }
+  .card.missing .n { color: var(--prod); }
+  .card.extra .n { color: #7a4a00; }
+  .card.changed .n { color: #b06f00; }
+
+  .toggle { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; margin-bottom: 12px; }
+  .toggle button { border: 0; background: #fff; padding: 5px 12px; font-size: 12px; cursor: pointer; }
+  .toggle button.on { background: #2d6cdf; color: #fff; }
+  .filter-search { margin-left: 10px; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; font-size: 12px; min-width: 200px; }
+
+  table.toc { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  table.toc th { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); background: #fafbfc; }
+  table.toc td { padding: 7px 10px; border-bottom: 1px solid #f0f1f3; vertical-align: top; }
+  table.toc td.h { overflow-wrap: anywhere; }
+  table.toc td.num { text-align: center; white-space: nowrap; color: #3a4757; }
+  table.toc td.lvl { text-align: center; white-space: nowrap; }
+  tr.st-missing td.h { color: var(--prod); }
+  tr.st-extra td.h { color: var(--stage); }
+  tr.st-missing td { background: #fdf4f4; }
+  tr.st-extra td { background: #f3fbf5; }
+  tr.st-changed td { background: #fffaf0; }
+  .indent-2 { padding-left: 16px; } .indent-3 { padding-left: 32px; } .indent-4 { padding-left: 48px; }
+  .badge { display: inline-block; font-size: 10px; font-weight: 700; border-radius: 9px; padding: 1px 7px; white-space: nowrap; }
+  .badge.matched { background: #e7f6ec; color: #1a7a34; }
+  .badge.missing { background: #fdecec; color: #a01515; }
+  .badge.extra { background: #fde8c8; color: #7a4a00; }
+  .badge.changed { background: #fdefcf; color: #8a5a00; }
+  .lvlchg { color: var(--prod); font-weight: 700; }
+  .pgdelta { color: var(--muted); font-size: 11px; }
+  .note { font-size: 11px; color: var(--muted); }
+  .warn { background: #fff6e5; border: 1px solid #f2dca8; border-radius: 8px; padding: 10px 14px; font-size: 12px; color: #7a5a12; margin-bottom: 14px; }
+  body.diffs-only tr.st-matched { display: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Table of Contents Comparison</h1>
+  <div class="files"><b class="p">Production</b>: {{ expected_path }} &nbsp;·&nbsp; <b class="s">Staging</b>: {{ actual_path }}</div>
+  <div class="nav">
+    <a href="report.html">← Validation report</a>
+    <a href="sections.html">▤ Side-by-side by section</a>
+  </div>
+
+  {% if not toc.have_expected_toc or not toc.have_actual_toc %}
+  <div class="warn">
+    {% if not toc.have_expected_toc and not toc.have_actual_toc %}Neither PDF has an embedded table of contents (bookmarks) — nothing to compare.
+    {% elif not toc.have_expected_toc %}Production has no embedded table of contents (bookmarks). Every Staging bookmark below is shown as “Extra”.
+    {% else %}Staging has no embedded table of contents (bookmarks). Every Production bookmark below is shown as “Missing”.
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <div class="cards">
+    <div class="card"><div class="n">{{ toc.expected_headings }}</div><div class="l">Prod bookmarks</div></div>
+    <div class="card"><div class="n">{{ toc.actual_headings }}</div><div class="l">Stage bookmarks</div></div>
+    <div class="card ok"><div class="n">{{ toc.counts.matched }}</div><div class="l">Matched</div></div>
+    <div class="card missing"><div class="n">{{ toc.counts.missing }}</div><div class="l">Missing (prod only)</div></div>
+    <div class="card extra"><div class="n">{{ toc.counts.extra }}</div><div class="l">Extra (stage only)</div></div>
+    <div class="card changed"><div class="n">{{ toc.counts.level_changed }}</div><div class="l">Nesting changed</div></div>
+    <div class="card"><div class="n">{{ toc.counts.page_shifted }}</div><div class="l">Page moved</div></div>
+  </div>
+
+  <div class="toggle">
+    <button id="btn-all" class="on" onclick="setMode('all')">All bookmarks</button>
+    <button id="btn-diff" onclick="setMode('diffs')">Differences only</button>
+  </div>
+  <input class="filter-search" type="search" placeholder="Filter headings…" oninput="filterRows(this.value)">
+
+  {% if toc.rows %}
+  <table class="toc" id="toctable">
+    <thead><tr>
+      <th>Heading (bookmark)</th>
+      <th style="width:70px;text-align:center">Prod lvl</th>
+      <th style="width:70px;text-align:center">Stage lvl</th>
+      <th style="width:70px;text-align:center">Prod pg</th>
+      <th style="width:70px;text-align:center">Stage pg</th>
+      <th style="width:90px">Status</th>
+      <th style="width:230px">What changed</th>
+    </tr></thead>
+    <tbody>
+    {% for r in toc.rows %}
+      <tr class="st-{{ r.status|lower }}" data-heading="{{ r.heading|lower }}">
+        {% set lvl = r.expected_level or r.actual_level or 1 %}
+        <td class="h indent-{{ lvl if lvl <= 4 else 4 }}">{{ r.heading }}</td>
+        <td class="lvl">{{ r.expected_level if r.expected_level is not none else '—' }}</td>
+        <td class="lvl">
+          {%- if r.level_changed -%}<span class="lvlchg">{{ r.actual_level }}</span>
+          {%- elif r.actual_level is not none -%}{{ r.actual_level }}
+          {%- else -%}—{%- endif -%}
+        </td>
+        <td class="num">{{ r.expected_page if r.expected_page is not none else '—' }}</td>
+        <td class="num">{{ r.actual_page if r.actual_page is not none else '—' }}</td>
+        <td><span class="badge {{ r.status|lower }}">{{ r.status }}</span></td>
+        <td class="note">
+          {{ r.note }}
+          {%- if r.page_delta and not r.level_changed %} <span class="pgdelta">({{ '%+d'|format(r.page_delta) }} pages)</span>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="warn">No bookmarks to compare.</div>
+  {% endif %}
+</div>
+
+<script>
+  function setMode(m) {
+    document.body.classList.toggle('diffs-only', m === 'diffs');
+    document.getElementById('btn-all').classList.toggle('on', m === 'all');
+    document.getElementById('btn-diff').classList.toggle('on', m === 'diffs');
+  }
+  function filterRows(q) {
+    q = q.trim().toLowerCase();
+    document.querySelectorAll('#toctable tbody tr').forEach(tr => {
+      tr.style.display = !q || tr.dataset.heading.includes(q) ? '' : 'none';
+    });
+  }
+</script>
+</body>
+</html>

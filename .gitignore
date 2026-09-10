@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+output/
+runs/
+*.egg-info/
+.DS_Store
+sample/*.pdf
+.playwright-mcp/
+/sec18_*.png
+/sections_sec*.png

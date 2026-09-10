@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>PDF Validation Engine</title>
+<style>
+  body { font-family: -apple-system, Arial, sans-serif; margin: 0; padding: 3rem 1rem; background: #f5f6f8; color: #1a1a1a; display: flex; justify-content: center; }
+  .card { background: #fff; border-radius: 8px; padding: 2rem; box-shadow: 0 1px 3px rgba(0,0,0,0.08); max-width: 560px; width: 100%; }
+  h1 { margin-top: 0; }
+  p.subtitle { color: #555; }
+  label { display: block; font-weight: bold; margin: 1rem 0 0.35rem; font-size: 0.9rem; }
+  input[type=file] { display: block; width: 100%; padding: 0.5rem; border: 1px dashed #bbb; border-radius: 6px; background: #fafafa; box-sizing: border-box; }
+  .advanced { margin-top: 1.25rem; }
+  .advanced summary { cursor: pointer; font-weight: bold; font-size: 0.9rem; color: #555; }
+  .row { display: flex; gap: 1rem; margin-top: 0.75rem; }
+  .row > div { flex: 1; }
+  input[type=number] { width: 100%; padding: 0.4rem; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+  button { margin-top: 1.5rem; padding: 0.7rem 1.4rem; background: #2d6cdf; color: #fff; border: none; border-radius: 6px; font-weight: bold; font-size: 0.95rem; cursor: pointer; }
+  button:hover { opacity: 0.9; }
+  .flash { background: #f8d7da; color: #721c24; padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 1rem; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>PDF Validation Engine</h1>
+    <p class="subtitle">Upload the Production and Staging PDFs to compare page, content, image and table differences.</p>
+
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        {% for m in messages %}<div class="flash">{{ m }}</div>{% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <form method="post" action="{{ url_for('compare') }}" enctype="multipart/form-data">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+      <label for="expected">Production PDF (baseline)</label>
+      <input type="file" id="expected" name="expected" accept="application/pdf,.pdf" required>
+
+      <label for="actual">Staging PDF (candidate)</label>
+      <input type="file" id="actual" name="actual" accept="application/pdf,.pdf" required>
+
+      <button type="submit">Run Comparison</button>
+    </form>
+  </div>
+</body>
+</html>

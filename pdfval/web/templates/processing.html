@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Comparing PDFs…</title>
+<style>
+  body { font-family: -apple-system, Arial, sans-serif; margin: 0; padding: 4rem 1rem; background: #f5f6f8; color: #1a1a1a; display: flex; justify-content: center; }
+  .card { background: #fff; border-radius: 8px; padding: 2rem; box-shadow: 0 1px 3px rgba(0,0,0,0.08); max-width: 560px; width: 100%; }
+  h1 { margin: 0 0 .25rem; font-size: 1.3rem; }
+  p.sub { color: #667085; margin-top: 0; font-size: .9rem; }
+  .bar { height: 14px; background: #eef1f5; border-radius: 8px; overflow: hidden; margin: 1.5rem 0 .5rem; }
+  .bar > span { display: block; height: 100%; width: 1%; background: linear-gradient(90deg,#2d6cdf,#4d89f0); transition: width .4s ease; }
+  .pct { font-weight: 700; font-size: 1.1rem; }
+  .stage { color: #344054; font-size: .9rem; margin-top: .25rem; }
+  .err { background: #f8d7da; color: #721c24; padding: .75rem 1rem; border-radius: 6px; margin-top: 1rem; font-size: .9rem; }
+  a.btn { display: inline-block; margin-top: 1.25rem; padding: .55rem 1.1rem; background: #2d6cdf; color: #fff; border-radius: 6px; text-decoration: none; font-size: .9rem; font-weight: 700; }
+  .spin { display:inline-block; width:14px; height:14px; border:2px solid #cdd7e5; border-top-color:#2d6cdf; border-radius:50%; animation:spin .8s linear infinite; vertical-align:-2px; margin-right:6px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Comparing your PDFs</h1>
+    <p class="sub">Production vs Staging — page, content, image, table, alignment and link checks.</p>
+
+    <div class="pct"><span class="spin" id="spin"></span><span id="pct">{{ status.percent or 1 }}</span>%</div>
+    <div class="bar"><span id="fill" style="width: {{ status.percent or 1 }}%"></span></div>
+    <div class="stage" id="stage">{{ status.label or 'Starting…' }}</div>
+
+    <div id="err" class="err" style="display:none"></div>
+    <a id="open" class="btn" href="#" style="display:none">Open the report →</a>
+  </div>
+
+<script>
+  const runId = {{ run_id|tojson }};
+  const fill = document.getElementById('fill');
+  const pct = document.getElementById('pct');
+  const stage = document.getElementById('stage');
+  const errBox = document.getElementById('err');
+  const openBtn = document.getElementById('open');
+  const spin = document.getElementById('spin');
+
+  async function poll() {
+    let s;
+    try {
+      s = await (await fetch(`/runs/${runId}/status`, {cache: 'no-store'})).json();
+    } catch (e) { setTimeout(poll, 1500); return; }
+
+    const p = Math.max(1, Math.min(100, s.percent || 1));
+    fill.style.width = p + '%';
+    pct.textContent = p;
+    if (s.label) stage.textContent = s.label;
+
+    if (s.error) {
+      spin.style.display = 'none';
+      errBox.style.display = 'block';
+      errBox.textContent = s.error;
+      openBtn.style.display = 'none';
+      return;
+    }
+    if (s.done) {
+      fill.style.width = '100%'; pct.textContent = 100;
+      stage.textContent = 'Done — opening the report…';
+      window.location = s.result_url || `/runs/${runId}`;
+      return;
+    }
+    setTimeout(poll, 1000);
+  }
+  poll();
+</script>
+</body>
+</html>

@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>PDF Validation Report</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { width: 100%; }
+  body { font-family: -apple-system, Arial, sans-serif; margin: 0; padding: 16pt 20pt; background: #f5f6f8; color: #1a1a1a; max-width: none; font-size: 8.5pt; }
+  h1 { margin-bottom: 3pt; font-size: 16pt; }
+  .subtitle { color: #555; margin-bottom: 12pt; overflow-wrap: anywhere; font-size: 8.5pt; }
+  .summary { display: inline-block; padding: 4pt 8pt; border-radius: 6px; font-weight: bold; margin-bottom: 12pt; font-size: 8.5pt; }
+  .summary.pass { background: #d4edda; color: #155724; }
+  .summary.fail { background: #f8d7da; color: #721c24; }
+  .check { background: #fff; border-radius: 8px; padding: 8pt 12pt; margin-bottom: 8pt; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+  .check h2 { margin: 0 0 4pt; font-size: 10.5pt; }
+  .badge { display: inline-block; padding: 1pt 5pt; border-radius: 4px; font-size: 7pt; font-weight: bold; margin-left: 4pt; }
+  .badge.pass { background: #d4edda; color: #155724; }
+  .badge.fail { background: #f8d7da; color: #721c24; }
+  .issue-counts { margin: 3pt 0 6pt; }
+  .count-pill { display: inline-block; background: #eef1f6; color: #333; border-radius: 10px; padding: 1.5pt 7pt; margin: 0 4pt 3pt 0; font-size: 7pt; font-weight: bold; cursor: pointer; user-select: none; border: 1.5px solid transparent; }
+  .count-pill:hover { filter: brightness(0.95); }
+  .count-pill.active { border-color: #ff7a00; box-shadow: 0 0 0 1px #ff7a00 inset; }
+  .count-pill.total { background: #2d6cdf; color: #fff; }
+  table { width: 100%; border-collapse: collapse; margin-top: 4pt; }
+  th, td { text-align: left; padding: 3pt 5pt; border-bottom: 1px solid #eee; font-size: 7.5pt; vertical-align: top; overflow-wrap: anywhere; word-break: break-word; }
+  tr.error td { background: #fff5f5; }
+  tr.warning td { background: #fffbea; }
+  tr.info td { background: #eef6fb; }
+  .sev-error { color: #c0392b; font-weight: bold; }
+  .sev-warning { color: #b7791f; font-weight: bold; }
+  .sev-info { color: #1a6fa8; font-weight: bold; }
+  .no-issues { color: #2e7d32; padding: 4pt 0; font-size: 8pt; }
+  details { margin-top: 3pt; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; margin: 2pt 0 5pt; font-size: 7.5pt; background: #f1f1f1; padding: 3pt 2pt; border-radius: 4px; border: none; }
+  .issue-meta { font-size: 7pt; color: #555; margin-bottom: 3pt; }
+  .diff-col { margin-bottom: 5pt; }
+  .diff-expected .diff-label { color: #a01515; }
+  .diff-actual .diff-label { color: #1f7a34; }
+  .diff-label { font-size: 6.5pt; font-weight: bold; color: #666; text-transform: uppercase; margin-bottom: 2pt; }
+  .sentence { padding: 3pt 5pt; margin-bottom: 2pt; border-radius: 4px; font-size: 7.5pt; line-height: 1.4; overflow-wrap: anywhere; word-break: break-word; }
+  .sentence-missing { background: #fbdada; color: #7a1414; font-weight: 500; }
+  .sentence-added { background: #dcf3e1; color: #1a5c2a; }
+  .sentence-note { background: transparent; color: #888; font-style: italic; padding: 1pt 5pt; }
+  .word-diff-sentence { padding: 3pt 5pt; margin-bottom: 2pt; border-radius: 4px; background: #fafafa; font-size: 7.5pt; line-height: 1.7; overflow-wrap: anywhere; word-break: break-word; }
+  .word-diff-sentence del { background: #fbdada; color: #7a1414; text-decoration: line-through; text-decoration-color: #a01515; text-decoration-thickness: 2px; padding: 0 2px; border-radius: 2px; }
+  .word-diff-sentence ins { background: #dcf3e1; color: #1a5c2a; text-decoration: underline; text-decoration-color: #1f7a34; text-decoration-thickness: 2px; padding: 0 2px; border-radius: 2px; }
+  /* letter-level ops sit INSIDE a word - keep them tight against the surrounding letters */
+  .word-diff-sentence del.char, .word-diff-sentence ins.char { padding: 0; border-radius: 0; margin: 0; }
+  .word-diff-sentence del.char { background: #f5b8b8; }
+  .word-diff-sentence ins.char { background: #b8e6c4; }
+  .diff-legend { font-size: 6.8pt; color: #666; margin: 1pt 0 3pt; }
+  .diff-legend del { background: #fbdada; color: #7a1414; text-decoration: line-through; padding: 0 2px; }
+  .diff-legend ins { background: #dcf3e1; color: #1a5c2a; text-decoration: underline; padding: 0 2px; }
+  .kv-row { margin-bottom: 2pt; font-size: 7pt; }
+  .kv-key { color: #666; font-weight: bold; }
+  .screenshot-pair { display: flex; flex-wrap: wrap; gap: 8pt; margin-top: 5pt; }
+  .screenshot-col { flex: 1 1 220px; max-width: 320px; }
+  .screenshot-col img { width: 100%; border: 1px solid #ddd; border-radius: 4px; }
+  .screenshot-absent { font-size: 7pt; color: #888; font-style: italic; background: #f7f7f7; border: 1px dashed #ddd; border-radius: 4px; padding: 8pt 6pt; }
+  .issue-help { font-size: 7pt; color: #444; background: #f7f7f7; border-radius: 4px; padding: 3pt 5pt; margin-bottom: 3pt; }
+  .issue-help-label { font-weight: bold; color: #333; }
+  .subhead { margin: 8pt 0 3pt; font-size: 9pt; }
+  tr.heading-divider td { background: #eef1f6; border-left: 4px solid #2d6cdf; font-weight: bold; font-size: 8pt; padding-top: 4pt; padding-bottom: 4pt; }
+  table.toc-compare { margin-top: 3pt; }
+  table.toc-compare th, table.toc-compare td { font-size: 7.5pt; }
+  .toc-row-missing td { background: #fff5f5; }
+  .toc-row-extra td { background: #fff9ec; }
+  .level-change { color: #a01515; font-weight: bold; }
+  .status-badge { display: inline-block; padding: 1pt 5pt; border-radius: 10px; font-size: 6.8pt; font-weight: bold; }
+  .status-badge.status-matched, .status-badge.status-ok { background: #d4edda; color: #155724; }
+  .status-badge.status-missing, .status-badge.status-issues { background: #f8d7da; color: #721c24; }
+  .status-badge.status-extra, .status-badge.status-review,
+  .status-badge.status-stage-only, .status-badge.status-not-detected-in-stage { background: #fde8c8; color: #7a4a00; }
+  table.summary-table { margin-top: 3pt; }
+  table.summary-table th, table.summary-table td { font-size: 7pt; white-space: nowrap; }
+  table.summary-table td:first-child { white-space: normal; }
+  tr.summary-row-issues td { background: #fff5f5; }
+  tr.summary-row-review td, tr.summary-row-stage-only td, tr.summary-row-not-detected-in-stage td { background: #fffbea; }
+  .summary-note { font-size: 7pt; color: #666; margin: 2pt 0 0; }
+  .downloads { margin-bottom: 10pt; display: flex; flex-wrap: wrap; align-items: flex-end; gap: 5pt; }
+  .downloads a { display: inline-block; padding: 4pt 8pt; border-radius: 6px; text-decoration: none; font-weight: bold; font-size: 7.5pt; }
+  .downloads a.pdf { background: #2d6cdf; color: #fff; }
+  .downloads a.json { background: #eef1f6; color: #1a1a1a; }
+  .downloads a.new { background: transparent; color: #2d6cdf; border: 1px solid #2d6cdf; }
+  .download-item { position: relative; display: inline-block; padding-top: 11pt; }
+  .badge.recommended { position: absolute; top: 0; left: 50%; transform: translateX(-50%); background: #d4edda; color: #155724; white-space: nowrap; margin-left: 0; }
+</style>
+</head>
+<body>
+  <h1>PDF Validation Report</h1>
+  <div class="subtitle">Expected: {{ report.expected_path }} &nbsp;|&nbsp; Actual: {{ report.actual_path }}</div>
+  <div class="downloads">
+    <span class="download-item">
+      <span class="badge recommended">Recommended</span>
+      <a class="json" href="sections.html">▤ Side-by-Side by Section (Prod vs Stage)</a>
+    </span>
+    <a class="json" href="toc.html">▤ TOC Comparison Report (Prod vs Stage)</a>
+    {% if new_comparison_url %}<a class="new" href="{{ new_comparison_url }}">⟲ New Comparison</a>{% endif %}
+  </div>
+  <div class="summary {{ 'pass' if report.passed else 'fail' }}">
+    Overall result: {{ 'PASS' if report.passed else 'FAIL' }}
+  </div>
+
+  {% macro format_scalar(v) -%}
+    {%- if v is sequence and v is not string -%}
+      ({{ v|map('string')|join(', ') }})
+    {%- else -%}
+      {{ v }}
+    {%- endif -%}
+  {%- endmacro %}
+
+  {% macro render_details(d) -%}
+    {%- set has_diff = (d.expected is defined and d.expected is sequence and d.expected is not string)
+                      or (d.actual is defined and d.actual is sequence and d.actual is not string)
+                      or (d.text is defined and d.text is sequence and d.text is not string)
+                      or (d.word_diff is defined) -%}
+    {%- set known_keys = ('heading', 'expected_page', 'actual_page', 'expected', 'actual', 'text', 'word_diff', 'prod_screenshot', 'stage_screenshot') -%}
+    {%- set hidden_keys = ('bbox', 'expected_bbox', 'actual_bbox', 'page_rect', 'delta', 'prod_screenshot_caption', 'stage_screenshot_caption', 'prod_screenshot_note', 'stage_screenshot_note') -%}
+    {%- set extra_keys = d.keys()|reject('in', known_keys)|reject('in', hidden_keys)|list -%}
+    {%- if has_diff and (d.expected_page is defined or d.actual_page is defined or extra_keys) %}
+    <div class="issue-meta">
+      {%- if d.expected_page is defined %}Expected p.{{ d.expected_page }}{% endif -%}
+      {%- if d.actual_page is defined %} &rarr; Actual p.{{ d.actual_page }}{% endif -%}
+      {%- for key in extra_keys %}{% if d.expected_page is defined or d.actual_page is defined or not loop.first %} &middot; {% endif %}{{ key|replace('_', ' ')|title }}: {{ format_scalar(d[key]) }}{% endfor -%}
+    </div>
+    {%- endif %}
+    {%- if d.word_diff is defined %}
+    <div class="diff-legend">In this section &mdash; <del>struck red = in Production, removed from Staging</del> &nbsp; <ins>underlined green = added in Staging</ins></div>
+    <div class="word-diff">
+      {%- for ops in d.word_diff %}
+      <div class="word-diff-sentence">
+        {%- for op in ops -%}
+          {%- if op.type == 'equal' -%}{{ op.text }}
+          {%- elif op.type == 'del' -%}<del{% if op.level == 'char' %} class="char"{% endif %}>{{ op.text }}</del>
+          {%- elif op.type == 'ins' -%}<ins{% if op.level == 'char' %} class="char"{% endif %}>{{ op.text }}</ins>
+          {%- endif -%}
+        {%- endfor %}
+      </div>
+      {%- endfor %}
+    </div>
+    {%- elif d.expected is defined and d.expected is sequence and d.expected is not string
+        or d.actual is defined and d.actual is sequence and d.actual is not string %}
+    <div class="diff-block">
+      {%- if d.expected is defined %}
+      <div class="diff-col diff-expected">
+        <div class="diff-label">Missing / Expected</div>
+        {%- for sentence in d.expected %}
+        {%- if sentence.startswith('... (+') %}
+        <div class="sentence sentence-note">{{ sentence }}</div>
+        {%- else %}
+        <div class="sentence sentence-missing">{{ sentence }}</div>
+        {%- endif %}
+        {%- endfor %}
+      </div>
+      {%- endif %}
+      {%- if d.actual is defined %}
+      <div class="diff-col diff-actual">
+        <div class="diff-label">Added / Actual</div>
+        {%- for sentence in d.actual %}
+        {%- if sentence.startswith('... (+') %}
+        <div class="sentence sentence-note">{{ sentence }}</div>
+        {%- else %}
+        <div class="sentence sentence-added">{{ sentence }}</div>
+        {%- endif %}
+        {%- endfor %}
+      </div>
+      {%- endif %}
+    </div>
+    {%- elif d.text is defined and d.text is sequence and d.text is not string %}
+    <pre class="text-block">{{ d.text|join('\n') }}</pre>
+    {%- else %}
+    <div class="kv">
+      {%- for key, value in d.items() %}
+      {%- if not (has_diff and key in ('heading', 'expected_page', 'actual_page')) and key not in hidden_keys and key not in ('prod_screenshot', 'stage_screenshot') %}
+      <div class="kv-row"><span class="kv-key">{{ key|replace('_', ' ')|title }}:</span> <span class="kv-val">{{ format_scalar(value) }}</span></div>
+      {%- endif %}
+      {%- endfor %}
+    </div>
+    {%- endif %}
+    {%- if d.prod_screenshot or d.stage_screenshot or d.prod_screenshot_note or d.stage_screenshot_note %}
+    <div class="screenshot-pair">
+      <div class="screenshot-col">
+        <div class="diff-label">{{ d.prod_screenshot_caption or 'Production (prod)' }}</div>
+        {%- if d.prod_screenshot %}
+        <img src="{{ d.prod_screenshot }}" alt="{{ d.prod_screenshot_caption or 'Production page screenshot' }}">
+        {%- elif d.prod_screenshot_note %}
+        <div class="screenshot-absent">{{ d.prod_screenshot_note }}</div>
+        {%- endif %}
+      </div>
+      <div class="screenshot-col">
+        <div class="diff-label">{{ d.stage_screenshot_caption or 'Staging (stage)' }}</div>
+        {%- if d.stage_screenshot %}
+        <img src="{{ d.stage_screenshot }}" alt="{{ d.stage_screenshot_caption or 'Staging page screenshot' }}">
+        {%- elif d.stage_screenshot_note %}
+        <div class="screenshot-absent">{{ d.stage_screenshot_note }}</div>
+        {%- endif %}
+      </div>
+    </div>
+    {%- endif %}
+  {%- endmacro %}
+
+  {% set issue_help_map = {
+    'Page count mismatch': {'what': 'The two PDFs have a different total number of pages.', 'fix': 'Confirm whether pages were intentionally added or removed; otherwise regenerate Staging from the same source as Production.'},
+    'Missing page': {'what': 'A page present in Production could not be found in Staging.', 'fix': 'Add the missing page back into Staging.'},
+    'Extra page': {'what': 'Staging has a page that is not present in Production.', 'fix': 'Remove the extra page, or confirm it was an intentional addition.'},
+    'Missing text': {'what': 'This text exists in Production but could not be found in Staging.', 'fix': 'Add the missing text back into Staging.'},
+    'Added text': {'what': 'This text appears in Staging but not in Production.', 'fix': 'Remove the extra text from Staging, or confirm it was an intentional addition.'},
+    'Changed text': {'what': 'The wording differs between Production and Staging for this section.', 'fix': 'Align the Staging text with Production (or confirm the change was intended).'},
+    'Minor text difference': {'what': 'The two sentences are near-identical and the wording is still present in both documents - they differ only by spacing, punctuation, or a list-marker glyph that one export captured as text and the other did not. Shown for completeness; never fails the run.', 'fix': 'Usually nothing - confirm the difference is cosmetic. If a bullet or a whole list marker was genuinely dropped, restore it in Staging.'},
+    'Possible text encoding issue': {'what': 'Unusual or garbled characters were found - usually a sign a font was extracted with the wrong encoding. The count shows how many times each character occurs, and the snippets show where.', 'fix': 'Check the font embedding/encoding of the source document and re-export the PDF. Characters listed as not present in the other document were introduced by this export.'},
+    'Text formatting differs': {'what': 'The wording is identical but the styling is not - the font family, size, bold or italic changed between Production and Staging.', 'fix': 'Restore the Staging styling to match Production, or confirm the restyle was intended.'},
+    'Image alignment changed': {'what': 'A figure that was left/centre/right aligned in Production sits in a different alignment in Staging. Small positional drift is ignored - only a change of alignment class is reported.', 'fix': 'Restore the figure to its original alignment, or confirm the change was intended.'},
+    'Diagram callout number missing': {'what': 'A numbered leader-line callout printed on a Production diagram could not be found anywhere in the corresponding Staging section (or the page either side of it).', 'fix': 'Restore the missing callout number(s) on the Staging diagram.'},
+    'Diagram callouts stripped from figure': {'what': 'The Production diagram has a run of numbered callouts drawn on it with leader lines; the Staging version of the same diagram has none of them. The numbers still exist in the legend list beside the figure, but a reader can no longer point at a number on the picture and see which part it is.', 'fix': 'Re-add the numbered leader-line callouts to the Staging diagram so it matches the legend.'},
+    'Broken image': {'what': 'Artwork in Staging is unusable: its embedded image data will not decode, or the region renders as a blank flat colour.', 'fix': 'Re-embed the image in Staging from a working source file.'},
+    'Image highlight box missing': {'what': 'A coloured highlight box drawn on a Production figure is not present on the corresponding Staging figure.', 'fix': 'Re-add the highlight box, or confirm it was intentionally removed.'},
+    'Table header row not repeated on continuation page': {'what': 'This Staging table runs onto another page, and that page does not reprint the header row - so the reader is left with columns of values and nothing saying what they are. The header is mandatory on every continuation page, whatever Production does, so this is checked against Staging on its own.', 'fix': 'Repeat the header row at the top of every page the table continues onto.'},
+    'Table split across pages': {'what': 'A page break splits this table across more pages in Staging than in Production, so it no longer reads as one table.', 'fix': 'Keep the table together the way Production does - or, if the split is intended, make sure its header row repeats on every continuation page.'},
+    'Table columns differ': {'what': 'The two tables do not have the same number of columns.', 'fix': 'Reconcile the column counts between the two documents.'},
+    'Table column layout differs': {'what': 'The tables have the same columns, but the column widths/positions changed - a column was widened or narrowed.', 'fix': 'Restore the Production column widths, or confirm the relayout was intended.'},
+    'Table cell layout differs': {'what': 'A row holds the same words but they are no longer divided into the same cells - cells were merged or split.', 'fix': 'Restore the original cell structure for that row.'},
+    'Table breaking the margins': {'what': 'The table extends past the page margins in Staging.', 'fix': 'Resize or reflow the table so it fits within the page margins.'},
+    'Table heading missing': {'what': "A header cell present in Production is missing from Staging. The row was located by its anchor cell, and only that cell's own words were compared.", 'fix': 'Restore the missing header text.'},
+    'Table cell missing': {'what': "Part of a cell's content is gone in Staging. The row was located by its anchor cell (not by position), and the cell's words were compared as an unordered set - so a reordering alone is never reported.", 'fix': 'Restore the missing words listed above to that cell.'},
+    'List marker changed': {'what': 'The same list item is marked differently between Production and Staging (numbered 1,2,3 vs lettered a,b,c vs a bullet).', 'fix': 'Align the Staging list marker style with Production.'},
+    'List alignment/indent changed': {'what': "A list item's indent moved - it changed nesting level, or lost its hanging indent.", 'fix': 'Restore the original indent, or confirm the nesting change was intended.'},
+    'Text alignment changed': {'what': 'The same text is aligned differently (left / center / right / justified).', 'fix': 'Restore the Production alignment, or confirm the change was intended.'},
+    'Paragraph merged with heading': {'what': "A numbered item's description has been pulled up onto the same line as its bold label, where Production keeps the label on its own line.", 'fix': 'Put the description back on its own line beneath the label.'},
+    'Hyperlink not highlighted in STAGE': {'what': 'The link works, but its text is styled exactly like body text - not coloured and not underlined - so a reader has no way to tell it is clickable.', 'fix': 'Restore the link styling (colour and/or underline) in Staging.'},
+    'Internal link target does not resolve': {'what': 'The link points at a page or named destination that does not exist in this document, so clicking it goes nowhere.', 'fix': 'Repoint the link at a destination that exists, or remove it.'},
+    'Hyperlink has no usable scheme': {'what': 'The link URI has no scheme a PDF viewer can act on, so clicking it does nothing.', 'fix': 'Give the URI a usable scheme (https://, mailto:, ...).'},
+    'Hyperlink hotspot cannot be clicked': {'what': 'The clickable rectangle is empty, too small to hit, or lies outside the page.', 'fix': 'Resize the link hotspot so it covers its text.'},
+    'Callout label differs': {'what': 'The same sentence is marked with a different callout type (e.g. NOTE vs WARNING) between Production and Staging.', 'fix': 'Confirm the correct callout type and align Staging with Production (or vice versa if intended).'},
+    'Callout icon missing in Staging': {'what': "Production marks this NOTE / TIP / WARNING / CAUTION with a filled, coloured badge to the left of the callout body. In Staging the badge is gone or is rendered as a flat ~13pt black outline glyph with no colour, so the visual callout cue is effectively lost even though the callout text is present.", 'fix': 'Restore the coloured callout icon in Staging so the note/tip/warning is visually flagged as it is in Production.'},
+    'List formatting differs': {'what': 'The same list item is styled differently between Production and Staging (e.g. numbered 1,2,3 vs lettered a,b,c vs a bullet).', 'fix': 'Align the Staging list style with Production (or confirm the change was intended).'},
+    'Image missing': {'what': 'No figure anywhere in the Staging section resembles this Production figure. Figures are matched by appearance across the whole section, so a figure that merely moved to another page inside the section is never reported here.', 'fix': 'Re-add the missing figure to the Staging section.'},
+    'Image content differs': {'what': 'Staging shows a figure in this figure\'s place, the two were measured over comparable areas, and their artwork has nothing in common - the picture was replaced, or its contents changed. Compare the two images below.', 'fix': 'Restore the Production figure, or confirm the replacement was intended.'},
+    'Image could not be confirmed identical': {'what': 'A figure sits in this figure\'s place in Staging, but it could not be confirmed to be the same picture - either the two documents detected different extents of it (one crop caught the leader lines or the figure beside it) or the two are only partly alike. No defect is being asserted; this needs a human eye.', 'fix': 'Compare the two images below and confirm whether the Staging figure is correct.'},
+    'Image size changed': {'what': 'The same picture, rendered at a materially different width and/or height in Staging (more than 15% and at least 12pt on that axis). Small scaling differences from re-export are ignored.', 'fix': 'Restore the Production dimensions, or confirm the resize was intended.'},
+    'Image width changed': {'what': 'The same picture, rendered materially wider or narrower in Staging (more than 15% and at least 12pt), with its height unchanged. Small scaling differences from re-export are ignored.', 'fix': 'Restore the Production width, or confirm the resize was intended.'},
+    'Image outside its section': {'what': 'The figure is still in Staging, but it now sits past the end of the section it belongs to. Moving to a later page WITHIN the section is fine and is never reported; leaving the section is not.', 'fix': 'Move the figure back under its own heading.'},
+    'Image label missing': {'what': "A caption or label word on a Production figure could not be found in Staging's own lines for the same section, including text OCR reads out of the artwork itself.", 'fix': 'Restore the missing label text on the Staging figure.'},
+    'Table row missing': {'what': 'A row present in Production could not be found in Staging. The row was located by its anchor cell rather than by position, so an inserted row elsewhere does not cause this.', 'fix': 'Add the missing row back into the Staging table.'},
+  } %}
+
+  {% macro render_issue_help(message) -%}
+    {%- set ns = namespace(help=none) -%}
+    {%- for key, v in issue_help_map.items() -%}
+      {%- if ns.help is none and message.startswith(key) -%}{%- set ns.help = v -%}{%- endif -%}
+    {%- endfor -%}
+    {%- if ns.help %}
+    <div class="issue-help">
+      <div><span class="issue-help-label">Issue:</span> {{ ns.help.what }}</div>
+      <div><span class="issue-help-label">Fix:</span> {{ ns.help.fix }}</div>
+    </div>
+    {%- endif %}
+  {%- endmacro %}
+
+  {% set severity_labels = {'error': 'Not Matching', 'warning': 'Review', 'info': 'Summary'} %}
+
+  {% for check in report.checks %}
+  <div class="check">
+    <h2>{{ check.name }}
+      <span class="badge {{ 'pass' if check.passed else 'fail' }}">{{ 'PASS' if check.passed else 'FAIL' }}</span>
+    </h2>
+    {%- set confirmed = check.issues|selectattr('details.confidence', 'ne', 'review')|list -%}
+    {%- set review = check.issues|selectattr('details.confidence', 'eq', 'review')|list -%}
+    {% if check.message_counts %}
+    <div class="issue-counts">
+      <span class="count-pill total" data-msg="__all__">Confirmed issues: {{ confirmed|length }}</span>
+      {%- if review %}<span class="count-pill" data-msg="__review__">Needs review: {{ review|length }}</span>{% endif -%}
+      {% for msg, n in check.message_counts.items() %}<span class="count-pill" data-msg="{{ msg }}">{{ msg }}: {{ n }}</span>{% endfor %}
+    </div>
+    {% endif %}
+
+    {% macro issue_table(issues) %}
+    <table class="issues">
+      <thead><tr><th>Status</th><th>Page</th><th>Message</th><th>Details</th></tr></thead>
+      <tbody>
+      {% for heading, group_issues in issues|group_by_heading %}
+        {% if heading %}
+        <tr class="heading-divider"><td colspan="4">{{ heading }}</td></tr>
+        {% endif %}
+        {% for issue in group_issues %}
+          <tr class="{{ issue.severity }}" data-message="{{ issue.message }}">
+            <td class="sev-{{ issue.severity }}">{{ severity_labels.get(issue.severity, issue.severity) }}</td>
+            <td>{{ (issue.page + 1) if issue.page is not none else '-' }}</td>
+            <td>{{ issue.message }}</td>
+            <td>
+              {{ render_issue_help(issue.message) }}
+              {% if issue.details %}<details open><summary>view</summary>{{ render_details(issue.details) }}</details>{% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      {% endfor %}
+      </tbody>
+    </table>
+    {% endmacro %}
+
+    {% if confirmed %}
+      {{ issue_table(confirmed) }}
+    {% elif not review %}
+      <div class="no-issues">No issues found.</div>
+    {% endif %}
+    {% if review %}
+    <details class="review-block">
+      <summary>{{ review|length }} lower-confidence finding(s) held for review &mdash; not counted as failures</summary>
+      {{ issue_table(review) }}
+    </details>
+    {% endif %}
+
+    {% if check.summary_rows %}
+    <h3 class="subhead">{{ check.summary_title or 'Summary' }}</h3>
+    <p class="summary-note">Everything that was compared, including what came through clean &mdash; an issue list on its own cannot tell a clean section from an unchecked one.</p>
+    {% set columns = check.summary_rows[0].keys()|list %}
+    <table class="summary-table">
+      <thead><tr>{% for key in columns %}<th>{{ key|replace('_', ' ')|title }}</th>{% endfor %}</tr></thead>
+      <tbody>
+      {% for row in check.summary_rows %}
+        <tr class="summary-row-{{ (row.status or '')|lower|replace(' ', '-') }}">
+          {%- for key in columns %}
+          <td>
+            {%- if key == 'status' -%}
+            <span class="status-badge status-{{ (row[key] or '')|lower|replace(' ', '-') }}">{{ row[key] }}</span>
+            {%- elif row[key] is none or row[key] == '' -%}
+            -
+            {%- else -%}
+            {{ row[key] }}
+            {%- endif -%}
+          </td>
+          {%- endfor %}
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+
+    {% if check.name == 'TOC Validation' and report.toc_comparison %}
+    <h3 class="subhead">Heading-by-heading comparison (Prod vs Stage)</h3>
+    <table class="toc-compare">
+      <thead><tr><th>Section (TOC entry)</th><th>Level</th><th>Prod Page</th><th>Stage Page</th><th>Status</th></tr></thead>
+      <tbody>
+      {% for row in report.toc_comparison %}
+        <tr class="toc-row-{{ row.status|lower }}">
+          <td>{{ row.heading }}</td>
+          <td>
+            {%- if row.expected_level and row.actual_level and row.expected_level != row.actual_level -%}
+            <span class="level-change">L{{ row.expected_level }} &rarr; L{{ row.actual_level }}</span>
+            {%- else -%}
+            L{{ row.expected_level or row.actual_level }}
+            {%- endif -%}
+          </td>
+          <td>{{ row.expected_page or '-' }}</td>
+          <td>{{ row.actual_page or '-' }}</td>
+          <td><span class="status-badge status-{{ row.status|lower }}">{{ row.status }}</span></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </div>
+  {% endfor %}
+
+  <script>
+    (function () {
+      function groupRows(tbody) {
+        // Ties each heading-divider row to the data rows that follow it, up to
+        // the next divider, so a divider can be hidden once every row under it
+        // is filtered out - an empty heading floating above nothing reads as a
+        // rendering bug, not "no matches".
+        var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
+        var groups = [];
+        var current = null;
+        rows.forEach(function (tr) {
+          if (tr.classList.contains('heading-divider')) {
+            current = { divider: tr, rows: [] };
+            groups.push(current);
+          } else if (current) {
+            current.rows.push(tr);
+          } else {
+            groups.push({ divider: null, rows: [tr] });
+          }
+        });
+        return groups;
+      }
+
+      function applyFilter(checkEl, msg) {
+        var reviewBlock = checkEl.querySelector('details.review-block');
+        var tables = checkEl.querySelectorAll('table.issues');
+        tables.forEach(function (table) {
+          var inReview = reviewBlock && reviewBlock.contains(table);
+          var tbody = table.querySelector('tbody');
+          if (!tbody) return;
+          groupRows(tbody).forEach(function (group) {
+            var groupVisible = false;
+            group.rows.forEach(function (tr) {
+              var show;
+              if (msg === null) show = true;
+              else if (msg === '__review__') show = inReview;
+              else if (msg === '__all__') show = !inReview;
+              else show = tr.dataset.message === msg;
+              tr.style.display = show ? '' : 'none';
+              if (show) groupVisible = true;
+            });
+            if (group.divider) group.divider.style.display = groupVisible ? '' : 'none';
+          });
+        });
+        if (reviewBlock) {
+          if (msg === '__review__') reviewBlock.open = true;
+          else if (msg === '__all__' || msg === null) reviewBlock.open = false;
+          else {
+            var hasMatch = reviewBlock.querySelector('tr[data-message="' + CSS.escape(msg) + '"]');
+            reviewBlock.open = !!hasMatch;
+          }
+        }
+      }
+
+      document.querySelectorAll('.check').forEach(function (checkEl) {
+        var pills = checkEl.querySelectorAll('.count-pill[data-msg]');
+        pills.forEach(function (pill) {
+          pill.addEventListener('click', function () {
+            var wasActive = pill.classList.contains('active');
+            pills.forEach(function (p) { p.classList.remove('active'); });
+            if (wasActive) {
+              applyFilter(checkEl, null);
+            } else {
+              pill.classList.add('active');
+              applyFilter(checkEl, pill.dataset.msg);
+            }
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
