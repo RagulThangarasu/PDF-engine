@@ -17,6 +17,7 @@
   input[type=number] { width: 100%; padding: 0.4rem; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
   button { margin-top: 1.5rem; padding: 0.7rem 1.4rem; background: #2d6cdf; color: #fff; border: none; border-radius: 6px; font-weight: bold; font-size: 0.95rem; cursor: pointer; }
   button:hover { opacity: 0.9; }
+  button:disabled { background: #9fb8e6; cursor: default; }
   .flash { background: #f8d7da; color: #721c24; padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 1rem; font-size: 0.9rem; }
 </style>
 </head>
@@ -31,7 +32,7 @@
       {% endif %}
     {% endwith %}
 
-    <form method="post" action="{{ url_for('compare') }}" enctype="multipart/form-data">
+    <form method="post" action="{{ url_for('compare') }}" enctype="multipart/form-data" onsubmit="return onSubmitCompare(this)">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
       <label for="expected">Production PDF (baseline)</label>
@@ -40,8 +41,21 @@
       <label for="actual">Staging PDF (candidate)</label>
       <input type="file" id="actual" name="actual" accept="application/pdf,.pdf" required>
 
-      <button type="submit">Run Comparison</button>
+      <button type="submit" id="run-btn">Run Comparison</button>
     </form>
   </div>
+  <script>
+    // A large PDF pair can take a while just to upload, and only one
+    // comparison runs at a time server-side - an impatient second click
+    // (or double-click) queued a second, redundant job behind the first and
+    // made everything slower for both. One click, then the button is gone.
+    function onSubmitCompare(form) {
+      var btn = document.getElementById('run-btn');
+      if (btn.disabled) return false;
+      btn.disabled = true;
+      btn.textContent = 'Uploading…';
+      return true;
+    }
+  </script>
 </body>
 </html>

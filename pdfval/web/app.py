@@ -22,6 +22,7 @@ from flask import (
     session,
     url_for,
 )
+from werkzeug.exceptions import RequestEntityTooLarge
 
 from pdfval.cli import run
 from pdfval.report.html_report import generate_reports
@@ -29,7 +30,11 @@ from pdfval.report.html_report import generate_reports
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 RUNS_DIR = os.path.join(BASE_DIR, "runs")
 
-MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50 MB per request
+# A scanned/high-DPI manual pair can run well past 50 MB - that limit was
+# hitting real uploads and, worse, showing Werkzeug's raw "Request Entity Too
+# Large" page instead of coming back to the form. Overridable via env var for
+# a deployment that wants a different ceiling.
+MAX_CONTENT_LENGTH = int(os.environ.get("PDFVAL_MAX_UPLOAD_MB", "300")) * 1024 * 1024
 PDF_MAGIC = b"%PDF-"
 
 _RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -42,6 +47,9 @@ _JOBS_LOCK = threading.Lock()
 # pdfplumber / extractor caches are module-global, so only one comparison runs
 # at a time; others queue behind this lock.
 _RUN_LOCK = threading.Lock()
+# run_ids not yet finished, in submission order - lets a queued job report a
+# real position ("2 comparisons ahead of you") instead of a flat "waiting".
+_QUEUE_ORDER: list[str] = []
 # The validation report and the side-by-side section browser are exposed.
 # report.json is still written (the result page reads it server-side) but is
 # not downloadable, and report.pdf is not produced for web runs at all.
@@ -56,6 +64,14 @@ def create_app() -> Flask:
     app.secret_key = os.environ.get("PDFVAL_SECRET_KEY") or secrets.token_hex(32)
 
     os.makedirs(RUNS_DIR, exist_ok=True)
+
+    @app.errorhandler(RequestEntityTooLarge)
+    def _too_large(_exc):
+        # Without this, an over-limit upload hit Werkzeug's bare "Request
+        # Entity Too Large" page - no styling, no way back to the form.
+        limit_mb = MAX_CONTENT_LENGTH // (1024 * 1024)
+        flash(f"That upload is too large — combined PDF size must be under {limit_mb} MB.")
+        return redirect(url_for("upload_form"))
 
     @app.get("/")
     def upload_form():
@@ -202,15 +218,38 @@ def _job_status(run_id: str) -> dict:
         return {}
 
 
+def _queue_position(run_id: str) -> int:
+    """1-based position in the queue; 1 = running now or about to start."""
+    with _JOBS_LOCK:
+        try:
+            return _QUEUE_ORDER.index(run_id) + 1
+        except ValueError:
+            return 1
+
+
+_QUEUE_POLL_SECONDS = 3.0
+
+
 def _start_job(app, run_id, run_dir, expected_path, actual_path, exp_name, act_name) -> None:
+    with _JOBS_LOCK:
+        _QUEUE_ORDER.append(run_id)
     _set_progress(run_dir, run_id, percent=1, label="Starting…", done=False, error=None,
                   result_url=f"/runs/{run_id}")
 
     def worker():
         try:
-            if not _RUN_LOCK.acquire(blocking=False):
-                _set_progress(run_dir, run_id, percent=1, label="Waiting for another comparison to finish…")
-                _RUN_LOCK.acquire()
+            # Poll for the lock instead of blocking on it outright, so a
+            # queued job's progress keeps reporting how many comparisons are
+            # still ahead of it rather than sitting on one static message.
+            while not _RUN_LOCK.acquire(timeout=_QUEUE_POLL_SECONDS):
+                ahead = _queue_position(run_id) - 1
+                if ahead <= 0:
+                    continue  # lock lost a race right as it freed up - retry
+                label = (
+                    "Waiting for another comparison to finish…" if ahead == 1
+                    else f"Waiting — {ahead} comparisons ahead of you…"
+                )
+                _set_progress(run_dir, run_id, percent=1, label=label)
             try:
                 report = run(
                     expected_path, actual_path, run_dir,
@@ -231,5 +270,9 @@ def _start_job(app, run_id, run_dir, expected_path, actual_path, exp_name, act_n
             traceback.print_exc()
             _set_progress(run_dir, run_id, percent=100, label="Failed", done=True,
                           error=f"{type(exc).__name__}: {exc}")
+        finally:
+            with _JOBS_LOCK:
+                if run_id in _QUEUE_ORDER:
+                    _QUEUE_ORDER.remove(run_id)
 
     threading.Thread(target=worker, name=f"pdfval-{run_id[:8]}", daemon=True).start()
