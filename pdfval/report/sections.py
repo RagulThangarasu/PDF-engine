@@ -1953,12 +1953,12 @@ def _issue_groups(row: dict) -> list[dict]:
         notes = by_key.get(meta["key"]) or []
         if not notes:
             continue
-        # Content is ONE note standing for many differing lines (they are all
-        # listed in the table above), so its count comes from the lines, not
-        # from the note - otherwise a section with thirty changed sentences
-        # reports "1 issue".
+        # Content is ONE note standing for many differing lines, so its count
+        # comes from the lines. `real_diff`, not `diff`: the same number the
+        # section's red badge and the "differences only" filter use, so the
+        # panel cannot claim more differences than the nav does.
         count = (
-            (row.get("counts") or {}).get("diff", 0) if meta["key"] == "content"
+            (row.get("counts") or {}).get("real_diff", 0) if meta["key"] == "content"
             else sum(n.get("count", 1) for n in notes)
         )
         groups.append({**meta, "notes": notes, "count": count})
