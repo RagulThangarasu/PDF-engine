@@ -8,9 +8,16 @@ Findings:
 * Paragraph merged with heading - a numbered item's description glued onto the
                                   same line as its bold label
 
-Everything here compares blocks whose TEXT is identical on both sides, so a
-finding is always "the same words, laid out differently" and never a disguised
-content difference - those belong to Content Validation.
+Everything here compares text that is identical on both sides, so a finding is
+always "the same words, presented differently" and never a disguised content
+difference - those belong to Content Validation.
+
+The three block-level checks pair whole blocks whose text matches exactly. The
+marker check cannot: a list whose markers changed has, by definition, different
+text on the two sides, and half the time the marker isn't in the item's text at
+all - it is drawn as its own text object beside the item. So it pairs list
+ITEMS on the item's own wording, with the marker (wherever it is drawn) read
+separately and compared. See `_list_items`.
 """
 from __future__ import annotations
 
@@ -21,9 +28,9 @@ import fitz
 
 from pdfval.models import CheckResult, Issue
 from pdfval.report import screenshots
+from pdfval.validators.headings import resolve_entries
 from pdfval.validators.toc import (
     extract_section_blocks,
-    get_toc_entries,
     match_toc_entries,
     normalize_block_text,
 )
@@ -48,8 +55,12 @@ _BOLD_FLAG = 1 << 4
 # marker), so it's deliberately not repeated here. Mirrors content.py's
 # identical marker regex.
 _ROMAN_NUMERAL_MARKERS = r"ii|iii|iv|v|vi|vii|viii|ix|x|xi|xii|xiii|xiv|xv|xvi|xvii|xviii|xix|xx"
+# A middle dot is in this set because a bullet set in one of the base-14 fonts
+# has no U+2022 to map to and extracts as U+00B7 - the page shows a bullet, the
+# text layer says middle dot, and the list would otherwise go unrecognised.
+_BULLET_GLYPHS = "\u2022\u25e6\u25aa\u25b8\u2023\u2043\u00b7\u2219"
 _LIST_MARKER_RE = re.compile(
-    r"^\s*(\d{1,2}[.)]|[a-zA-Z][.)]|(?:" + _ROMAN_NUMERAL_MARKERS + r")[.)]|[•◦▪▸‣⁃])\s+",
+    r"^\s*(\d{1,2}[.)]|[a-zA-Z][.)]|(?:" + _ROMAN_NUMERAL_MARKERS + r")[.)]|[" + _BULLET_GLYPHS + r"])\s+",
     re.IGNORECASE,
 )
 
@@ -57,9 +68,40 @@ _LIST_MARKER_RE = re.compile(
 # part that is supposed to stand alone on its own line.
 _NUMBERED_LABEL_RE = re.compile(r"^\s*\d{1,2}[.)]\s+\S")
 
+# A line that is NOTHING BUT a list marker. Publishing tools routinely draw an
+# ordered list's marker as its own text object to the LEFT of the item it
+# labels - Staging does exactly this ("a." at x=280, "Disable Set time
+# automatically." at x=295, two separate blocks) - so the marker never appears
+# inside the item's own text. A check that only looked at text STARTING with a
+# marker therefore saw an unnumbered paragraph and had nothing to compare,
+# which is why a document whose every procedure was renumbered 1,2,3 -> a,b,c
+# produced no marker finding at all.
+#
+# A digit/letter marker must carry its "." or ")" here: a bare "41" sitting on
+# its own is a page number, not a list item.
+_MARKER_ONLY_RE = re.compile(
+    r"^(\d{1,3}[.)]|(?:" + _ROMAN_NUMERAL_MARKERS + r")[.)]|[a-zA-Z][.)]|[" + _BULLET_GLYPHS + r"])$",
+    re.IGNORECASE,
+)
+
+# How far to the right of a detached marker its item text may start (points).
+# Wide enough for a deep hanging indent, narrow enough that the marker can't
+# adopt a neighbouring column's text.
+MARKER_TEXT_MAX_GAP = 48.0
+# Vertical gap between two items that still reads as ONE list, so a renumbered
+# procedure is reported as a single finding covering the whole list.
+LIST_RUN_MAX_GAP = 60.0
+# How far one line's box may reach INTO the next one's before the two stop
+# counting as consecutive items (descenders and ascenders overlap routinely).
+LINE_OVERLAP_SLACK = 8.0
+# An item's text must be at least this long before it is safe to pair two
+# documents' items by it - "OK." or "Yes" occurs everywhere and would pair the
+# wrong two lines.
+MIN_ITEM_KEY_CHARS = 6
+
 
 def classify_marker(marker: str) -> str:
-    if re.match(r"^\d{1,2}[.)]$", marker):
+    if re.match(r"^\d{1,3}[.)]$", marker):
         return "number"
     if re.match(rf"^(?:{_ROMAN_NUMERAL_MARKERS})[.)]$", marker, re.IGNORECASE):
         return "roman"
@@ -75,8 +117,12 @@ def validate_alignment(
     counter = itertools.count(1)
     counts: dict[str, int] = {}
 
-    exp_entries = get_toc_entries(expected)
-    act_entries = get_toc_entries(actual)
+    exp_entries, act_entries = resolve_entries(expected, actual)
+    # One cache per document, not one per section: every check here reads a
+    # page's lines, and a page is read by as many sections as start or end on
+    # it. Built once, each page is extracted at most once for the whole run.
+    exp_lines = _LineCache(expected)
+    act_lines = _LineCache(actual)
 
     if exp_entries and act_entries:
         matches = match_toc_entries(exp_entries, act_entries)
@@ -86,12 +132,12 @@ def validate_alignment(
         for idx, m in enumerate(matched):
             _compare_section(
                 result, expected, actual, exp_sections[idx], act_sections[idx],
-                exp_entries[m.expected_index].title, output_dir, counter, counts,
+                exp_lines, act_lines, exp_entries[m.expected_index].title, output_dir, counter, counts,
             )
     else:
         _compare_section(
             result, expected, actual, _all_blocks(expected), _all_blocks(actual),
-            None, output_dir, counter, counts,
+            exp_lines, act_lines, None, output_dir, counter, counts,
         )
     return result
 
@@ -255,18 +301,28 @@ def _compare_section(
     actual: fitz.Document,
     exp_blocks: list[dict],
     act_blocks: list[dict],
+    exp_lines: _LineCache,
+    act_lines: _LineCache,
     heading: str | None,
     output_dir: str | None,
     counter: "itertools.count",
     counts: dict[str, int],
 ) -> None:
-    exp_lines = _LineCache(expected)
-    act_lines = _LineCache(actual)
     pairs = _pair_blocks(exp_blocks, act_blocks)
     pairs.sort(key=lambda p: (p[0]["page"], p[0]["bbox"][1]))
 
+    # Marker style is compared across the WHOLE section, not per paired block:
+    # the marker often isn't in the item's block text at all (see
+    # `_MARKER_ONLY_RE`), and the blocks that carry a renumbered list can never
+    # pair here anyway - `_pair_blocks` pairs on identical text, and a list
+    # whose markers changed has, by definition, different text on the two
+    # sides.
+    _check_list_markers(
+        result, expected, actual, exp_blocks, act_blocks, exp_lines, act_lines,
+        heading, output_dir, counter, counts,
+    )
+
     for exp_b, act_b in pairs:
-        _check_list_marker(result, expected, actual, exp_b, act_b, heading, output_dir, counter, counts)
         _check_indent(
             result, expected, actual, exp_b, act_b, exp_lines, act_lines, heading, output_dir, counter, counts
         )
@@ -295,36 +351,289 @@ def _details(exp_b: dict, act_b: dict, heading: str | None) -> dict:
     return details
 
 
-def _check_list_marker(
+def _item_key(text: str) -> str:
+    """The key two documents' list items are paired on: the item's own text,
+    without its marker - the marker is the thing being compared, so it can't
+    be part of what identifies the item."""
+    return " ".join(text.split()).casefold()
+
+
+def _make_item(page: int, marker: str, text: str, bbox: tuple) -> dict | None:
+    marker = marker.strip()
+    key = _item_key(text)
+    if len(key) < MIN_ITEM_KEY_CHARS or not any(ch.isalnum() for ch in key):
+        return None
+    return {
+        "page": page,
+        "marker": marker,
+        "kind": classify_marker(marker),
+        "text": " ".join(text.split()),
+        "key": key,
+        "bbox": tuple(bbox),
+    }
+
+
+def _text_right_of(marker_line: dict, bodies: list[dict], claimed: set[int]) -> tuple[str, tuple] | None:
+    """The text a DETACHED marker labels: the nearest run of spans beginning to
+    the right of it on the same row.
+
+    Span-level rather than line-level because a table row's other cells extract
+    into the same line as the step text beside them - Staging's "Manual
+    Disable Set time automatically." is one line whose first span is the
+    neighbouring cell, so taking the whole line would compare the wrong text.
+    """
+    mx1 = marker_line["bbox"][2]
+    my0, my1 = marker_line["bbox"][1], marker_line["bbox"][3]
+    best: tuple[float, dict, list[dict]] | None = None
+    for line in bodies:
+        if id(line) in claimed:
+            continue
+        by0, by1 = line["bbox"][1], line["bbox"][3]
+        overlap = min(my1, by1) - max(my0, by0)
+        if overlap <= 0.4 * min(my1 - my0, by1 - by0):
+            continue  # not on the marker's own row
+        spans = [sp for sp in line["spans"] if sp["bbox"][0] >= mx1 - 1]
+        if not spans:
+            continue
+        gap = spans[0]["bbox"][0] - mx1
+        if gap > MARKER_TEXT_MAX_GAP:
+            continue
+        if best is None or gap < best[0]:
+            best = (gap, line, spans)
+    if best is None:
+        return None
+    _, line, spans = best
+    claimed.add(id(line))
+    bbox = (
+        min(marker_line["bbox"][0], spans[0]["bbox"][0]),
+        min(my0, line["bbox"][1]),
+        max(sp["bbox"][2] for sp in spans),
+        max(my1, line["bbox"][3]),
+    )
+    return "".join(sp["text"] for sp in spans), bbox
+
+
+def _page_list_items(lines: list[dict], page: int) -> list[dict]:
+    markers: list[tuple[dict, str]] = []
+    bodies: list[dict] = []
+    for line in lines:
+        text = " ".join(line["text"].split())
+        m = _MARKER_ONLY_RE.match(text)
+        if m:
+            markers.append((line, m.group(1)))
+        else:
+            bodies.append(line)
+
+    items: list[dict] = []
+    claimed: set[int] = set()
+    # Detached markers first: each claims one specific line, and claiming it
+    # also stops that line being re-read below as an item of its own.
+    for marker_line, marker in markers:
+        found = _text_right_of(marker_line, bodies, claimed)
+        if not found:
+            continue
+        item = _make_item(page, marker, found[0], found[1])
+        if item:
+            items.append(item)
+    for line in bodies:
+        if id(line) in claimed:
+            continue
+        text = " ".join(line["text"].split())
+        m = _LIST_MARKER_RE.match(text)
+        if not m:
+            continue
+        item = _make_item(page, m.group(1), text[m.end():], tuple(line["bbox"]))
+        if item:
+            items.append(item)
+    return items
+
+
+def _list_items(cache: _LineCache, blocks: list[dict]) -> list[dict]:
+    """Every list item in this section, as {page, marker, kind, text, key, bbox}.
+
+    Built from LINES, with a detached marker joined to the text it labels,
+    because the two documents disagree about where a marker even lives:
+    Production sets "1.\t Disable Set time automatically." as one line, while
+    Staging draws "a." as a separate text object beside it. Both have to reduce
+    to the same item before the marker style can be compared at all.
+    """
+    bands: dict[int, list[float]] = {}
+    for b in blocks:
+        page, bbox = b.get("page"), b.get("bbox")
+        if page is None or not bbox:
+            continue
+        band = bands.get(page)
+        if band is None:
+            bands[page] = [bbox[1], bbox[3]]
+        else:
+            band[0] = min(band[0], bbox[1])
+            band[1] = max(band[1], bbox[3])
+
+    items: list[dict] = []
+    for page, (top, bottom) in sorted(bands.items()):
+        lines = [
+            ln for ln in cache.lines(page)
+            if top - 1 <= (ln["bbox"][1] + ln["bbox"][3]) / 2 <= bottom + 1
+        ]
+        items.extend(_page_list_items(lines, page))
+    items.sort(key=lambda it: (it["page"], round(it["bbox"][1], 1), it["bbox"][0]))
+    return items
+
+
+def _pair_list_items(exp_items: list[dict], act_items: list[dict]) -> list[tuple[dict, dict]]:
+    """Pair items whose text is identical, and only where that text occurs once
+    on each side - the same "never guess" rule `_pair_blocks` applies. A
+    mispaired item would report a renumbering that never happened.
+    """
+    def unique_index(items: list[dict]) -> dict[str, dict]:
+        seen: dict[str, dict | None] = {}
+        for it in items:
+            seen[it["key"]] = None if it["key"] in seen else it
+        return {k: v for k, v in seen.items() if v is not None}
+
+    exp_index = unique_index(exp_items)
+    act_index = unique_index(act_items)
+    pairs = [(exp_index[k], act_index[k]) for k in exp_index.keys() & act_index.keys()]
+    pairs.sort(key=lambda p: (p[0]["page"], round(p[0]["bbox"][1], 1)))
+    return pairs
+
+
+def _restarts_numbering(marker: str, kind: str) -> bool:
+    """True when this marker is the FIRST value of its kind ("1.", "a.", "i.")
+    - i.e. a new list starts here rather than the previous one continuing. A
+    table of procedures stacks several short lists one under the other with no
+    more whitespace between them than between their own items, so the restart,
+    not the gap, is what tells them apart.
+    """
+    value = marker.rstrip(".)").strip().casefold()
+    if kind == "number":
+        return value == "1"
+    if kind == "letter":
+        return value == "a"
+    if kind == "roman":
+        return value == "i"
+    return False  # a bullet has no sequence to restart
+
+
+def _marker_runs(pairs: list[tuple[dict, dict]]) -> list[list[tuple[dict, dict]]]:
+    """Group changed items back into the list they came from, so a five-step
+    procedure renumbered 1-5 -> a-e is ONE finding showing the whole list
+    rather than five the reader has to reassemble.
+    """
+    runs: list[list[tuple[dict, dict]]] = []
+    for exp_it, act_it in pairs:
+        run = runs[-1] if runs else None
+        # Consecutive lines' bboxes overlap slightly (one line's descenders
+        # reach below the next line's ascenders), so the gap test has to allow
+        # a small negative value or every item starts its own "run".
+        gap = exp_it["bbox"][1] - run[-1][0]["bbox"][3] if run else None
+        if (
+            run
+            and run[-1][0]["page"] == exp_it["page"]
+            and run[-1][0]["kind"] == exp_it["kind"]
+            and run[-1][1]["kind"] == act_it["kind"]
+            and -LINE_OVERLAP_SLACK <= gap <= LIST_RUN_MAX_GAP
+            and not _restarts_numbering(exp_it["marker"], exp_it["kind"])
+        ):
+            run.append((exp_it, act_it))
+        else:
+            runs.append([(exp_it, act_it)])
+    return runs
+
+
+# How each marker kind is spoken about in the finding.
+_MARKER_KIND_VERB = {
+    "number": "numbers",
+    "letter": "letters",
+    "roman": "numbers with roman numerals",
+    "bullet": "bullets",
+}
+_MARKER_KIND_ADJ = {"number": "numbered", "letter": "lettered", "roman": "roman", "bullet": "bulleted"}
+
+
+def _marker_summary(items: list[dict]) -> str:
+    shown = [it["marker"] for it in items[:6]]
+    listed = ", ".join(shown) + (" …" if len(items) > len(shown) else "")
+    return f"{listed} ({_MARKER_KIND_ADJ[items[0]['kind']]})"
+
+
+def _marker_range(items: list[dict]) -> str:
+    """"1.–5." for a run, just "3." for a single item."""
+    first, last = items[0]["marker"], items[-1]["marker"]
+    return first if first == last else f"{first}\u2013{last}"
+
+
+def _run_anchor(items: list[dict]) -> dict:
+    """The page and region a run of list items covers, for the screenshot."""
+    page = items[0]["page"]
+    boxes = [it["bbox"] for it in items if it["page"] == page]
+    return {
+        "page": page,
+        "bbox": (
+            min(b[0] for b in boxes), min(b[1] for b in boxes),
+            max(b[2] for b in boxes), max(b[3] for b in boxes),
+        ),
+    }
+
+
+def _check_list_markers(
     result: CheckResult,
     expected: fitz.Document,
     actual: fitz.Document,
-    exp_b: dict,
-    act_b: dict,
+    exp_blocks: list[dict],
+    act_blocks: list[dict],
+    exp_lines: _LineCache,
+    act_lines: _LineCache,
     heading: str | None,
     output_dir: str | None,
     counter: "itertools.count",
     counts: dict[str, int],
 ) -> None:
-    """The same list item styled with a different marker kind - Production
-    numbers it 1,2,3 while Staging uses a,b,c or a bullet.
+    """The same list item marked differently on each side - Production numbers
+    a procedure 1., 2., 3. where Staging letters it a., b., c. or drops it to a
+    bullet.
+
+    Reported as a mismatch rather than advisory layout drift: renumbering a
+    procedure changes what the reader is told to do ("repeat step 3" no longer
+    resolves), and unlike indent it cannot happen by accident between two
+    exports of the same source.
     """
-    exp_m = _LIST_MARKER_RE.match(exp_b["text"])
-    act_m = _LIST_MARKER_RE.match(act_b["text"])
-    if not exp_m or not act_m:
-        return
-    exp_kind = classify_marker(exp_m.group(1))
-    act_kind = classify_marker(act_m.group(1))
-    if exp_kind == act_kind or not _budget(counts, "marker"):
-        return
-    details = _details(exp_b, act_b, heading)
-    details["expected_marker"] = f"{exp_m.group(1)} ({exp_kind})"
-    details["actual_marker"] = f"{act_m.group(1)} ({act_kind})"
-    details["text"] = [exp_b["text"]]
-    _attach(details, expected, actual, output_dir, counter, exp_b, act_b)
-    result.issues.append(
-        Issue(severity="warning", page=exp_b["page"], message="List marker changed", details=details)
-    )
+    pairs = [
+        (exp_it, act_it)
+        for exp_it, act_it in _pair_list_items(
+            _list_items(exp_lines, exp_blocks), _list_items(act_lines, act_blocks)
+        )
+        if exp_it["kind"] != act_it["kind"]
+    ]
+    for run in _marker_runs(pairs):
+        if not _budget(counts, "marker"):
+            return
+        exp_items = [e for e, _ in run]
+        act_items = [a for _, a in run]
+        exp_anchor = _run_anchor(exp_items)
+        act_anchor = _run_anchor(act_items)
+        details = _details(exp_anchor, act_anchor, heading)
+        details["expected_marker"] = _marker_summary(exp_items)
+        details["actual_marker"] = _marker_summary(act_items)
+        details["items"] = len(run)
+        count = len(run)
+        details["changed"] = (
+            f"Production {_MARKER_KIND_VERB[exp_items[0]['kind']]} "
+            f"{'this' if count == 1 else 'these'} {count} "
+            f"{'item' if count == 1 else 'items'} ({_marker_range(exp_items)}); "
+            f"Staging {_MARKER_KIND_VERB[act_items[0]['kind']]} "
+            f"{'it' if count == 1 else 'them'} ({_marker_range(act_items)})"
+        )
+        details["text"] = [it["text"] for it in exp_items[:5]]
+        _attach(details, expected, actual, output_dir, counter, exp_anchor, act_anchor)
+        result.issues.append(
+            Issue(
+                severity="error",
+                page=exp_anchor["page"],
+                message="List marker changed",
+                details=details,
+            )
+        )
 
 
 def _check_indent(
@@ -481,11 +790,15 @@ def _attach(
     seq = next(counter)
     if seq > MAX_SCREENSHOTS:
         return
+    label = str(seq)  # the same number on both crops - one block, two layouts
+    details["shot_label"] = label
     prod = screenshots.capture_region(
-        expected, exp_b["page"], output_dir, f"align_{seq}_prod", exp_b["bbox"]
+        expected, exp_b["page"], output_dir, f"align_{seq}_prod", exp_b["bbox"],
+        screenshots.KIND_DIFF, label,
     )
     stage = screenshots.capture_region(
-        actual, act_b["page"], output_dir, f"align_{seq}_stage", act_b["bbox"]
+        actual, act_b["page"], output_dir, f"align_{seq}_stage", act_b["bbox"],
+        screenshots.KIND_DIFF, label,
     )
     if prod:
         details["prod_screenshot"] = prod

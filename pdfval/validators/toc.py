@@ -24,7 +24,7 @@ TITLE_MATCH_THRESHOLD = 0.6  # minimum similarity to pair up two non-identical h
 # by validate_toc / toc.html, so comparing this text line-by-line in the
 # section browser just floods it with red. Matched by title in English and CJK.
 _EXCLUDED_HEADING_RE = re.compile(
-    r"\bq\s*&\s*a\b|\bfaq\b|\btable of contents\b|\bq\s*&\s*a\s*index\b"
+    r"\bq\s*&\s*a\b|\bfaq\b|\btable of contents?\b|\bq\s*&\s*a\s*index\b"
     r"|目\s*录|索\s*引|问\s*答|常见问题",
     re.IGNORECASE,
 )
@@ -44,7 +44,7 @@ def looks_like_toc_listing(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
         return False
-    if stripped.lower().rstrip(":") == "table of contents":
+    if stripped.lower().rstrip(":") in ("table of contents", "table of content"):
         return True
     return bool(_TOC_DOT_LEADER_RE.search(stripped))
 
@@ -245,8 +245,17 @@ def looks_like_page_number(text: str) -> bool:
 # comparing them yields nothing but noise - so they are dropped before any
 # comparison, exactly as bare page numbers already are.
 _HF_BAND = 0.12          # top/bottom fraction of page height that is the header/footer margin
+# A footer that appears on only ONE page is recognized by position alone, so it
+# must hug the page edge. At the full 12% band that test reached 100 points up
+# an A4 page and swallowed the last row of any table that ran that far down -
+# on the pair this was built against it ate Staging's "Power off reminder"
+# label cell, which then showed in the report as a row Production has and
+# Staging lacks. A footer repeated across pages is still caught anywhere in the
+# wider band by the repeat test.
+_HF_LONE_BAND = 0.06
 _HF_SHORT_WORDS = 16     # a header/footer line is short; a real paragraph at the margin is not
 _HF_SHORT_LINES = 3
+_HF_ONE_STRIP_HEIGHT = 22.0  # points - a block no taller than this is one printed strip
 _HF_REPEAT_MIN = 3       # a short line in the margin band on >= this many pages is chrome for sure
 
 # Keyed by id() - PyMuPDF Documents are not weak-referenceable. Cleared by
@@ -268,9 +277,21 @@ _CJK_RANGE_RE = re.compile(r"[\u3040-\u33ff\u3400-\u9fff\uac00-\ud7af\uf900-\ufa
 _SENTENCE_END = ("。", "！", "？", ".", "!", "?", "；", ";", "，", "、")
 
 
-def _is_short_line(text: str) -> bool:
+def _is_short_line(text: str, height: float | None = None) -> bool:
     s = text.strip()
-    if not s or s.count("\n") + 1 > _HF_SHORT_LINES:
+    if not s:
+        return False
+    # A block PyMuPDF hands back as several "lines" that all sit on ONE
+    # baseline is a single printed strip, not a multi-line paragraph: the
+    # print-shop slug across the foot of an InDesign export comes back as
+    # "ST04_UM_V2_EN.indb 16 / ST04_UM_V2_EN.indb 16 / 2026/3/2 12:34 /
+    # 2026/3/2 12:34" - four "lines" 6 points tall in total. Counted as four
+    # lines it failed the cap below, was never recognized as a footer, and
+    # showed up in the report as content Production has and Staging lacks.
+    # Trust the block's real height when the caller knows it.
+    if s.count("\n") + 1 > _HF_SHORT_LINES and not (
+        height is not None and height <= _HF_ONE_STRIP_HEIGHT
+    ):
         return False
     if s.rstrip().endswith(_SENTENCE_END):
         return False  # a finished sentence is content, not chrome
@@ -298,7 +319,7 @@ def _scan_running_header_footer(doc: "fitz.Document") -> set:
         bot_edge = rect.y1 - h * _HF_BAND
         for b in blocks:
             y0, y1, text = b[1], b[3], (b[4] or "")
-            if not _is_short_line(text):
+            if not _is_short_line(text, y1 - y0):
                 continue
             k = _hf_key(text)
             if not k:
@@ -336,11 +357,13 @@ def is_running_header_footer(doc: "fitz.Document", page_index: int, bbox, text: 
     key = _hf_key(stripped)
     if in_top and ("top", key) in sigs:
         return True
-    if in_bot and (("bot", key) in sigs or _is_short_line(stripped)):
+    at_bot_edge = y1 >= rect.y1 - h * _HF_LONE_BAND
+    if in_bot and (("bot", key) in sigs or (at_bot_edge and _is_short_line(stripped, y1 - y0))):
         # A short line in the footer band is a footer whether or not it repeats
-        # (the back-page copyright strip only appears once). The header band is
-        # left to the repeat test alone - real section content legitimately
-        # begins at the very top of a page.
+        # (the back-page copyright strip only appears once), but a one-off is
+        # only trusted right at the page edge - see `_HF_LONE_BAND`. The header
+        # band is left to the repeat test alone - real section content
+        # legitimately begins at the very top of a page.
         return True
     return False
 
@@ -488,34 +511,135 @@ def get_toc_entries(doc: fitz.Document) -> list[TocEntry]:
 
     PDF outlines don't use one consistent coordinate convention for the
     bookmark destination point across documents (some are bottom-left/native,
-    some are already top-left, depending on how the destination was encoded).
-    Rather than trust a single formula, we ground the position in the actual
-    rendered page: look for a text block whose content matches the heading
-    title, and use its real bbox. The destination point's y (flipped to
-    top-left origin) is only a fallback when no matching block is found.
+    some are already top-left, depending on how the destination was encoded) -
+    and plenty of real outlines, including every InDesign export this was built
+    against, encode no point at all (`to = (0, 0)` for every bookmark). So the
+    position is grounded in the actual rendered page: find the LINE that prints
+    the title and use its real y. The destination point is only a last resort.
+
+    Entries are resolved in outline order and each one is looked for BELOW the
+    previous entry on the same page, so two sections whose titles both appear
+    twice on a page can't resolve to the same line or land out of order.
     """
     entries: list[TocEntry] = []
+    prev_page, prev_y = -1, -1.0
     for level, title, page_1based, dest in doc.get_toc(simple=False):
         page_index = max(0, min(page_1based - 1, doc.page_count - 1))
         title = " ".join(title.split())
-        y = _locate_heading_y(doc, page_index, title, dest)
+        after = prev_y if page_index == prev_page else None
+        y = _locate_heading_y(doc, page_index, title, dest, after)
         entries.append(TocEntry(level=level, title=title, page=page_index, y=y, excluded=is_excluded_heading(title)))
+        prev_page, prev_y = page_index, y
     return entries
 
 
-def _locate_heading_y(doc: fitz.Document, page_index: int, title: str, dest: object) -> float:
+# A heading's own line is routinely grouped by PyMuPDF into the SAME text block
+# as the lines above it - a page whose figure callouts sit directly over the
+# next section's title comes back as one block reading "1. IR sensor 2. Power
+# status light Left panel". Matching the title against whole blocks then finds
+# nothing, the heading falls back to the destination point, and a `to = (0, 0)`
+# outline puts it at the bottom of the page: the section gets an EMPTY body,
+# and every sentence really printed under it shows in the report as "not in
+# Production" against the other document's copy of the very same text. Matching
+# per LINE is what makes those sections come back whole.
+_HEADING_HEAVY_FONT_RE = re.compile(r"bold|black|heavy|semib|demi|medium", re.I)
+_HEADING_PROMINENT_RATIO = 1.15  # line vs. the page's dominant size = set as a heading
+# Keyed by id() like `_PARA_CACHE`, and cleared by `reset_paragraph_cache()`.
+_HEADING_LINE_CACHE: dict[tuple[int, int], dict[str, list[tuple[float, bool]]]] = {}
+
+
+def _heading_line_map(doc: fitz.Document, page_index: int) -> dict[str, list[tuple[float, bool]]]:
+    """`squashed line text -> [(y0, set as a heading), ...]` for every text line
+    on the page, plus each block's 2- and 3-line joins so a title the layout
+    wrapped is still found whole. Sorted by y."""
+    key = (id(doc), page_index)
+    cached = _HEADING_LINE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    data = doc[page_index].get_text("dict")
+    rows: list[tuple[str, float, float, bool]] = []  # text, y0, size, heavy
+    for block in data.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        lines = []
+        for ln in block.get("lines", []):
+            spans = [s for s in ln.get("spans", []) if s.get("text", "").strip()]
+            if not spans:
+                continue
+            lines.append((
+                "".join(s["text"] for s in spans),
+                float(ln["bbox"][1]),
+                max(float(s.get("size", 0.0)) for s in spans),
+                all(_HEADING_HEAVY_FONT_RE.search(str(s.get("font", ""))) for s in spans),
+            ))
+        rows.extend(lines)
+        # A wrapped title: the join of the first 2 or 3 lines of a run.
+        for i in range(len(lines)):
+            for n in (2, 3):
+                if i + n > len(lines):
+                    break
+                grp = lines[i:i + n]
+                rows.append((
+                    " ".join(g[0] for g in grp), grp[0][1],
+                    max(g[2] for g in grp), all(g[3] for g in grp),
+                ))
+
+    sizes: dict[float, int] = {}
+    for text, _y, size, _heavy in rows:
+        sizes[round(size, 1)] = sizes.get(round(size, 1), 0) + len(text.strip())
+    body_size = max(sizes, key=sizes.get) if sizes else 0.0
+
+    out: dict[str, list[tuple[float, bool]]] = {}
+    for text, y, size, heavy in rows:
+        if looks_like_toc_listing(text):
+            continue
+        squashed = _squash_title(text)
+        if not squashed or len(squashed) > 160:
+            continue
+        prominent = bool(body_size) and (size >= body_size * _HEADING_PROMINENT_RATIO or heavy)
+        out.setdefault(squashed, []).append((y, prominent))
+    for ys in out.values():
+        ys.sort()
+    _HEADING_LINE_CACHE[key] = out
+    return out
+
+
+def _pick_heading_y(candidates: list[tuple[float, bool]], after: float | None) -> float | None:
+    """The right occurrence of a title printed more than once on one page: the
+    first one below `after` (the previous outline entry on this page) wins, and
+    among those the one actually SET as a heading beats a passing mention."""
+    if not candidates:
+        return None
+    in_order = [c for c in candidates if after is None or c[0] > after + 1.0] or candidates
+    styled = [c for c in in_order if c[1]]
+    return (styled or in_order)[0][0]
+
+
+def _locate_heading_y(
+    doc: fitz.Document, page_index: int, title: str, dest: object, after: float | None = None
+) -> float:
     page = doc[page_index]
     normalized_title = normalize_title(title)
     if normalized_title:
+        # The line (or wrapped pair of lines) that prints exactly this title.
+        y = _pick_heading_y(_heading_line_map(doc, page_index).get(_squash_title(title), []), after)
+        if y is not None:
+            return y
+        # Then a whole block - an outline title that is a prefix of the printed
+        # one, or vice versa, which the exact line test above deliberately
+        # won't take.
         candidates = []
         for block in page.get_text("blocks"):
             text = normalize_title(block[4])
             if not text:
                 continue
             if text == normalized_title or text.startswith(normalized_title) or normalized_title.startswith(text):
-                candidates.append(block[1])
-        if candidates:
-            return min(candidates)
+                candidates.append((block[1], False))
+        candidates.sort()
+        y = _pick_heading_y(candidates, after)
+        if y is not None:
+            return y
 
     to = dest.get("to") if isinstance(dest, dict) else None
     if to is None:
@@ -718,6 +842,7 @@ _PARA_MERGE_MAX_VGAP_RATIO = 1.4   # blocks farther apart than this * line-heigh
 _PARA_MERGE_LEFT_TOL = 8.0         # left edges must line up within this many points
 _PARA_MERGE_RIGHT_SLACK = 12.0     # prev block's last line must end within this of the column edge
 _PARA_MERGE_SIZE_TOL = 1.0         # font-size difference that still counts as one paragraph
+_PARA_MERGE_HEADING_RATIO = 1.2    # next block's first line this much bigger = it opens a heading
 
 
 def _block_line_geometry_from(data: dict) -> dict:
@@ -745,13 +870,37 @@ def _block_line_geometry_from(data: dict) -> dict:
         )
         total_chars = sum(len(s.get("text", "")) for s in text_spans) or 1
         first, last = rows[0]["bbox"], rows[-1]["bbox"]
+
+        def _line_size(ln) -> float:
+            got = [float(s.get("size", 0.0)) for s in ln.get("spans", []) if s.get("text", "").strip()]
+            return max(got) if got else 10.0
+
         out[_round_bbox(block.get("bbox", (0, 0, 0, 0)))] = {
             "first_x0": float(first[0]),
             "last_x1": float(last[2]),
             "size": max(sizes) if sizes else 10.0,
+            # The block-level size is the MAX over every line, so a block that
+            # starts with a heading line and continues in body text reports the
+            # heading's size - which makes two such blocks look like the same
+            # size and lets them merge. The first/last line sizes are what the
+            # join between two blocks actually looks like.
+            "first_size": _line_size(rows[0]),
+            "last_size": _line_size(rows[-1]),
             "line_h": max(float(first[3] - first[1]), 1.0),
             "n_lines": len(rows),
             "mostly_bold": bold_chars / total_chars >= 0.7,
+            # Per-line geometry, so a caller bounding a SECTION can trim a
+            # block that straddles the boundary instead of taking or dropping
+            # it whole (see `_extract_blocks_range`).
+            "lines": [
+                {
+                    "x0": float(ln["bbox"][0]), "y0": float(ln["bbox"][1]),
+                    "x1": float(ln["bbox"][2]), "y1": float(ln["bbox"][3]),
+                    "text": "".join(s.get("text", "") for s in ln.get("spans", [])).strip(),
+                    "size": _line_size(ln),
+                }
+                for ln in rows
+            ],
         }
     return out
 
@@ -818,6 +967,17 @@ def _merge_wrapped_blocks(page, page_index):
                 and not i18n.ends_with_terminator(p["text"])
                 and not g.get("mostly_bold")
             )
+            # The next block OPENS with a heading line (set materially larger
+            # than the line this one ends on). `same_size` cannot see it: a
+            # block's size is the max over its lines, so a block whose first
+            # line is a 7pt heading and whose body is 5pt reports 7pt, and two
+            # such blocks compare as identical. Merging them ran a section's
+            # last paragraph straight into the NEXT section's heading and body,
+            # which then showed up inside the wrong section.
+            next_opens_heading = (
+                float(g.get("first_size", 0.0))
+                >= float(prev_g.get("last_size", 0.0)) * _PARA_MERGE_HEADING_RATIO
+            )
             # A bare marker ("1.", "a)") the PDF placed to the RIGHT of its own
             # list item (so it sorts just after the item text) belongs at the
             # FRONT of that item - which is where the other document, and a
@@ -834,20 +994,26 @@ def _merge_wrapped_blocks(page, page_index):
                     min(p["bbox"][0], x0), min(p["bbox"][1], y0),
                     max(p["bbox"][2], x1), max(p["bbox"][3], y1),
                 )
+                p["lines"] = list(g.get("lines") or []) + p["lines"]
                 merged = True
             elif (
                 0 <= vgap <= _PARA_MERGE_MAX_VGAP_RATIO * line_h
                 and same_left and same_size and prev_wrapped
                 and not next_is_item and not prev_is_heading
+                and not next_opens_heading
             ):
                 p["text"] = p["text"] + "\n" + text
                 p["bbox"] = (
                     min(p["bbox"][0], x0), min(p["bbox"][1], y0),
                     max(p["bbox"][2], x1), max(p["bbox"][3], y1),
                 )
+                p["lines"] = p["lines"] + list(g.get("lines") or [])
                 merged = True
         if not merged:
-            out.append({"text": text, "page": page_index, "bbox": (x0, y0, x1, y1)})
+            out.append({
+                "text": text, "page": page_index, "bbox": (x0, y0, x1, y1),
+                "lines": list(g.get("lines") or []) if g else [],
+            })
         prev_g = g
     return out
 
@@ -865,6 +1031,7 @@ _PARA_CACHE: dict[tuple[int, int], list[dict]] = {}
 def reset_paragraph_cache() -> None:
     _PARA_CACHE.clear()
     _hf_cache.clear()
+    _HEADING_LINE_CACHE.clear()
 
 
 def _reconstruct_paragraphs(page, page_index):
@@ -876,6 +1043,37 @@ def _reconstruct_paragraphs(page, page_index):
     # Hand back copies - callers mutate the block dicts (normalize_block_text,
     # bbox unions) and must not corrupt the shared cache entry.
     return [dict(b) for b in cached]
+
+
+def _squash_title(text: str) -> str:
+    """A title with every space removed, for comparing a heading against the
+    line(s) that print it. CJK headings have no spaces at all, and a title the
+    PDF wrapped over two lines joins with one only sometimes - squashing makes
+    both cases compare the same way."""
+    return re.sub(r"\s+", "", normalize_title(text))
+
+
+def _drop_heading_lines(lines: list[dict], normalized_heading: str) -> list[dict]:
+    """Drop the heading's OWN line(s) from the front of its section's first
+    block.
+
+    A PDF's text block routinely carries the heading line and the body under it
+    together - PyMuPDF groups them - so the block-level title test below never
+    fires and the section's first sentence came back with its heading glued to
+    the front ("Power safety precautionsAlways connect the earth..."). Handles
+    a title the PDF wrapped over two or three lines.
+    """
+    target = _squash_title(normalized_heading)
+    if not target:
+        return lines
+    acc = ""
+    for i, ln in enumerate(lines[:3]):
+        acc += _squash_title(ln["text"])
+        if not acc or not target.startswith(acc):
+            return lines
+        if acc == target:
+            return lines[i + 1:]
+    return lines
 
 
 def _extract_blocks_range(
@@ -894,13 +1092,45 @@ def _extract_blocks_range(
             text = para["text"]
             if not text.strip():
                 continue
-            if page_index == start_page and y0 < start_y - tolerance:
+            # Bound the section by LINE, not by block. A block that starts
+            # inside this section can run past its end - it carries the next
+            # heading and that section's body too - and taking or dropping it
+            # whole either pulls the next section's content in here or loses
+            # the tail of this one. Trimming to the lines actually inside the
+            # range is what keeps the two documents' columns aligned.
+            lines = para.get("lines") or []
+            if lines:
+                kept = [
+                    ln for ln in lines
+                    if not (page_index == start_page and ln["y0"] < start_y - tolerance)
+                    and not (page_index == end_page and ln["y0"] >= end_y - tolerance)
+                ]
+                # Only the block this section actually STARTS in can carry the
+                # heading's own line - gating on "nothing was trimmed" instead
+                # missed the common case where the same block also runs past
+                # the section's end and lost its tail to the trim above.
+                if (
+                    normalized_heading and page_index == start_page
+                    and kept and kept[0]["y0"] <= start_y + tolerance
+                ):
+                    kept = _drop_heading_lines(kept, normalized_heading)
+                if not kept:
+                    continue
+                if len(kept) != len(lines):
+                    text = "\n".join(ln["text"] for ln in kept if ln["text"])
+                    if not text.strip():
+                        continue
+                    x0 = min(ln["x0"] for ln in kept)
+                    y0 = min(ln["y0"] for ln in kept)
+                    x1 = max(ln["x1"] for ln in kept)
+                    y1 = max(ln["y1"] for ln in kept)
+            elif page_index == start_page and y0 < start_y - tolerance:
                 continue
-            if page_index == end_page and y0 >= end_y - tolerance:
+            elif page_index == end_page and y0 >= end_y - tolerance:
                 continue
             if is_toc or looks_like_page_number(text):
                 continue
-            if is_running_header_footer(doc, page_index, para["bbox"], text):
+            if is_running_header_footer(doc, page_index, (x0, y0, x1, y1), text):
                 continue
             # The heading's own title line is already validated by the TOC
             # comparison table - skip it here so it isn't also reported as a

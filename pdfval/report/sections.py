@@ -9,6 +9,7 @@ splitting so the two views agree on what "a section" and "a sentence" are.
 from __future__ import annotations
 
 import difflib
+import html
 import os
 import re
 
@@ -16,22 +17,116 @@ import fitz
 
 from pdfval.validators import content as _content
 from pdfval import ocr as _ocr
+from pdfval.report import screenshots as _shots
+from pdfval.validators.headings import resolve_entries
 from pdfval.validators.toc import (
     TocEntry,
     extract_section_blocks,
-    get_toc_entries,
     is_excluded_heading,
     match_toc_entries,
     normalize_block_text,
     normalize_title,
 )
 
+_WHOLE_DOC_TITLE = "Whole document"
+# A stand-in span is there to show the reader WHERE, not to re-render a
+# chapter beside a two-line section.
+_FALLBACK_MAX_PAGES = 2
+
+
+def _section_ends(entries: list[TocEntry]) -> list[tuple[int, float]]:
+    """Each entry's END `(page, y)` - the position of the next heading in
+    reading order, or the end of the document."""
+    order = sorted(range(len(entries)), key=lambda i: (entries[i].page, entries[i].y))
+    ends: list[tuple[int, float]] = [(10**9, float("inf"))] * len(entries)
+    for place, idx in enumerate(order):
+        if place + 1 < len(order):
+            nxt = entries[order[place + 1]]
+            ends[idx] = (nxt.page, nxt.y)
+    return ends
+
+
+def _heading_band(
+    doc: fitz.Document, entry: TocEntry | None, end: tuple[int, float] | None
+) -> list[dict]:
+    """A geometric stand-in span for a section whose text blocks came back
+    empty - a container heading, or a page whose content is all table/figure.
+    The snapshot then still shows the reader what is actually printed under
+    that heading instead of the column reading "Not in Production"."""
+    if entry is None or not (0 <= entry.page < doc.page_count):
+        return []
+    end_page, end_y = end or (10**9, float("inf"))
+    if end_y <= 0:  # the next heading starts at the very top of its page
+        end_page -= 1
+    last = min(doc.page_count - 1, end_page, entry.page + _FALLBACK_MAX_PAGES - 1)
+    out: list[dict] = []
+    for p in range(entry.page, max(entry.page, last) + 1):
+        rect = doc[p].rect
+        y0 = max(rect.y0, entry.y - _SNAP_MARGIN) if p == entry.page else rect.y0
+        y1 = min(rect.y1, end_y) if p == end_page else rect.y1
+        if y1 - y0 < 6:
+            continue
+        out.append({"page": p, "bbox": (rect.x0, y0, rect.x1, y1)})
+    return out
+
+
+def _capped_span(blocks: list[dict] | None, max_pages: int = _FALLBACK_MAX_PAGES) -> list[dict]:
+    """The first `max_pages` pages of a stand-in span - a fallback is there to
+    show the reader WHERE in the other document to look, not to re-render a
+    whole chapter beside a two-line section."""
+    pages: list[int] = []
+    out: list[dict] = []
+    for b in blocks or []:
+        p = b.get("page")
+        if not isinstance(p, int):
+            continue
+        if p not in pages:
+            if len(pages) >= max_pages:
+                continue
+            pages.append(p)
+        out.append(b)
+    return out
+
+
+# Separators a document puts between the entries of a "see also" list of
+# section links - a dash, a bullet, a comma - when the extractor hands the
+# whole list back as one line.
+_HEADING_RUN_SEP_RE = re.compile(r"^[\s\-\u2013\u2014\u2022\u00b7,;:>/]{0,3}")
+
+
+def _is_heading_title_run(text: str, heading_titles: set[str]) -> bool:
+    """True when `text` is nothing but a run of two or more known heading
+    titles - a cross-reference list ("Configuring startup and shutdown settings
+    -Configuring power off and sleep settings -Setting a power schedule"), or a
+    parent title glued to its first child ("投影机概述概述").
+
+    One document lays such a list out as three separate lines, each of which
+    the single-title test above recognizes and drops as navigation; the other
+    emits all three as one block, which matches no single title and survives -
+    so the report showed the whole list as content only Production has.
+    """
+    nt = normalize_title(text)
+    if not nt:
+        return False
+    titles = sorted((t for t in heading_titles if t), key=len, reverse=True)
+    pos = found = 0
+    while pos < len(nt):
+        pos += _HEADING_RUN_SEP_RE.match(nt[pos:]).end()
+        if pos >= len(nt):
+            break
+        for t in titles:
+            if nt.startswith(t, pos):
+                pos += len(t)
+                found += 1
+                break
+        else:
+            return False
+    return found >= 2
+
 
 def _is_heading_line(text: str, heading_titles: set[str]) -> bool:
     """A sub-heading's own title line, extracted as a line of the parent
-    section's body, is navigation not content. Also catches a parent title
-    glued to its first child title in one extracted block ("投影机概述概述" =
-    "投影机概述" + "概述"), which a plain set lookup misses."""
+    section's body, is navigation not content."""
     nt = normalize_title(text)
     if not nt:
         return False
@@ -41,10 +136,7 @@ def _is_heading_line(text: str, heading_titles: set[str]) -> bool:
     # section extractor swept in, never body text.
     if len(nt) <= 24 and is_excluded_heading(nt):
         return True
-    for t in heading_titles:
-        if t and len(t) < len(nt) and nt.startswith(t) and normalize_title(nt[len(t):]) in heading_titles:
-            return True
-    return False
+    return _is_heading_title_run(nt, heading_titles)
 
 
 def _section_records(section_blocks: list[dict], heading_titles: set[str]) -> list[dict]:
@@ -137,23 +229,36 @@ _CJK_CHAR_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿豈-﫿가-힯]")
 
 
 def _tok_set(text: str) -> set[str]:
-    key = _key(text or "").lower()
-    # Latin/digit words, plus every CJK character on its own - a spaceless
-    # script has no word tokens for the `[a-z0-9]{3,}` pass to find, which
-    # left every reworded Chinese sentence pair looking like two unrelated
-    # lines (zero overlap) instead of one change with an inline diff.
-    return set(re.findall(r"[a-z0-9]{3,}", key)) | set(_CJK_CHAR_RE.findall(key))
+    # Words in ANY script, plus every CJK character on its own - a spaceless
+    # script has no word tokens for a `[a-z0-9]{3,}` pass to find, which left
+    # every reworded Chinese sentence pair looking like two unrelated lines
+    # (zero overlap) instead of one change with an inline diff. Restricted to
+    # a-z it did exactly the same to Cyrillic and Greek: two Russian renderings
+    # of one directive showed as a prod-only row and a stage-only row rather
+    # than one reworded line with the difference marked inside it.
+    return {
+        w for w in _alnum_blob(_key(text or "")).split()
+        if len(w) >= 3 or _CJK_CHAR_RE.match(w)
+    }
 
 
 def _alnum_blob(text: str) -> str:
-    # ASCII alnum words kept as-is; every CJK character kept but space-isolated
-    # so it becomes its own token in the word-set comparisons below. Without
-    # this a whole Chinese sentence collapsed to a single unusable token and
-    # the "is this really present in the other document" reconciliation never
-    # fired for CJK - so relocated Chinese content stayed flagged prod/stage
-    # only with an empty opposite column.
+    # Every CJK character is kept but space-isolated so it becomes its own
+    # token in the word-set comparisons below. Without this a whole Chinese
+    # sentence collapsed to a single unusable token and the "is this really
+    # present in the other document" reconciliation never fired for CJK - so
+    # relocated Chinese content stayed flagged prod/stage only with an empty
+    # opposite column.
+    #
+    # Everything else is kept as words of LETTERS in any script, not just
+    # a-z. Restricted to ASCII, this threw away every Cyrillic, Greek, Thai and
+    # accented-Latin word outright, so a multilingual regulatory page - a WEEE
+    # notice repeated in 20 languages - had nothing left to reconcile with:
+    # "Русский" came back as the empty string on both sides, and a list whose
+    # language label the two documents order differently reported the very same
+    # word as missing from Production AND added in Staging, three lines apart.
     s = _CJK_CHAR_RE.sub(lambda m: f" {m.group(0)} ", (text or "").lower())
-    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9㐀-鿿぀-ヿ가-힯 ]+", " ", s)).strip()
+    return re.sub(r"\s+", " ", re.sub(r"[^\w ]+", " ", s, flags=re.UNICODE)).strip()
 
 
 def _sig_words(text: str) -> set[str]:
@@ -179,6 +284,32 @@ _RECONCILE_STOPWORDS = {
 }
 
 
+_RUN_MAX_TOKENS = 5   # tokens - above this, match on characters instead (below)
+_RUN_MIN_CHARS = 12   # characters - a shorter run proves too little on its own
+
+
+def _contains_run(blob: str, text: str) -> bool:
+    """Is `text` itself printed somewhere in `blob` - its own tokens, in order
+    and unbroken?
+
+    Word-for-word for a short fragment, and character-for-character with
+    spacing discounted for anything longer. The second form is what settles a
+    line the two producers tokenise differently: Production sets a phone number
+    as "Cell# +880-18-47052070" plus "or +880-17-14077062" on the next line and
+    Staging runs the two together as "...47052070or +880-17...", and a Japanese
+    sentence one document wraps mid-word comes back with the break in a
+    different place. Order and adjacency make this a far stricter test than the
+    word-set ones, so a genuinely dropped paragraph is never swallowed by it.
+    """
+    frag = _alnum_blob(text)
+    if not frag:
+        return False
+    if len(frag.split()) <= _RUN_MAX_TOKENS and f" {frag} " in f" {blob} ":
+        return True
+    squashed = frag.replace(" ", "")
+    return len(squashed) >= _RUN_MIN_CHARS and squashed in blob.replace(" ", "")
+
+
 def _reconcile_cross_present(rows: list[dict], exp_full_blob: str, act_full_blob: str) -> None:
     """A short sentence that shows as prod-only / stage-only but whose every
     meaningful word appears in the OTHER document's full section text is not
@@ -192,22 +323,27 @@ def _reconcile_cross_present(rows: list[dict], exp_full_blob: str, act_full_blob
     exp_words = set(exp_full_blob.split())
     act_words = set(act_full_blob.split())
 
-    def present(text: str, other_words: set[str]) -> bool:
+    def present(text: str, other_words: set[str], other_blob: str) -> bool:
         n = _blob_len(text)
         words = _sig_words(text)
-        if not words or not (words <= other_words):
-            return False
-        # a short fragment (the reading order split a figure-box label) needs
-        # only its words present; a longer line must be a real sentence-length
-        # match, all meaningful words accounted for. CJK counts characters, not
-        # words, so its caps are higher.
-        return (n <= 5) or (n <= 14 and len(words) >= 3) or (n <= 45 and len(words) >= 6)
+        if words and words <= other_words:
+            # a short fragment (the reading order split a figure-box label)
+            # needs only its words present; a longer line must be a real
+            # sentence-length match, all meaningful words accounted for. CJK
+            # counts characters, not words, so its caps are higher.
+            return (n <= 5) or (n <= 14 and len(words) >= 3) or (n <= 45 and len(words) >= 6)
+        # The word-set test can't see two kinds of real match: a fragment with
+        # no word of three characters at all ("4K", "16:9", "Wi-Fi", a spec
+        # value), and a line the two producers tokenise differently. Both are
+        # settled by looking for the row's own text, verbatim, on the other
+        # side - see `_contains_run`.
+        return _contains_run(other_blob, text)
 
     for row in rows:
-        if row["op"] == "prod" and row.get("prod") and present(row["prod"], act_words):
+        if row["op"] == "prod" and row.get("prod") and present(row["prod"], act_words, act_full_blob):
             row["op"] = "equal"
             row["stage"] = row["prod"]
-        elif row["op"] == "stage" and row.get("stage") and present(row["stage"], exp_words):
+        elif row["op"] == "stage" and row.get("stage") and present(row["stage"], exp_words, exp_full_blob):
             row["op"] = "equal"
             row["prod"] = row["stage"]
 
@@ -404,40 +540,90 @@ def _row_locations(rows: list[dict], exp_recs: list[dict], act_recs: list[dict])
             row["stage_loc"] = act_loc.get(_key(row["stage"]))
 
 
+def _number_label(nums: list[int]) -> str:
+    """A compact label for the difference numbers a box carries: "3", "3-6",
+    "3-5, 9". Plain ASCII - the badge is drawn with Pillow's built-in face,
+    which has no en dash and renders one as a tofu box."""
+    parts: list[str] = []
+    start = prev = nums[0]
+    for n in nums[1:] + [None]:
+        if n is not None and n == prev + 1:
+            prev = n
+            continue
+        parts.append(str(start) if start == prev else f"{start}-{prev}")
+        if n is None:
+            break
+        start = prev = n
+    return ", ".join(parts)
+
+
+def _merge_boxes(boxes: list[dict]) -> list[dict]:
+    """Consecutive differences very often anchor to the SAME sentence (a
+    paragraph rewritten line by line, or a run of dropped lines all pointing at
+    one surviving neighbour on the other side) - stacking a dozen identical
+    rectangles there just paints a solid block and hides which numbers are in
+    it. Collapse boxes sharing a page and rectangle into one, keeping the bold
+    "diff" styling if any of them was a real difference on this side.
+    """
+    merged: dict[tuple, dict] = {}
+    for b in boxes:
+        key = (b.get("page"), tuple(round(v, 1) for v in b["bbox"]))
+        slot = merged.get(key)
+        if slot is None:
+            merged[key] = {**b, "numbers": [b["n"]]}
+            continue
+        slot["numbers"].append(b["n"])
+        if b.get("kind") == "diff":
+            slot["kind"] = "diff"
+    out: list[dict] = []
+    for b in merged.values():
+        b["label"] = _number_label(sorted(set(b.pop("numbers"))))
+        b.pop("n", None)
+        out.append(b)
+    return out
+
+
 def _diff_highlight_boxes(rows: list[dict]) -> tuple[list[dict], list[dict]]:
-    """(prod_boxes, stage_boxes) for the snapshots: a bold red box on the
-    sentence that differs / was dropped, and a thin "context" box on the other
-    side around the neighbouring matched sentence so the reader sees where the
-    missing content belongs.
+    """(prod_boxes, stage_boxes) for the snapshots - PAIRED and NUMBERED.
+
+    Every difference is boxed on BOTH sides under the same number, so box 3 in
+    the Production snapshot points straight at the spot box 3 marks in the
+    Staging one. Whichever side carries the differing text gets the bold red
+    box; the side that doesn't gets a thin orange box on the nearest matched
+    sentence - exactly where the missing content belongs. Boxing only the side
+    that changed left the reader hunting the other document by eye for the
+    place a left-hand highlight was talking about.
     """
     prod_boxes: list[dict] = []
     stage_boxes: list[dict] = []
 
     def nearest(idx: int, side: str) -> dict | None:
-        for step in range(1, 6):
+        """The closest row above or below that does have a location on `side`."""
+        for step in range(1, max(2, len(rows))):
             for j in (idx - step, idx + step):
-                if 0 <= j < len(rows) and rows[j].get(side):
-                    return rows[j][side]
+                if 0 <= j < len(rows):
+                    loc = rows[j].get(side)
+                    if loc and loc.get("bbox"):
+                        return loc
         return None
 
+    number = 0
     for i, row in enumerate(rows):
-        op = row["op"]
-        if op == "equal":
+        if row["op"] == "equal":
             continue
         pl, sl = row.get("prod_loc"), row.get("stage_loc")
-        if op in ("prod", "change") and pl and pl.get("bbox"):
-            prod_boxes.append({**pl, "kind": "diff"})
-        if op in ("stage", "change") and sl and sl.get("bbox"):
-            stage_boxes.append({**sl, "kind": "diff"})
-        if op == "prod":  # dropped from Staging - show where on the Staging side
-            ctx = sl or nearest(i, "stage_loc")
-            if ctx and ctx.get("bbox"):
-                stage_boxes.append({**ctx, "kind": "context"})
-        if op == "stage":  # added in Staging - show the spot in Production
-            ctx = pl or nearest(i, "prod_loc")
-            if ctx and ctx.get("bbox"):
-                prod_boxes.append({**ctx, "kind": "context"})
-    return prod_boxes, stage_boxes
+        prod_hit = bool(row.get("prod") and pl and pl.get("bbox"))
+        stage_hit = bool(row.get("stage") and sl and sl.get("bbox"))
+        prod_at = pl if prod_hit else nearest(i, "prod_loc")
+        stage_at = sl if stage_hit else nearest(i, "stage_loc")
+        if not prod_at and not stage_at:
+            continue
+        number += 1
+        if prod_at:
+            prod_boxes.append({**prod_at, "kind": "diff" if prod_hit else "context", "n": number})
+        if stage_at:
+            stage_boxes.append({**stage_at, "kind": "diff" if stage_hit else "context", "n": number})
+    return _merge_boxes(prod_boxes), _merge_boxes(stage_boxes)
 
 
 def _annotate_callouts(
@@ -527,7 +713,7 @@ def _linked_records(doc: fitz.Document, recs: list[dict]) -> dict[str, list[str]
             # neighbouring words or the xref's "on page N" (already stripped)
             # and to Production's wrapped-xref rects extracting out of order.
             if len(label) >= 12 and _shared_run(label, rt) >= 18:
-                hits.append(t)
+                hits.append((t, label))
         if hits:
             k = _key(r["text"])
             bucket = out.setdefault(k, [])
@@ -535,6 +721,107 @@ def _linked_records(doc: fitz.Document, recs: list[dict]) -> dict[str, list[str]
                 if h not in bucket:
                     bucket.append(h)
     return out
+
+
+# The PDF renders a hyperlink as coloured, underlined text, not as a word with
+# a marker beside it - so the browser does the same, and a row reads the way
+# the page reads. The phrase the link actually covers is matched back into the
+# sentence tolerantly: `get_textbox` on a link rect returns the words with the
+# PDF's own line breaks and spacing, which rarely survive sentence
+# reconstruction character for character.
+_LINK_MIN_PHRASE = 8
+
+
+# A printed web address, for the last-resort match below.
+_URL_TEXT_RE = re.compile(r"(?:https?://|www\.)[^\s,;)\]]+", re.I)
+
+
+def _link_anchor(text: str, target: str, label: str) -> tuple[int, int] | None:
+    """Where this link's clickable text sits in the sentence.
+
+    Three tries, because a link rect's extracted text is the least reliable
+    thing in a PDF: the phrase the link covers; the target spelled out as text
+    (a printed URL is normally its own link); and any web address in the
+    sentence. Without the fallbacks, a document whose link rect extracts
+    garbled - which is exactly what the compact Production layout does - loses
+    its link in the report and reads as if the link were not there at all.
+    """
+    label = " ".join((label or "").split())
+    if len(label) >= _LINK_MIN_PHRASE:
+        at = _find_loose(text, label)
+        if at is not None:
+            return at
+    printed = re.sub(r"^https?://", "", (target or "")).rstrip("/")
+    if len(printed) >= _LINK_MIN_PHRASE:
+        at = _find_loose(text, printed)
+        if at is not None:
+            return _snap_to_url(text, *at)
+    if (target or "").lower().startswith(("http://", "https://")):
+        m = _URL_TEXT_RE.search(text)
+        if m:
+            return m.start(), m.end()
+    return None
+
+
+def _snap_to_url(text: str, start: int, end: int) -> tuple[int, int]:
+    """Widen a match to the whole printed web address it lands in, so the
+    scheme isn't left sitting outside the link ("Visit https://<a>example.com
+    </a>") when the match came from a target with its scheme stripped."""
+    for m in _URL_TEXT_RE.finditer(text):
+        if m.start() <= start and end <= m.end():
+            return m.start(), m.end()
+    return start, end
+
+
+def _link_html(text: str, links: list[tuple[str, str]] | None) -> str | None:
+    """`text` with each hyperlinked phrase wrapped in an <a>, HTML-escaped, or
+    None when nothing could be matched (the caller then renders plain text)."""
+    if not text or not links:
+        return None
+    spans: list[tuple[int, int, str]] = []
+    for target, label in links:
+        at = _link_anchor(text, target, label)
+        if at is None:
+            continue
+        start, end = at
+        if any(start < e and s < end for s, e, _ in spans):
+            continue  # overlaps a link already placed
+        spans.append((start, end, target))
+    if not spans:
+        return None
+    spans.sort()
+    out: list[str] = []
+    at = 0
+    for start, end, target in spans:
+        out.append(html.escape(text[at:start]))
+        out.append(
+            f'<a class="pdflink" href="{html.escape(target, quote=True)}"'
+            f' title="{html.escape(target, quote=True)}" target="_blank" rel="noopener">'
+            f"{html.escape(text[start:end])}</a>"
+        )
+        at = end
+    out.append(html.escape(text[at:]))
+    return "".join(out)
+
+
+def _find_loose(text: str, phrase: str) -> tuple[int, int] | None:
+    """Where `phrase` sits in `text`, ignoring how whitespace was broken."""
+    lowered = text.lower()
+    needle = phrase.lower()
+    at = lowered.find(needle)
+    if at >= 0:
+        return at, at + len(needle)
+    # Whitespace-insensitive: walk the sentence skipping spaces the PDF's own
+    # line break put in (or took out) of the link's extracted text.
+    squashed = [(c, i) for i, c in enumerate(lowered) if not c.isspace()]
+    flat = "".join(c for c, _ in squashed)
+    target = "".join(c for c in needle if not c.isspace())
+    if not target:
+        return None
+    hit = flat.find(target)
+    if hit < 0:
+        return None
+    return squashed[hit][1], squashed[hit + len(target) - 1][1] + 1
 
 
 # A contents / FAQ-index line ("... Displaying two sources ... 54", a dot-leader
@@ -563,9 +850,18 @@ def _annotate_links(
         if pl or sl:
             row["link"] = {
                 "prod": bool(pl), "stage": bool(sl),
-                "prod_targets": pl or [], "stage_targets": sl or [],
+                "prod_targets": [t for t, _ in (pl or [])],
+                "stage_targets": [t for t, _ in (sl or [])],
                 "differ": bool(pl) != bool(sl),
             }
+            # The row's own text with the linked phrase marked up the way the
+            # PDF prints it, so the comparison looks like the page.
+            prod_html = _link_html(row.get("prod") or "", pl)
+            stage_html = _link_html(row.get("stage") or "", sl)
+            if prod_html:
+                row["prod_html"] = prod_html
+            if stage_html:
+                row["stage_html"] = stage_html
 
 
 # A contents / FAQ-index entry: ends in a bare page number, is a bare question,
@@ -924,10 +1220,13 @@ def _pix_to_jpeg(pix) -> bytes | None:
 
 
 def _draw_boxes(pix, clip: "fitz.Rect", scale: float, boxes: list[dict]) -> bytes | None:
-    """Overlay highlight rectangles on a rendered page band. `kind == "context"`
-    draws a thin orange outline (Staging place where Production content is
-    missing); anything else draws a bold red box with a light fill (a sentence
-    that differs / was dropped)."""
+    """Overlay highlight rectangles on a rendered page band, in the same visual
+    language the validation report uses (`pdfval.report.screenshots`): a bold
+    red box on the sentence that differs or was dropped, a thin orange box on
+    the place in THIS document where the other one's content belongs, and on
+    both the difference's number - so a highlight on the left always has a
+    visible partner on the right and the two columns can be read together.
+    """
     try:
         import io
 
@@ -938,14 +1237,13 @@ def _draw_boxes(pix, clip: "fitz.Rect", scale: float, boxes: list[dict]) -> byte
     d = ImageDraw.Draw(im, "RGBA")
     for b in boxes:
         bx0, by0, bx1, by1 = b["bbox"]
-        x0 = (bx0 - clip.x0) * scale - 3
-        y0 = (by0 - clip.y0) * scale - 2
-        x1 = (bx1 - clip.x0) * scale + 3
-        y1 = (by1 - clip.y0) * scale + 2
-        if b.get("kind") == "context":
-            d.rectangle([x0, y0, x1, y1], outline=(230, 130, 0, 255), width=2)
-        else:
-            d.rectangle([x0, y0, x1, y1], fill=(255, 70, 70, 40), outline=(210, 20, 20, 255), width=3)
+        rect = (
+            (bx0 - clip.x0) * scale - 3,
+            (by0 - clip.y0) * scale - 2,
+            (bx1 - clip.x0) * scale + 3,
+            (by1 - clip.y0) * scale + 2,
+        )
+        _shots.draw_highlight(d, im, rect, b.get("kind") or _shots.KIND_DIFF, b.get("label"))
     buf = io.BytesIO()
     im.save(buf, format="PNG")
     return buf.getvalue()
@@ -1163,6 +1461,51 @@ def _table_notes_by_heading(findings: list[dict] | None) -> dict[str, list[dict]
     return out
 
 
+_LIST_MARKER_MSG = "List marker changed"
+
+
+def _list_notes_by_heading(findings: list[dict] | None) -> dict[str, list[dict]]:
+    """Group the list-marker findings by section heading.
+
+    Shown in RED, unlike the amber formatting notes: a procedure whose steps
+    are numbered 1,2,3 in Production and lettered a,b,c in Staging is not a
+    styling nicety - every cross-reference to "step 3" in the surrounding text
+    now points at nothing, and the two documents' instructions no longer read
+    the same. The section's own text diff can't show it, because the marker is
+    stripped from (or drawn outside) the sentence it belongs to.
+    """
+    grouped: dict[str, dict[str, dict]] = {}
+    for f in findings or []:
+        if f.get("message") != _LIST_MARKER_MSG:
+            continue
+        d = f.get("details") or {}
+        heading = d.get("heading")
+        if not heading:
+            continue
+        texts = d.get("text") or []
+        quote = _one_line(texts[0]) if texts else ""
+        text = (
+            (d.get("changed") or "the list marker style changed")
+            + (f': first item “{quote}”' if quote else "")
+            + "."
+        )
+        bucket = grouped.setdefault(heading, {})
+        note = bucket.get(text)
+        if note:
+            note["count"] += 1
+        else:
+            bucket[text] = {
+                "text": text,
+                "count": 1,
+                "items": d.get("items") or 1,
+                "prod_markers": d.get("expected_marker") or "",
+                "stage_markers": d.get("actual_marker") or "",
+                "prod_screenshot": d.get("prod_screenshot"),
+                "stage_screenshot": d.get("stage_screenshot"),
+            }
+    return {heading: list(bucket.values()) for heading, bucket in grouped.items()}
+
+
 _FMT_EMPHASIS_MSG = "Bold or italic emphasis removed"
 _FMT_ENCODING_MSGS = ("Text encoding regression in Staging", "Possible text encoding issue")
 
@@ -1258,6 +1601,7 @@ def build_section_comparison(
     image_findings: list[dict] | None = None,
     table_findings: list[dict] | None = None,
     format_findings: list[dict] | None = None,
+    list_findings: list[dict] | None = None,
 ) -> list[dict]:
     """One entry per TOC heading, in document order, each with the aligned
     Production/Staging content for that section.
@@ -1268,10 +1612,27 @@ def build_section_comparison(
     Headings unique to one document are still listed (so the reader sees they
     exist) but their body is shown under their parent matched section.
     """
-    exp_entries = get_toc_entries(expected)
-    act_entries = get_toc_entries(actual)
-    if not exp_entries or not act_entries:
+    if not expected.page_count or not actual.page_count:
         return []
+    exp_tables = _content._TableBBoxCache(expected_path)
+    act_tables = _content._TableBBoxCache(actual_path)
+    exp_images = _content._ImageBBoxCache(expected)
+    act_images = _content._ImageBBoxCache(actual)
+
+    # The same section list every check in the engine anchors on: real
+    # bookmarks where there are any, printed headings detected by style where
+    # there aren't, and each side given any heading the other has that is
+    # genuinely printed here too - so both columns compare the SAME section
+    # instead of one of them going empty. See `pdfval.validators.headings`.
+    exp_entries, act_entries = resolve_entries(expected, actual)
+    if not exp_entries or not act_entries:
+        # One side offers nothing to navigate by even now: compare the two
+        # documents whole rather than handing back an empty browser - a run
+        # always has to validate something.
+        exp_entries = [TocEntry(level=1, title=_WHOLE_DOC_TITLE, page=0, y=0.0)]
+        act_entries = [TocEntry(level=1, title=_WHOLE_DOC_TITLE, page=0, y=0.0)]
+    exp_ends = _section_ends(exp_entries)
+    act_ends = _section_ends(act_entries)
 
     # Include the excluded headings (a printed contents / Q&A index) so the
     # browser still LISTS them in the nav with their match status - it just
@@ -1300,6 +1661,43 @@ def build_section_comparison(
     act_sections_wide = extract_section_blocks(actual, act_matched_entries)
     exp_wide_pos = {m.expected_index: i for i, m in enumerate(matched)}
     act_wide_pos = {m.actual_index: i for i, m in enumerate(matched)}
+    # The nearest mutually-matched heading before and after each entry in the
+    # list. A section with nothing of its own on one side borrows that
+    # neighbour's region for its snapshot, so the column is never left blank -
+    # looking FORWARD as well as back matters for the headings that come before
+    # the document's first matched one (a cover page, a title block).
+    prev_matched: list[int | None] = [None] * len(matches)
+    next_matched: list[int | None] = [None] * len(matches)
+    seen: int | None = None
+    for i, m in enumerate(matches):
+        prev_matched[i] = seen
+        if m.expected_index is not None and m.actual_index is not None:
+            seen = i
+    seen = None
+    for i in range(len(matches) - 1, -1, -1):
+        next_matched[i] = seen
+        if matches[i].expected_index is not None and matches[i].actual_index is not None:
+            seen = i
+
+    def counterpart_region(side: str, at: int) -> tuple[list[dict], str | None]:
+        """The nearest matched section's own region on `side` - what to show in
+        a column that has no content of its own for this heading, with the
+        heading it belongs to so the note can say where the reader is looking.
+        """
+        for j in (prev_matched[at], next_matched[at]):
+            if j is None:
+                continue
+            m = matches[j]
+            if side == "prod":
+                span = _capped_span(exp_sections_wide[exp_wide_pos[m.expected_index]])
+                where = exp_entries[m.expected_index].title
+            else:
+                span = _capped_span(act_sections_wide[act_wide_pos[m.actual_index]])
+                where = act_entries[m.actual_index].title
+            if span:
+                return span, where
+        return [], None
+
     exp_heading_titles = {normalize_title(e.title) for e in exp_entries if e.title.strip()}
     act_heading_titles = {normalize_title(e.title) for e in act_entries if e.title.strip()}
     # A heading bookmarked in only ONE document (e.g. Staging's own
@@ -1321,14 +1719,11 @@ def build_section_comparison(
     image_notes_by_heading = _image_notes_by_heading(image_findings)
     table_notes_by_heading = _table_notes_by_heading(table_findings)
     format_notes_by_heading = _format_notes_by_heading(format_findings)
+    list_notes_by_heading = _list_notes_by_heading(list_findings)
     snap_dir = None
     if output_dir:
         snap_dir = os.path.join(output_dir, "sections")
         os.makedirs(snap_dir, exist_ok=True)
-    exp_tables = _content._TableBBoxCache(expected_path)
-    act_tables = _content._TableBBoxCache(actual_path)
-    exp_images = _content._ImageBBoxCache(expected)
-    act_images = _content._ImageBBoxCache(actual)
     exp_words = _ocr.PageWords(expected)
     act_words = _ocr.PageWords(actual)
     # Whole-document text, for the "Match content" button fallback below -
@@ -1377,9 +1772,17 @@ def build_section_comparison(
         else:
             status = "extra"  # Staging only
 
-        # A printed contents / Q&A index heading: keep it in the nav with its
-        # match status, but do NOT diff its listing text line by line - that is
-        # the TOC Comparison report's job. Emit a stub with a note.
+        # Front matter - a cover page, a title block, a printed contents page
+        # that only one document has - is not a section anyone is validating:
+        # there is nothing to compare it against, so it would render as a pair
+        # of empty columns the reader has to scroll past. Marked out of scope
+        # by `pdfval.validators.headings`, and dropped here.
+        if (exp_e is None or act_e is None) and ((exp_e or act_e).excluded):
+            continue
+
+        # A printed contents / Q&A index heading BOTH documents have: keep it in
+        # the nav with its match status, but do NOT diff its listing text line
+        # by line - that is the TOC Comparison report's job. Emit a stub.
         if (exp_e and exp_e.excluded) or (act_e and act_e.excluded):
             out.append({
                 "id": f"sec{n}",
@@ -1392,6 +1795,11 @@ def build_section_comparison(
                 "counts": {"equal": 0, "change": 0, "prod": 0, "stage": 0, "diff": 0},
                 "exp_shots": [],
                 "act_shots": [],
+                # Not diffed line by line, but both sides still get their page
+                # snapshot - a stub with two empty columns tells the reader
+                # nothing about a contents page that may well have changed.
+                "_exp_span": _heading_band(expected, exp_e, exp_ends[ei] if ei is not None else None),
+                "_act_span": _heading_band(actual, act_e, act_ends[ai] if ai is not None else None),
                 "toc_listing": True,
                 "counterpart_note": (
                     "This is a printed table-of-contents / index page. It is compared in the "
@@ -1470,20 +1878,27 @@ def build_section_comparison(
 
         rows, n_index = _strip_index_runs(rows)
         rows = _drop_bare_callout_label_rows(rows)
-        prod_boxes, stage_boxes = _diff_highlight_boxes(rows)
 
-        # Pixel-exact snapshot of exactly this section's region in each PDF -
-        # the faithful "what does it actually look like" view, Production
-        # beside Staging, clipped per page to the section's own block span,
-        # with every difference boxed so it's spotted at a glance.
-        exp_shots = (
-            _section_snapshots(expected, exp_span, snap_dir, f"sec{n}_prod", prod_boxes)
-            if snap_dir and exp_span else []
-        )
-        act_shots = (
-            _section_snapshots(actual, act_span, snap_dir, f"sec{n}_stage", stage_boxes)
-            if snap_dir and act_span else []
-        )
+        # Neither column may be left empty. A section can have no text blocks
+        # of its own on one side - a container heading, a page that is all
+        # figure or all table, or a one-sided heading none of whose sentences
+        # turned up under the other document's parent - and the snapshot pane
+        # then read "Not in Staging" about content that is in fact printed
+        # right there. Fall back to the heading's own page band first (the real
+        # answer whenever the heading exists on that side), then to the nearest
+        # matched section's region, labelled so the reader knows which it is.
+        own_exp, own_act = bool(exp_span), bool(act_span)
+        exp_span = exp_span or _heading_band(expected, exp_e, exp_ends[ei] if ei is not None else None)
+        act_span = act_span or _heading_band(actual, act_e, act_ends[ai] if ai is not None else None)
+        exp_note = act_note = None
+        if not exp_span:
+            exp_span, where = counterpart_region("prod", n)
+            if where:
+                exp_note = f"nearest matched section — “{where}”"
+        if not act_span:
+            act_span, where = counterpart_region("stage", n)
+            if where:
+                act_note = f"nearest matched section — “{where}”"
 
         row_dict = {
             "id": f"sec{n}",
@@ -1494,9 +1909,29 @@ def build_section_comparison(
             "actual_page": (act_e.page + 1) if act_e else None,
             "rows": rows,
             "counts": _counts(rows),
-            "exp_shots": exp_shots,
-            "act_shots": act_shots,
+            "exp_shots": [],
+            "act_shots": [],
+            # Rendered after `_fill_relocated_counterparts` below, once every
+            # row's final op is known.
+            "_exp_span": exp_span,
+            "_act_span": act_span,
+            "_own_text": own_exp or own_act,
         }
+        if exp_note:
+            row_dict["exp_shots_note"] = exp_note
+        if act_note:
+            row_dict["act_shots_note"] = act_note
+        # "No text content extracted for this section", in a section only one
+        # document even has, tells the reader nothing - drop it rather than
+        # make them scroll past it.
+        if status != "matched" and not rows:
+            continue
+        # A section whose body is entirely a table or a figure has no prose to
+        # diff, but it is NOT empty - its content is real and is compared by
+        # Table/Image Validation. Saying "no text content extracted" about a
+        # page full of a RoHS substance table reads as a hole in the report.
+        if not rows and (own_exp or own_act):
+            row_dict["table_only"] = True
         if counterpart_note:
             row_dict["counterpart_note"] = counterpart_note
         content_match_count = sum(1 for r in rows if r.get("content_match_text"))
@@ -1509,6 +1944,8 @@ def build_section_comparison(
         if format_notes_by_heading.get(head):
             row_dict["format_notes"] = format_notes_by_heading[head]
             row_dict["format_kinds"] = _format_kind_chips(format_notes_by_heading[head])
+        if list_notes_by_heading.get(head):
+            row_dict["list_notes"] = list_notes_by_heading[head]
         if n_index:
             row_dict["index_note"] = (
                 f"{n_index} contents / FAQ-index navigation entries in this section "
@@ -1522,13 +1959,37 @@ def build_section_comparison(
     # merely moved to a different heading.
     _fill_relocated_counterparts(out, exp_all_sent, act_all_sent)
 
+    # Snapshots last. `_fill_relocated_counterparts` above can turn a row that
+    # looked one-sided into a plain match, and a highlight box drawn before
+    # that ran would box content the report no longer calls a difference.
+    for s in out:
+        exp_span = s.pop("_exp_span", None)
+        act_span = s.pop("_act_span", None)
+        if not snap_dir:
+            continue
+        # Pixel-exact snapshot of exactly this section's region in each PDF -
+        # the faithful "what does it actually look like" view, Production
+        # beside Staging, clipped per page to the section's own block span,
+        # with every difference boxed and NUMBERED identically on both sides so
+        # a highlight on the left can be found on the right at a glance.
+        prod_boxes, stage_boxes = _diff_highlight_boxes(s["rows"])
+        if exp_span:
+            s["exp_shots"] = _section_snapshots(
+                expected, exp_span, snap_dir, f"{s['id']}_prod", prod_boxes
+            )
+        if act_span:
+            s["act_shots"] = _section_snapshots(
+                actual, act_span, snap_dir, f"{s['id']}_stage", stage_boxes
+            )
+
     # Flag a heading that only groups the deeper headings right below it (its
     # own body is empty because its first child starts at the same spot) so
     # the reader isn't told "no text extracted" for what is really just a
     # container heading.
     for i, s in enumerate(out):
         nxt = out[i + 1] if i + 1 < len(out) else None
-        if s["rows"] or s["exp_shots"] or s["act_shots"] or not nxt:
+        own_text = s.pop("_own_text", True)
+        if s["rows"] or own_text or not nxt:
             continue
         same_page = (
             (s["expected_page"] and s["expected_page"] == nxt["expected_page"])

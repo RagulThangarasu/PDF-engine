@@ -39,6 +39,7 @@ import fitz
 from pdfval.extractor import get_tables
 from pdfval.models import CheckResult, Issue
 from pdfval.report import screenshots
+from pdfval.validators.headings import resolve_entries
 from pdfval.validators.toc import (
     get_toc_entries,
     heading_at,
@@ -81,8 +82,7 @@ def validate_tables(
     expected: fitz.Document, actual: fitz.Document, expected_path: str, actual_path: str, output_dir: str | None = None
 ) -> CheckResult:
     result = CheckResult(name="Table Validation")
-    exp_entries = get_toc_entries(expected)
-    act_entries = get_toc_entries(actual)
+    exp_entries, act_entries = resolve_entries(expected, actual)
     counter = itertools.count(1)
     summary: list[dict] = []
     margins = _document_margins(actual)
@@ -355,13 +355,23 @@ def _attach_screenshots(
     seq = next(counter)
     if seq > MAX_SCREENSHOTS:
         return
+    # Both crops carry the finding's number so the reader can tell at a glance
+    # that they are the same table on the two sides.
+    label = str(seq)
+    details["shot_label"] = label
     prod_path = (
-        screenshots.capture_region(expected, exp_page, output_dir, f"table_{seq}_prod", exp_bbox)
+        screenshots.capture_region(
+            expected, exp_page, output_dir, f"table_{seq}_prod", exp_bbox,
+            screenshots.KIND_DIFF, label,
+        )
         if exp_page is not None
         else None
     )
     stage_path = (
-        screenshots.capture_region(actual, act_page, output_dir, f"table_{seq}_stage", act_bbox)
+        screenshots.capture_region(
+            actual, act_page, output_dir, f"table_{seq}_stage", act_bbox,
+            screenshots.KIND_DIFF if act_bbox is not None else screenshots.KIND_CONTEXT, label,
+        )
         if act_page is not None
         else None
     )
@@ -451,7 +461,24 @@ def _section_tokens(doc: fitz.Document, pages) -> Counter:
 
 
 def _table_tokens(t: dict) -> Counter:
-    return Counter(_TOKEN_RE.findall(_table_text(t).lower()))
+    """Tokens used to decide WHICH tables correspond across the two documents -
+    deliberately excluding the header row.
+
+    These manuals repeat one column-label row ("Model | ST4304 | ST5504 |
+    ST6504") verbatim across every spec table in a section. Counting it here
+    means two genuinely UNRELATED small tables that both carry that header
+    look like a strong match purely from the header's word overlap - and the
+    smaller the rest of a table's content, the more that shared header
+    dominates its score, so the smallest table in a section becomes a false
+    magnet for every other table's fallback match. The header's words carry no
+    information about which table an OTHER table corresponds to, so they are
+    left out of the matching signal; the full text (header included) is still
+    used everywhere else - the actual cell/row diff, screenshots, etc.
+    """
+    rows = t.get("rows") or []
+    body = rows[1:] if len(rows) > 1 else rows
+    text = "\n".join(_row_text(r) for r in body)
+    return Counter(_TOKEN_RE.findall(text.lower()))
 
 
 def _table_similarity(a: Counter, b: Counter) -> float:

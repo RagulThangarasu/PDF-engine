@@ -25,16 +25,18 @@
      is carried by the small chip on the right, not by tinting the heading. */
   .toc a.missing .t, .toc a.extra .t, .toc a.matched .t { color: #1a1a1a; }
   .toc .tag { font-size: 10px; font-weight: 700; border-radius: 8px; padding: 1px 6px; white-space: nowrap; }
-  .tag.diff, .tag.missing { background: #fdecec; color: #a01515; }
+  .tag.diff, .tag.missing { background: #a31212; color: #fff; }
   .tag.ok, .tag.extra { background: #eef1f6; color: #4a5566; }
   .tag.img { background: #ede4fb; color: #5b3ba3; }
   .tag.tbl { background: #d9efe4; color: #12664a; }
   .tag.fmt { background: #fbe6d4; color: #8a4b12; }
   .tag.fmt.fmt-encoded { background: #fbdada; color: #7a1414; }
+  .tag.num { background: #a31212; color: #fff; }
   .tag.toc { background: #fff1d6; color: #7a5a12; }
   .toc a.hasimg { border-left-color: #7c4dcc; }
   .toc a.hastbl { border-left-color: #14875f; }
   .toc a.hasfmt { border-left-color: #c9781f; }
+  .toc a.hasnum { border-left-color: #a31212; }
 
   /* ---- right: content ---- */
   .content { overflow-y: auto; padding: 16px 22px 120px; }
@@ -57,15 +59,31 @@
   section.sec.status-extra > h3 { background: #f4f6f8; }
 
   table.cmp { width: 100%; border-collapse: collapse; table-layout: fixed; }
-  table.cmp col.c { width: 30px; }
+  table.cmp col.c { width: 104px; }
   table.cmp th { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #1a1a1a; font-weight: 700; text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); }
   table.cmp td { padding: 6px 10px; vertical-align: top; border-bottom: 1px solid #f0f1f3; overflow-wrap: anywhere; line-height: 1.5; }
-  table.cmp td.mark { text-align: center; color: var(--muted); font-size: 11px; user-select: none; }
+  table.cmp td.mark { text-align: left; color: var(--muted); font-size: 11px; user-select: none; white-space: nowrap; }
   tr.op-equal td { color: #3a4757; }
-  tr.op-prod td.p { background: #fdecec; } tr.op-prod td.s { background: #fafafa; }
-  tr.op-stage td.s { background: #e7f6ec; } tr.op-stage td.p { background: #fafafa; }
-  tr.op-change td.p, tr.op-change td.s { background: #fff8e6; }
-  .absent { color: #b9c0c9; font-style: italic; font-size: 11px; }
+  /* An ISSUE has to be unmistakable at a glance: a named label, a dark rule
+     down the side of the row, and a saturated tint on the column that carries
+     it - not a faint wash and a single punctuation glyph. */
+  .issue { display: inline-block; font-size: 9px; font-weight: 800; letter-spacing: .05em;
+           text-transform: uppercase; border-radius: 3px; padding: 2px 5px; color: #fff; }
+  .issue.prod { background: #a31212; }
+  .issue.stage { background: #12633a; }
+  .issue.change { background: #9a5b06; }
+  .same { color: #98a2b3; font-size: 11px; }
+  tr.op-prod td, tr.op-stage td, tr.op-change td { border-bottom-color: #e3e6ea; }
+  tr.op-prod td.mark { border-left: 4px solid #a31212; }
+  tr.op-stage td.mark { border-left: 4px solid #12633a; }
+  tr.op-change td.mark { border-left: 4px solid #9a5b06; }
+  tr.op-prod td.p { background: #fbdcdc; color: #4a0f0f; } tr.op-prod td.s { background: #f4f5f7; }
+  tr.op-stage td.s { background: #d6efdf; color: #0d3f24; } tr.op-stage td.p { background: #f4f5f7; }
+  tr.op-change td.p, tr.op-change td.s { background: #fdf0d5; color: #4a3205; }
+  .absent { color: #8a94a3; font-style: italic; font-size: 11px; font-weight: 600; }
+  /* A hyperlink is drawn the way the PDF draws it, so a row reads like the page. */
+  a.pdflink { color: #1a4fc4; text-decoration: underline; text-underline-offset: 2px; }
+  a.pdflink:hover { color: #0f2f80; }
   del { background: #fbdada; color: #7a1414; text-decoration: line-through; text-decoration-thickness: 2px; padding: 0 1px; }
   ins { background: #dcf3e1; color: #1a5c2a; text-decoration: underline; text-decoration-thickness: 2px; padding: 0 1px; }
   del.char, ins.char { padding: 0; }
@@ -87,6 +105,9 @@
   .snap-legend .sw { display: inline-block; width: 22px; height: 10px; vertical-align: middle; border-radius: 2px; }
   .snap-legend .sw.red { border: 2px solid #d21414; background: #ffeaea; }
   .snap-legend .sw.orange { border: 2px solid #e68200; }
+  .snap-legend .num { display: inline-block; min-width: 14px; padding: 0 4px; border-radius: 3px; background: #d21414; color: #fff; font-weight: 700; text-align: center; }
+  .snap-legend .snap-pair { color: #1f2430; }
+  .col-label .snap-note { font-weight: 400; text-transform: none; letter-spacing: 0; color: var(--muted); }
   .co { display: inline-block; font-size: 9px; font-weight: 700; letter-spacing: .03em; text-transform: uppercase;
         border-radius: 3px; padding: 1px 4px; margin-right: 4px; vertical-align: 1px; }
   .co.icon { background: #efe7fb; color: #5b3ba3; }
@@ -101,6 +122,15 @@
   .fmt-label { display: inline-block; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em;
                border-radius: 3px; padding: 1px 5px; margin-right: 6px; background: #f0dcc4; color: #8a4b12; vertical-align: 1px; }
   .fmt-label.fmt-encoded { background: #f0d2d2; color: #7a1414; }
+  /* A renumbered list is a content-level regression, so it is flagged the way
+     a missing figure is - solid red - not in the amber used for styling. */
+  .list-notes { margin: 8px 14px 4px; }
+  .list-note { padding: 8px 10px; margin-bottom: 6px; background: #fdeeee; border: 1px solid #eab6b6; border-left: 4px solid #a31212; border-radius: 5px; }
+  .list-note-text { font-size: 12px; color: #7a1414; font-weight: 600; }
+  .list-note-markers { font-size: 11px; color: #8a4444; margin-top: 4px; font-weight: 400; }
+  .list-note-markers b { color: #7a1414; }
+  .list-label { display: inline-block; font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em;
+                border-radius: 3px; padding: 1px 5px; margin-right: 6px; background: #a31212; color: #fff; vertical-align: 1px; }
   .index-note { margin: 8px 14px 4px; padding: 6px 10px; background: #f4f5f7; border-radius: 5px; font-size: 11px; color: var(--muted); }
   .image-notes { margin: 8px 14px 4px; }
   .image-note { padding: 8px 10px; margin-bottom: 6px; background: #fdf4f4; border: 1px solid #f3d9d9; border-radius: 5px; }
@@ -147,24 +177,30 @@
   {%- endfor -%}
 {%- endmacro -%}
 {%- macro link_chip(lk, side) -%}
-  {%- if side == 'prod' -%}
-    {%- if lk.prod -%}<span class="lk" title="{{ lk.prod_targets|join(', ') }}">🔗 link</span>
-    {%- elif lk.stage -%}<span class="lk none">no link</span>
-    {%- endif -%}
-  {%- else -%}
-    {%- if lk.stage -%}<span class="lk" title="{{ lk.stage_targets|join(', ') }}">🔗 link</span>
-    {%- elif lk.prod -%}<span class="lk none">no link</span>
-    {%- endif -%}
+  {#- The link itself is drawn INTO the sentence (see `cell_text`), the way the
+      PDF prints it. Only the ISSUE gets a chip: this side has no link where
+      the other side does. -#}
+  {%- if side == 'prod' and lk.stage and not lk.prod -%}<span class="lk none">link dropped</span>
+  {%- elif side == 'stage' and lk.prod and not lk.stage -%}<span class="lk none">link dropped</span>
   {%- endif -%}
+{%- endmacro -%}
+{%- macro cell_text(r, side) -%}
+  {#- The side's sentence, with any hyperlink rendered as a real link - same
+      text, same target, same blue underline the PDF shows. Falls back to plain
+      text when the link phrase couldn't be located in the sentence. -#}
+  {%- set marked = r.prod_html if side == 'prod' else r.stage_html -%}
+  {%- if marked -%}{{ marked|safe }}{%- else -%}{{ r.prod if side == 'prod' else r.stage }}{%- endif -%}
 {%- endmacro -%}
 <div class="layout">
   <nav class="toc">
     <h2>Table of contents</h2>
     <input class="toc-search" type="search" placeholder="Filter sections…" oninput="filterToc(this.value)">
     <div id="toclist">
+    {% if not sections %}<div class="only-side" style="margin:10px 14px">Nothing to navigate.</div>{% endif %}
     {% for s in sections %}
-      <a href="#{{ s.id }}" data-id="{{ s.id }}" class="lvl-{{ s.level }} {{ s.status }}{{ ' hasdiff' if s.counts.diff else '' }}{{ ' hasimg' if s.image_notes else '' }}{{ ' hastbl' if s.table_notes else '' }}{{ ' hasfmt' if s.format_notes else '' }}">
+      <a href="#{{ s.id }}" data-id="{{ s.id }}" class="lvl-{{ s.level }} {{ s.status }}{{ ' hasdiff' if s.counts.diff else '' }}{{ ' hasimg' if s.image_notes else '' }}{{ ' hastbl' if s.table_notes else '' }}{{ ' hasfmt' if s.format_notes else '' }}{{ ' hasnum' if s.list_notes else '' }}">
         <span class="t">{{ s.heading }}</span>
+        {% if s.list_notes %}<span class="tag num" title="{{ s.list_notes|length }} list(s) renumbered between Production and Staging">1→a {{ s.list_notes|length }}</span>{% endif %}
         {% if s.table_notes %}<span class="tag tbl" title="{{ s.table_notes|length }} table issue(s) in this section">▦ {{ s.table_notes|length }}</span>{% endif %}
         {% for fk in s.format_kinds %}<span class="tag fmt fmt-{{ fk.kind }}" title="{{ fk.count }} {{ fk.label }} issue(s) in this section">{{ fk.label }} {{ fk.count }}</span>{% endfor %}
         {% if s.image_notes %}<span class="tag img" title="{{ s.image_notes|length }} image issue(s) in this section">🖼 {{ s.image_notes|length }}</span>{% endif %}
@@ -189,13 +225,20 @@
       </span>
       <button id="btn-snaps" class="snaps-toggle" onclick="toggleSnaps()">Show page snapshots</button>
       <button id="btn-match-all" class="match-content-btn" style="margin-left:10px" onclick="matchAllContent(this)"
-              title="Across every section: any prod-only / stage-only line whose exact content is present elsewhere in the other document is marked matched (=). Real differences stay flagged.">⇄ Match all by content</button>
+              title="Across every section: any prod-only / stage-only line whose exact content is present elsewhere in the other document is marked matched. Real differences stay flagged.">⇄ Match all by content</button>
       <a href="report.html" style="margin-left:12px;font-size:12px;">← Validation report</a>
       <a href="toc.html" style="margin-left:10px;font-size:12px;">▤ TOC comparison</a>
     </div>
 
+    {% if not sections %}
+    <div class="only-side">
+      No sections could be built for this pair. Both documents were read, but no
+      heading was found in either one to compare them by - so there is nothing to
+      show side by side. The validation report and the TOC comparison still apply.
+    </div>
+    {% endif %}
     {% for s in sections %}
-    <section class="sec status-{{ s.status }} {{ 'no-diff' if not s.counts.diff and not s.table_notes and not s.image_notes and not s.format_notes and s.status == 'matched' else '' }}" id="{{ s.id }}">
+    <section class="sec status-{{ s.status }} {{ 'no-diff' if not s.counts.diff and not s.table_notes and not s.image_notes and not s.format_notes and not s.list_notes and s.status == 'matched' else '' }}" id="{{ s.id }}">
       <h3>
         <span>{{ s.heading }}</span>
         <span class="pages">
@@ -223,7 +266,12 @@
           {% set co = r.callout %}
           {% set lk = r.link %}
           <tr class="op-{{ r.op }}{{ ' has-callout' if co }}"{% if r.content_match_text %} data-content-match="1" data-text="{{ r.content_match_text }}"{% endif %}>
-            <td class="mark">{% if r.op == 'prod' %}−{% elif r.op == 'stage' %}+{% elif r.op == 'change' %}≠{% else %}={% endif %}</td>
+            <td class="mark">
+              {%- if r.op == 'prod' %}<span class="issue prod" title="This text is in Production and not in Staging">Missing</span>
+              {%- elif r.op == 'stage' %}<span class="issue stage" title="This text is in Staging and not in Production">Added</span>
+              {%- elif r.op == 'change' %}<span class="issue change" title="Both documents have this sentence, worded differently">Changed</span>
+              {%- else %}<span class="same" title="Identical in both documents">match</span>{% endif -%}
+            </td>
             {% if r.op == 'change' %}
               {#- Split view: each column shows that side's OWN complete
                   sentence, with the differing fragments marked. Never a merged
@@ -238,14 +286,14 @@
                 {%- if r.word_diff -%}{{ side_diff(r.word_diff, 'stage') }}{%- else -%}{{ r.stage }}{%- endif -%}
               </td>
             {% elif r.op == 'prod' %}
-              <td class="p">{%- if co -%}{{ callout_chip(co, 'prod') }} {% endif %}{%- if lk -%}{{ link_chip(lk, 'prod') }} {% endif %}{{ r.prod }}</td>
+              <td class="p">{%- if co -%}{{ callout_chip(co, 'prod') }} {% endif %}{%- if lk -%}{{ link_chip(lk, 'prod') }} {% endif %}{{ cell_text(r, 'prod') }}</td>
               <td class="s"><span class="absent">— not in Staging —</span></td>
             {% elif r.op == 'stage' %}
               <td class="p"><span class="absent">— not in Production —</span></td>
-              <td class="s">{%- if co -%}{{ callout_chip(co, 'stage') }} {% endif %}{%- if lk -%}{{ link_chip(lk, 'stage') }} {% endif %}{{ r.stage }}</td>
+              <td class="s">{%- if co -%}{{ callout_chip(co, 'stage') }} {% endif %}{%- if lk -%}{{ link_chip(lk, 'stage') }} {% endif %}{{ cell_text(r, 'stage') }}</td>
             {% else %}
-              <td class="p">{%- if co -%}{{ callout_chip(co, 'prod') }} {% endif %}{%- if lk -%}{{ link_chip(lk, 'prod') }} {% endif %}{{ r.prod }}</td>
-              <td class="s">{%- if co -%}{{ callout_chip(co, 'stage') }} {% endif %}{%- if lk -%}{{ link_chip(lk, 'stage') }} {% endif %}{{ r.stage }}</td>
+              <td class="p">{%- if co -%}{{ callout_chip(co, 'prod') }} {% endif %}{%- if lk -%}{{ link_chip(lk, 'prod') }} {% endif %}{{ cell_text(r, 'prod') }}</td>
+              <td class="s">{%- if co -%}{{ callout_chip(co, 'stage') }} {% endif %}{%- if lk -%}{{ link_chip(lk, 'stage') }} {% endif %}{{ cell_text(r, 'stage') }}</td>
             {% endif %}
           </tr>
           {% if co and co.differ %}
@@ -256,24 +304,19 @@
             {% else %}Callout type differs — Production “{{ co.prod }}”, Staging “{{ co.stage }}”.{% endif %}
           </td></tr>
           {% endif %}
-          {% if lk and lk.differ and r.op in ('equal', 'change') %}
-          <tr class="link-note"><td></td><td colspan="2">
-            {%- if lk.prod %}🔗 Production hyperlinks this text ({{ lk.prod_targets|join(', ') }}); Staging has no link on it.
-            {%- else %}🔗 Staging hyperlinks this text ({{ lk.stage_targets|join(', ') }}); Production has no link on it.{% endif %}
-          </td></tr>
-          {% endif %}
-          {% if r.relocated %}
-          <tr class="link-note"><td></td><td colspan="2">
-            ⇄ This heading isn’t where the {{ 'Staging' if r.relocated == 'stage' else 'Production' }} copy of this sentence sits — the text shown in that column was matched from elsewhere in the {{ 'Staging' if r.relocated == 'stage' else 'Production' }} document, so this isn’t missing content.
-          </td></tr>
-          {% endif %}
+          {#- A per-row note for every dropped link, and another for every
+              sentence matched from elsewhere, buried the real findings under
+              twenty identical italic lines in a single section. The link chip
+              in the cell already says "link dropped", and a row whose
+              counterpart was found elsewhere is simply not a difference - so
+              neither needs a line of its own. -#}
         {% endfor %}
         </tbody>
       </table>
-      {% if s.status == 'matched' and not s.counts.diff and not s.table_notes and not s.format_notes %}
+      {% if s.status == 'matched' and not s.counts.diff and not s.table_notes and not s.format_notes and not s.list_notes %}
       <div class="nodiff">✓ No differences — Production and Staging match for this section.</div>
-      {% elif s.status == 'matched' and not s.counts.diff and (s.table_notes or s.format_notes) %}
-      <div class="nodiff">✓ Text matches — but see the formatting / table difference(s) flagged below.</div>
+      {% elif s.status == 'matched' and not s.counts.diff and (s.table_notes or s.format_notes or s.list_notes) %}
+      <div class="nodiff">✓ Text matches — but see the numbering / formatting / table difference(s) flagged below.</div>
       {% elif s.status in ('missing', 'extra') and not s.counts.diff %}
       <div class="nodiff">✓ No unique content — the "stage only"/"prod only" tag means this exact heading isn't bookmarked on the other side; every sentence below already matches its counterpart (shown here, or under the parent section above).</div>
       {% endif %}
@@ -282,8 +325,29 @@
       <div class="only-side">This heading groups the sub-sections listed below it.</div>
       {% elif s.toc_listing %}
       {# counterpart_note above already explains this is a not-compared TOC/index page #}
+      {% elif s.table_only %}
+      <div class="only-side">This section is a table or figure — no prose to compare line by line.
+        Its content is checked by Table and Image Validation; the page snapshot below shows both sides as printed.</div>
       {% else %}
       <div class="only-side">No text content extracted for this section.</div>
+      {% endif %}
+      {% if s.list_notes %}
+      <div class="list-notes">
+        {% for ln in s.list_notes %}
+        <div class="list-note">
+          <div class="list-note-text"><span class="list-label">Numbering</span> {{ ln.text }}{% if ln.count > 1 %}  (×{{ ln.count }}){% endif %}</div>
+          {% if ln.prod_markers or ln.stage_markers %}
+          <div class="list-note-markers">Production: <b>{{ ln.prod_markers }}</b> &nbsp;·&nbsp; Staging: <b>{{ ln.stage_markers }}</b></div>
+          {% endif %}
+          {% if ln.prod_screenshot or ln.stage_screenshot %}
+          <div class="image-note-shots">
+            {% if ln.prod_screenshot %}<figure><figcaption>Production</figcaption><img loading="lazy" src="{{ ln.prod_screenshot }}" alt="Production list"></figure>{% endif %}
+            {% if ln.stage_screenshot %}<figure><figcaption>Staging</figcaption><img loading="lazy" src="{{ ln.stage_screenshot }}" alt="Staging list"></figure>{% endif %}
+          </div>
+          {% endif %}
+        </div>
+        {% endfor %}
+      </div>
       {% endif %}
       {% if s.table_notes %}
       <div class="table-notes">
@@ -333,10 +397,10 @@
       {% if s.exp_shots or s.act_shots %}
       <details class="rawhtml"{{ ' open' if snapshots_open }}>
         <summary>Exact page snapshot from the PDF — layout, fonts &amp; images as printed</summary>
-        {% if s.counts.diff %}<div class="snap-legend"><span class="sw red"></span> a sentence that differs or was dropped &nbsp;·&nbsp; <span class="sw orange"></span> where the other document's missing content belongs</div>{% endif %}
+        {% if s.counts.diff %}<div class="snap-legend"><span class="sw red"></span> a sentence that differs or was dropped &nbsp;·&nbsp; <span class="sw orange"></span> where that content belongs in the other document &nbsp;·&nbsp; <b class="snap-pair">same number = same difference</b> — box <span class="num">3</span> on the left is box <span class="num">3</span> on the right</div>{% endif %}
         <div class="rawhtml-pair">
           <div>
-            <div class="col-label">Production</div>
+            <div class="col-label">Production{% if s.exp_shots and s.exp_shots_note %} <span class="snap-note">— {{ s.exp_shots_note }}</span>{% endif %}</div>
             {% if s.exp_shots %}
               {% for sh in s.exp_shots %}
               <div class="snap"><span class="snap-pg">PDF page {{ sh.page }}</span><div class="snap-frame"><img loading="lazy" src="{{ sh.src }}" alt="Production — {{ s.heading }}"></div></div>
@@ -344,7 +408,7 @@
             {% else %}<div class="only-side">Not in Production.</div>{% endif %}
           </div>
           <div>
-            <div class="col-label">Staging</div>
+            <div class="col-label">Staging{% if s.act_shots and s.act_shots_note %} <span class="snap-note">— {{ s.act_shots_note }}</span>{% endif %}</div>
             {% if s.act_shots %}
               {% for sh in s.act_shots %}
               <div class="snap"><span class="snap-pg">PDF page {{ sh.page }}</span><div class="snap-frame"><img loading="lazy" src="{{ sh.src }}" alt="Staging — {{ s.heading }}"></div></div>
@@ -387,7 +451,7 @@
       tr.classList.remove('op-prod', 'op-stage');
       tr.classList.add('op-equal');
       const mark = tr.querySelector('td.mark');
-      if (mark) mark.textContent = '=';
+      if (mark) mark.innerHTML = '<span class="same" title="Identical in both documents">match</span>';
       tr.removeAttribute('data-content-match');
     });
     const navLink = document.querySelector('#toclist a[data-id="' + sectionId + '"]');

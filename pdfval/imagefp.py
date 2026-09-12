@@ -282,3 +282,51 @@ def similarity(a: Fingerprint, b: Fingerprint) -> float:
     size, which is the common case when a figure moves between pages.
     """
     return 0.55 * hash_similarity(a, b) + 0.45 * max(0.0, correlation(a, b))
+
+
+# --- sharpness ------------------------------------------------------------
+#
+# A figure that survived the rebuild as a soft, low-resolution copy is a real
+# defect and nothing else here catches it: the fingerprint correlates at ~1.0
+# (it is the same picture), the size check sees the same extent, and the broken
+# -image check only fires on artwork that is blank or fails to decode.
+#
+# Measured as edge energy normalised by the region's own contrast, at a FIXED
+# pixel size. Both normalisations matter: without the contrast term a pale
+# diagram reads as blurry, and without the common pixel size the side that
+# happens to be placed larger on the page always looks sharper.
+# Rendered at a fixed DPI, NOT a fixed pixel size: blur in a PDF is almost
+# always a low-resolution raster scaled up to fill the same box, and
+# downsampling both sides to a common small size destroys exactly the
+# high-frequency difference being looked for (a 3px Gaussian moved this metric
+# by 7% at 320px, and by 60% at 150 DPI).
+SHARP_DPI = 150
+SHARP_MAX_PX = 1400  # cap, so a full-page figure stays cheap to measure
+
+
+def sharpness(doc: "fitz.Document", page_index: int, bbox: tuple) -> float | None:
+    """Edge energy of the region, normalised by its contrast, or None when it
+    cannot be measured (no numpy, or a region too small or featureless)."""
+    try:
+        import numpy as np
+
+        page = doc[page_index]
+        rect = fitz.Rect(*bbox) & page.rect
+        if rect.is_empty or rect.width < 8 or rect.height < 8:
+            return None
+        zoom = min(SHARP_DPI / 72.0, SHARP_MAX_PX / max(1.0, max(rect.width, rect.height)))
+        pix = page.get_pixmap(
+            matrix=fitz.Matrix(zoom, zoom), clip=rect, alpha=False, colorspace=fitz.csGRAY
+        )
+        if pix.width < 16 or pix.height < 16:
+            return None
+        arr = np.frombuffer(pix.samples, dtype=np.uint8)
+        arr = arr.reshape(pix.height, pix.stride)[:, : pix.width].astype(np.float32)
+        contrast = float(arr.std())
+        if contrast < 3.0:
+            return None  # a flat region has no edges to be sharp or soft
+        gy, gx = np.gradient(arr)
+        edge = float(np.abs(gx).mean() + np.abs(gy).mean())
+        return edge / contrast
+    except Exception:
+        return None

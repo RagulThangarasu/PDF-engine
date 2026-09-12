@@ -93,18 +93,64 @@ def test_removed_figure_is_reported_as_missing():
     assert result.summary_rows[0]["missing"] == 1
 
 
-def test_same_figure_rendered_wider_is_reported_as_a_size_change():
+def test_a_figure_that_came_through_soft_is_reported_as_blurred():
+    """The same picture, rendered at a materially lower effective resolution in
+    Staging - unreadable in print, and invisible to every other check: the
+    fingerprint correlates at ~1.0 because it IS the same picture, the extent is
+    identical, and it decodes fine so it is not "broken"."""
+    from PIL import Image, ImageFilter
+
+    from pdfval.imagefp import sharpness
+
+    src_pdf = fitz.open(_fixture("images_prod.pdf"))
+    try:
+        pix = src_pdf[0].get_pixmap(dpi=150)
+        picture = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    finally:
+        src_pdf.close()
+
+    def page_of(image) -> fitz.Document:
+        import io
+
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        doc = fitz.open()
+        page = doc.new_page(width=image.width * 0.5, height=image.height * 0.5)
+        page.insert_image(page.rect, stream=buf.getvalue())
+        return doc
+
+    sharp = page_of(picture)
+    soft = page_of(picture.filter(ImageFilter.GaussianBlur(3.0)))
+    try:
+        rect = sharp[0].rect
+        box = (rect.x0, rect.y0, rect.x1, rect.y1)
+        sharp_score = sharpness(sharp, 0, box)
+        soft_score = sharpness(soft, 0, box)
+        assert sharp_score and soft_score, (sharp_score, soft_score)
+        # The metric has to separate them clearly, or the check cannot.
+        assert soft_score / sharp_score < 0.65, (sharp_score, soft_score)
+        # ...and must NOT call the sharp original blurred against itself.
+        assert sharpness(sharp, 0, box) / sharp_score >= 0.65
+    finally:
+        sharp.close()
+        soft.close()
+
+
+def test_same_figure_rendered_wider_is_counted_but_not_flagged():
     """The picture is unchanged, only its width - that is a resize, not a swap
-    and not a loss."""
+    and not a loss, so it is COUNTED in the figure summary and raises no issue.
+
+    Reporting it per figure buried the findings that break a document (a
+    dropped label, a stripped callout, a blank render) under rows nobody acts
+    on, so `_check_dimensions` now only records it.
+    """
     result = _images("images_prod.pdf", "images_stage_wider.pdf")
     counts = result.message_counts
     assert counts.get("Image missing") is None, counts
     assert counts.get("Image content differs") is None, counts
-    size_msgs = [m for m in counts if m in ("Image width changed", "Image size changed")]
-    assert size_msgs, counts
-    issue = next(i for i in result.issues if i.message in size_msgs)
-    assert issue.severity == "warning"
-    assert "wider" in issue.details["reason"]
+    assert counts.get("Image width changed") is None, counts
+    assert counts.get("Image size changed") is None, counts
+    # The resize is still visible where it belongs: the figure-by-figure table.
     assert result.summary_rows[0]["resized"] == 1
     assert result.summary_rows[0]["matched"] == 3  # still counted as the same picture
 
@@ -149,11 +195,16 @@ def test_identical_documents_report_no_content_findings():
     assert not [i for i in result.issues if i.message in ("Missing text", "Added text", "Changed text")]
 
 
-def test_one_sided_finding_shows_only_the_side_that_has_the_text():
-    """A Missing/Added finding must never show a screenshot on the side that
-    has nothing corresponding - the old "context" crop pointed at an unrelated
-    place and read as a false claim. It shows one accurate picture, or a note
-    saying there is nothing to show on that side."""
+def test_text_diff_finding_carries_its_wording_not_a_screenshot():
+    """A Missing/Added text finding shows the TEXT, not a picture of it.
+
+    The crops these findings used to carry said nothing the wording didn't -
+    and on the side with nothing corresponding, a "context" crop pointed at an
+    unrelated place and read as a false claim. The exact Production/Staging
+    wording is the evidence here; the side-by-side browser shows the same text
+    in its real page context. (Visual content findings - a dropped bold run, an
+    encoding regression - do still carry crops; see `_attach_screenshots`.)
+    """
     import tempfile
 
     prod_path = _fixture("content_prod.pdf")
@@ -173,12 +224,11 @@ def test_one_sided_finding_shows_only_the_side_that_has_the_text():
     assert one_sided, "expected a Missing and an Added finding for the edited paragraph"
     for issue in one_sided:
         d = issue.details or {}
-        if issue.message == "Missing text":
-            assert not d.get("stage_screenshot"), d
-            assert d.get("prod_screenshot") or d.get("prod_screenshot_note")
-        else:  # Added text
-            assert not d.get("prod_screenshot"), d
-            assert d.get("stage_screenshot") or d.get("stage_screenshot_note")
+        assert not d.get("prod_screenshot"), d
+        assert not d.get("stage_screenshot"), d
+        # The finding still has to say WHAT changed, on the side that has it.
+        side = "expected" if issue.message == "Missing text" else "actual"
+        assert d.get(side), d
 
 
 # --- tables ----------------------------------------------------------------

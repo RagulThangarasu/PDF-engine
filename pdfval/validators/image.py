@@ -5,9 +5,10 @@ SECTION and compared against what is found there, by appearance. Findings:
 
 * Image missing              - a Production figure has no counterpart at all
 * Image content differs      - a figure is there, but it is not the same picture
-* Image width changed / Image size changed
-                             - the SAME picture, rendered materially wider/
-                               taller (or smaller) in STAGE
+* Image blurred              - the same picture, rendered soft/low-resolution
+                               in STAGE where Production is sharp
+(A figure rendered at a different SIZE is counted in the summary table but is
+ not a finding: it is a layout choice, not a defect.)
 * Image outside its section  - the picture is in STAGE but past the section's end
 * Broken image               - STAGE artwork that fails to decode or renders blank
 * Image label missing        - a figure caption/label absent from STAGE
@@ -41,7 +42,8 @@ from pdfval import imagefp, ocr
 from pdfval.extractor import ImageInfo, get_all_detected_regions, get_figures
 from pdfval.models import CheckResult, Issue
 from pdfval.report import screenshots
-from pdfval.validators.toc import get_toc_entries, heading_at, in_section_bounds, matched_heading_ranges
+from pdfval.validators.headings import resolve_entries
+from pdfval.validators.toc import heading_at, in_section_bounds, matched_heading_ranges
 
 MAX_SCREENSHOTS = 300  # cap total screenshot pairs so a huge document doesn't stall the report
 
@@ -149,8 +151,7 @@ def validate_images(
     expected: fitz.Document, actual: fitz.Document, output_dir: str | None = None
 ) -> CheckResult:
     result = CheckResult(name="Image Validation")
-    exp_entries = get_toc_entries(expected)
-    act_entries = get_toc_entries(actual)
+    exp_entries, act_entries = resolve_entries(expected, actual)
     counter = itertools.count(1)
     ctx = _Context(expected, actual, output_dir, counter)
 
@@ -265,8 +266,7 @@ def _figures_in_bounds(doc: fitz.Document, bounds) -> list[tuple[int, ImageInfo]
 
 def _validate_by_page_index(result: CheckResult, ctx: _Context) -> None:
     """Fallback used only when one/both documents have no TOC to anchor by."""
-    exp_entries = get_toc_entries(ctx.expected)
-    act_entries = get_toc_entries(ctx.actual)
+    exp_entries, act_entries = resolve_entries(ctx.expected, ctx.actual)
     common_pages = min(ctx.expected.page_count, ctx.actual.page_count)
 
     for i in range(common_pages):
@@ -685,6 +685,7 @@ def _compare_section(
     counterparts = _counterparts(ctx, pairs)
     _report_matches(result, ctx, pairs, heading)
     _check_broken_images(result, ctx, act_figs, heading)
+    _check_blurred(result, ctx, pairs, heading)
     _check_dimensions(result, ctx, pairs, heading)
     _record_summary(ctx, heading, pairs, exp_figs, act_figs)
     _check_alignment(result, ctx, pairs, heading)
@@ -875,15 +876,16 @@ def _dimensions_comparable(exp_fp: "imagefp.Fingerprint", act_fp: "imagefp.Finge
 def _check_dimensions(
     result: CheckResult, ctx: _Context, pairs: list[_Pair], heading: str | None
 ) -> None:
-    """A figure that is the SAME picture but rendered at a materially different
-    width or height in Staging - it was scaled up or down.
+    """Flags the pairs that are the SAME picture rendered at a materially
+    different width or height in Staging - scaled up or down.
 
-    Checked only on figures confirmed identical, and only when both documents
-    detected the figure at a comparable EXTENT (a pair matched by the sliding
-    or split-figure fallback got there precisely because the two detections
-    disagree about where the figure ends, so their bboxes can't be compared as
-    sizes). Width and height are reported separately: "wider" and "taller" are
-    different edits and a reader wants to know which.
+    This is recorded (`pair.size_changed`, shown in the figure-by-figure
+    summary) but NOT raised as an issue: a resize is a layout choice, and
+    reporting one per figure drowned the findings that actually break the
+    document. The strict qualifying conditions below are what make the count
+    trustworthy: both documents must have detected the figure the same way and
+    at a comparable extent, or the two boxes differ for detection reasons that
+    have nothing to do with a resize.
     """
     for pair in pairs:
         if pair.status != "same" or pair.act_img is None:
@@ -935,22 +937,63 @@ def _check_dimensions(
         if not changes:
             continue
 
-        summary = "; ".join(f"{c['direction']} ({c['change']})" for c in changes)
+        # NOT a finding. The same picture rendered wider or taller is a layout
+        # choice, not a defect - and flagged per figure it buried the breaking
+        # issues (a dropped label, a stripped callout, a blank render) under
+        # rows nobody acts on. The resize is still COUNTED, so the figure-by-
+        # figure summary table below still reports it.
+        pair.size_changed = True
+
+
+# A figure is called blurred only when the SAME picture is materially softer in
+# Staging. Calibrated against known blurs of one real page: a 2px Gaussian
+# measures 0.57 of the sharp original and a 4px one 0.37, while a mild
+# half-resolution upscale still measures 0.88 - so 0.65 catches a genuine
+# resolution loss and leaves ordinary re-encoding alone.
+BLUR_RATIO = 0.65
+BLUR_MIN_PROD_SHARPNESS = 0.05  # below this Production is soft too - nothing to compare
+
+
+def _check_blurred(
+    result: CheckResult, ctx: _Context, pairs: list[_Pair], heading: str | None
+) -> None:
+    """The same picture, rendered soft or low-resolution in Staging.
+
+    Nothing else here catches this: the fingerprint correlates at ~1.0 because
+    it IS the same picture, the dimension check sees the same extent, and
+    `_check_broken_images` only fires on artwork that is blank or fails to
+    decode. A figure that came through the rebuild as an upscaled low-res copy
+    is unreadable in print and passes every other check.
+    """
+    for pair in pairs:
+        if pair.status != "same" or pair.act_img is None:
+            continue
+        exp_sharp = imagefp.sharpness(ctx.expected, pair.exp_page, pair.exp_img.bbox)
+        act_sharp = imagefp.sharpness(ctx.actual, pair.act_page, pair.act_img.bbox)
+        if exp_sharp is None or act_sharp is None:
+            continue
+        if exp_sharp < BLUR_MIN_PROD_SHARPNESS:
+            continue
+        ratio = act_sharp / exp_sharp
+        if ratio >= BLUR_RATIO:
+            continue
         details = _with_heading(
             {
                 "expected_page": pair.exp_page + 1,
                 "actual_page": pair.act_page + 1,
-                "reason": f"the same figure, rendered at a different size in Staging: {summary}",
-                "expected_size": f"{exp_fp.width:.0f} x {exp_fp.height:.0f} pt",
-                "actual_size": f"{act_fp.width:.0f} x {act_fp.height:.0f} pt",
+                "reason": (
+                    "the same figure, rendered soft in Staging - it carries "
+                    f"{ratio:.0%} of Production's edge detail"
+                ),
+                "bbox": pair.exp_img.bbox,
                 "similarity": f"{pair.score:.0%}",
             },
             heading,
         )
         _attach(ctx, details, pair.exp_page, pair.exp_img.bbox, pair.act_page, pair.act_img.bbox)
-        message = "Image width changed" if changes[0]["axis"] == "width" and len(changes) == 1 else "Image size changed"
-        result.issues.append(Issue(severity="warning", page=pair.exp_page, message=message, details=details))
-        pair.size_changed = True
+        result.issues.append(
+            Issue(severity="error", page=pair.exp_page, message="Image blurred", details=details)
+        )
 
 
 def _check_alignment(
@@ -1514,15 +1557,19 @@ def _attach(
     if seq > MAX_SCREENSHOTS:
         return
 
+    label = str(seq)  # the same number on both crops - one figure, two views
+    details["shot_label"] = label
     if exp_page is not None and _capturable(ctx.expected, exp_page, exp_bbox):
         prod = screenshots.capture_region(
-            ctx.expected, exp_page, ctx.output_dir, f"image_{seq}_prod", exp_bbox
+            ctx.expected, exp_page, ctx.output_dir, f"image_{seq}_prod", exp_bbox,
+            screenshots.KIND_DIFF, label,
         )
         if prod:
             details["prod_screenshot"] = prod
     if act_page is not None and _capturable(ctx.actual, act_page, act_bbox):
         stage = screenshots.capture_region(
-            ctx.actual, act_page, ctx.output_dir, f"image_{seq}_stage", act_bbox
+            ctx.actual, act_page, ctx.output_dir, f"image_{seq}_stage", act_bbox,
+            screenshots.KIND_DIFF, label,
         )
         if stage:
             details["stage_screenshot"] = stage

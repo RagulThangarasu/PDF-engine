@@ -11,6 +11,11 @@ Each fixture isolates ONE behaviour so a test failure says what broke:
   images_stage_swapped.pdf                  - one figure replaced by a
                                               different picture
   images_stage_missing.pdf                  - one figure removed outright
+  list_prod.pdf / list_stage_detached.pdf   - one numbered procedure, with Staging
+                                              drawing each marker as its own text
+                                              object beside the step
+  list_stage_lettered.pdf                   - that procedure relettered a,b,c
+  list_stage_bulleted.pdf                   - that procedure reduced to bullets
 """
 from __future__ import annotations
 
@@ -253,6 +258,54 @@ def _content_document(variant: str) -> pymupdf.Document:
     return doc
 
 
+_STEPS = [
+    "Disable Set time automatically.",
+    "Select Date.",
+    "Specify the date, and then select OK.",
+    "Select Time.",
+    "Specify the time, and then select OK.",
+]
+_LIST_LEAD = (
+    "Perform one or more of the following actions to set the time the display "
+    "shows while it is idle."
+)
+
+
+def _list_document(variant: str) -> pymupdf.Document:
+    """One heading over a five-step procedure, typeset the two ways real
+    documents typeset one.
+
+    variant "prod"     - "1." ... "5." inline, at the start of each step's own
+                         line (how Production sets a procedure)
+            "detached" - the SAME 1-5 numbering, but each marker drawn as its
+                         own text object to the left of the step (how Staging
+                         sets one) - same content, nothing to report
+            "lettered" - detached markers relettered a. ... e.
+            "bulleted" - detached markers replaced by bullets
+    """
+    doc = pymupdf.open()
+    doc.new_page(width=PAGE_W, height=PAGE_H)
+    page = doc[0]
+    page.insert_text((60, 60), "Setting the display time", fontsize=16)
+    _wrapped(page, _LIST_LEAD, 60, 84, 480)
+    markers = {
+        "prod": [f"{i}." for i in range(1, 6)],
+        "detached": [f"{i}." for i in range(1, 6)],
+        "lettered": ["a.", "b.", "c.", "d.", "e."],
+        "bulleted": ["\u2022"] * 5,
+    }[variant]
+    y = 150.0
+    for marker, step in zip(markers, _STEPS):
+        if variant == "prod":
+            page.insert_text((100, y), f"{marker}  {step}", fontsize=10)
+        else:
+            page.insert_text((100, y), marker, fontsize=10)
+            page.insert_text((125, y), step, fontsize=10)
+        y += 18.0
+    doc.set_toc([[1, "Setting the display time", 1]])
+    return doc
+
+
 def main() -> None:
     os.makedirs(FIXTURES, exist_ok=True)
     written = []
@@ -270,6 +323,10 @@ def main() -> None:
         ("content_stage_reflowed.pdf", _content_document("ok")),
         ("content_stage_glued.pdf", _content_document("glued")),
         ("content_stage_edited.pdf", _content_document("edited")),
+        ("list_prod.pdf", _list_document("prod")),
+        ("list_stage_detached.pdf", _list_document("detached")),
+        ("list_stage_lettered.pdf", _list_document("lettered")),
+        ("list_stage_bulleted.pdf", _list_document("bulleted")),
     ):
         path = os.path.join(FIXTURES, name)
         doc.save(path)

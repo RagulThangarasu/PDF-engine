@@ -9,8 +9,10 @@ import fitz
 
 from pdfval.extractor import reset_table_cache
 from pdfval.models import ValidationReport
+from pdfval.report.counterparts import fill_counterpart_screenshots
 from pdfval.report.html_report import generate_reports
 from pdfval.report.sections import build_section_comparison
+from pdfval.validators.headings import reset_heading_cache
 from pdfval.verify import verify_report
 from pdfval.validators import (
     validate_alignment,
@@ -57,7 +59,7 @@ def run(
     report = ValidationReport(expected_path=expected_path, actual_path=actual_path)
 
     _p(8, "Checking pages")
-    report.add(validate_pages(expected, actual))
+    report.add(validate_pages(expected, actual, output_dir))
     _p(14, "Checking table of contents")
     report.add(validate_toc(expected, actual))
     report.toc_comparison = build_toc_comparison(expected, actual)
@@ -80,6 +82,12 @@ def run(
     # tag the rest confirmed / review.
     _p(80, "Verifying findings")
     verify_report(report, expected, actual, expected_path, actual_path)
+
+    # Every finding shows BOTH documents. One that only one side has evidence
+    # for gets the other side's view of the same section, so a column is never
+    # left blank where the reader most needs the comparison.
+    _p(83, "Filling in counterpart screenshots")
+    fill_counterpart_screenshots(report, expected, actual, output_dir)
 
     # Data for sections.html - the standalone TOC-navigated side-by-side
     # content browser. Built here while both documents are still open.
@@ -112,10 +120,21 @@ def run(
             "Possible text encoding issue",
         )
     ]
+    # A list renumbered 1,2,3 -> a,b,c never shows up in the section browser's
+    # text diff (the marker is drawn outside the sentence, or stripped from
+    # it), so it is carried in explicitly and flagged there in red.
+    list_findings = [
+        {"message": issue.message, "details": issue.details or {}}
+        for check in report.checks
+        if check.name == "Alignment Validation"
+        for issue in check.issues
+        if issue.message == "List marker changed"
+    ]
     _p(85, "Building the side-by-side section browser")
     report.section_comparison = build_section_comparison(
         expected, actual, expected_path, actual_path, output_dir,
         callout_icon_findings, image_findings, table_findings, format_findings,
+        list_findings,
     )
     _p(95, "Rendering the report")
 
@@ -125,6 +144,7 @@ def run(
     # would keep every uploaded PDF open in pdfplumber for the process's life.
     reset_table_cache()
     reset_paragraph_cache()
+    reset_heading_cache()
     from pdfval.ocr import reset_ocr_cache
 
     reset_ocr_cache()
