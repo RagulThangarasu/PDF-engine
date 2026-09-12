@@ -172,7 +172,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Side-by-side sections: {paths['sections']}")
     if paths.get("toc"):
         print(f"TOC comparison: {paths['toc']}")
-    print(f"PDF report: {paths['pdf']}")
     print(f"JSON report: {paths['json']}")
 
     return 0 if report.passed else 1

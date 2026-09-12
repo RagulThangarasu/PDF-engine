@@ -1,4 +1,5 @@
-"""Writes report.html, report.pdf and report.json from a ValidationReport."""
+"""Writes report.html, sections.html, toc.html and report.json from a
+ValidationReport. report.pdf is no longer produced - see `ALL_FORMATS`."""
 from __future__ import annotations
 
 import json
@@ -121,7 +122,13 @@ def write_pdf_report(report: ValidationReport, output_dir: str, html: str | None
     return path
 
 
-ALL_FORMATS = ("json", "html", "pdf", "sections", "toc")
+# report.pdf is deliberately NOT here: nobody reads it. The three HTML reports
+# are what anyone opens - the side-by-side section browser above all - and a
+# paginated copy of the findings costs every run a few seconds and a ~7 MB file
+# (2.9s / 7.4 MB on a 61-page manual) that is strictly worse to read than the
+# report.html it was rendered from. `write_pdf_report` is still callable for
+# anyone who explicitly asks for `formats=("pdf",)`; nothing does by default.
+ALL_FORMATS = ("json", "html", "sections", "toc")
 
 
 def generate_reports(
@@ -132,14 +139,10 @@ def generate_reports(
 ) -> dict[str, str]:
     """Write the requested report formats; returns a dict of their paths.
 
-    `formats` exists so the web UI can skip report.pdf, which it no longer
-    offers: paginating a report carrying hundreds of screenshots through
-    Story/DocumentWriter is by far the slowest step of a run, and there is no
-    reason to pay it for a file nobody can reach.
-
     "sections" writes sections.html - the standalone TOC-navigated side-by-side
     content browser - from `report.section_comparison` (set by `cli.run`);
-    skipped silently when that isn't present.
+    skipped silently when that isn't present. "toc" writes toc.html the same
+    way from `report.toc_report`.
     """
     html = render_report_html(report, **extra_context)
     section_data = getattr(report, "section_comparison", None)
