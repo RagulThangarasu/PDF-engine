@@ -18,6 +18,8 @@ from __future__ import annotations
 import difflib
 import itertools
 import math
+import re
+from collections import Counter
 
 import fitz
 
@@ -41,15 +43,29 @@ _NEIGHBOUR_MAX_PAGES = 4    # a section runs on; the two documents paginate diff
 _BAND_SOURCE_SCALE = 1.15
 _BAND_MAX = 520.0
 _FIGURE_MIN_SIDE = 24.0     # smaller than this is a rule or a bullet, not artwork
+_MIN_GAP_BAND = 10.0        # a "where it belongs" box thinner than this is a hairline;
+                            # below it the lead-in line comes back inside the box so
+                            # there is something for the reader to recognise
+
+# Matching the flagged region's own CONTENT in the other document, which is
+# what the reader is really asking to see. A band measured down from a lead-in
+# line lands wherever that line happens to fall; the table or sentence the
+# finding is about can be half a page further on, and the two boxes then frame
+# different things - a Staging table beside a Production diagram - which reads
+# as a difference that was never reported.
+_CONTENT_MIN_TOKENS = 4     # fewer real words than this identifies nothing
+_CONTENT_MIN_SCORE = 0.45   # token overlap (F1) for "this says the same thing"
+_CONTENT_LINE_SLACK = 4     # lines either side of the source's own line count
+_CONTENT_PAD = 3.0          # points of padding around the matched lines
 
 
 def _norm(text: str) -> str:
     return " ".join((text or "").split()).lower()
 
 
-def _page_lines(doc: fitz.Document, page_index: int) -> list[tuple[float, float, str]]:
-    """(y0, y1, text) for every text line on the page, in reading order."""
-    out: list[tuple[float, float, str]] = []
+def _page_lines(doc: fitz.Document, page_index: int) -> list[tuple[float, float, float, float, str]]:
+    """(x0, y0, x1, y1, text) for every text line on the page, in reading order."""
+    out: list[tuple[float, float, float, float, str]] = []
     try:
         data = doc[page_index].get_text("dict")
     except Exception:
@@ -60,9 +76,93 @@ def _page_lines(doc: fitz.Document, page_index: int) -> list[tuple[float, float,
         for ln in b.get("lines", []):
             text = "".join(s.get("text", "") for s in ln.get("spans", [])).strip()
             if text:
-                out.append((float(ln["bbox"][1]), float(ln["bbox"][3]), text))
-    out.sort()
+                x0, y0, x1, y1 = (float(v) for v in ln["bbox"])
+                out.append((x0, y0, x1, y1, text))
+    out.sort(key=lambda ln: (ln[1], ln[0]))
     return out
+
+
+_WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
+
+
+def _tokens(text: str) -> Counter:
+    return Counter(w.lower() for w in _WORD_RE.findall(text or ""))
+
+
+def _token_f1(a: Counter, b: Counter) -> float:
+    """How much two pieces of text say the same thing, 0-1. A multiset F1 rather
+    than a plain overlap, so a candidate that contains the wanted words plus a
+    page of others does not score as a perfect match."""
+    total = sum(a.values()) + sum(b.values())
+    if not total:
+        return 0.0
+    return 2 * sum((a & b).values()) / total
+
+
+def _region_text(doc: fitz.Document, page_index: int | None, bbox) -> str:
+    """The text printed inside `bbox` - what the flagged region actually says."""
+    if page_index is None or bbox is None or not (0 <= page_index < doc.page_count):
+        return ""
+    try:
+        return doc[page_index].get_text("text", clip=fitz.Rect(*(float(v) for v in bbox)))
+    except Exception:
+        return ""
+
+
+def _counterpart_content(
+    doc: fitz.Document,
+    start_page: int,
+    end: tuple[int, float] | None,
+    source_text: str,
+    source_line_count: int,
+) -> tuple[int, tuple[float, float, float, float]] | None:
+    """Where in this document's copy of the section the SAME content is printed.
+
+    Scans the section's pages for the run of consecutive lines whose wording
+    best matches the flagged region's, and returns that run's own box - so the
+    orange counterpart box frames the same table, the same paragraph, the same
+    row as the red one beside it. Matching content instead of position is what
+    keeps a "table breaks the margin in Staging" finding from showing the
+    Staging table beside whatever Production happens to print at that height.
+    """
+    want = _tokens(source_text)
+    if sum(want.values()) < _CONTENT_MIN_TOKENS:
+        return None
+    lo = max(1, source_line_count - _CONTENT_LINE_SLACK)
+    hi = max(lo, source_line_count + _CONTENT_LINE_SLACK)
+    max_page = min(doc.page_count, start_page + _NEIGHBOUR_MAX_PAGES)
+    if end is not None:
+        max_page = min(max_page, end[0] + 1)
+
+    best: tuple[int, int, int] | None = None
+    best_score = 0.0
+    per_page: dict[int, list] = {}
+    for page_index in range(start_page, max_page):
+        lines = [
+            ln for ln in _page_lines(doc, page_index)
+            if not (end and (page_index, ln[1]) >= end)
+        ]
+        per_page[page_index] = lines
+        for i in range(len(lines)):
+            acc: Counter = Counter()
+            for j in range(i, min(len(lines), i + hi)):
+                acc.update(_tokens(lines[j][4]))
+                if j - i + 1 < lo:
+                    continue
+                score = _token_f1(acc, want)
+                if score > best_score:
+                    best_score, best = score, (page_index, i, j)
+    if best is None or best_score < _CONTENT_MIN_SCORE:
+        return None
+    page_index, i, j = best
+    window = per_page[page_index][i : j + 1]
+    rect = doc[page_index].rect
+    return page_index, (
+        max(rect.x0, min(ln[0] for ln in window) - _CONTENT_PAD),
+        max(rect.y0, min(ln[1] for ln in window) - _CONTENT_PAD),
+        min(rect.x1, max(ln[2] for ln in window) + _CONTENT_PAD),
+        min(rect.y1, max(ln[3] for ln in window) + _CONTENT_PAD),
+    )
 
 
 def _lead_in_line(doc: fitz.Document, page_index: int, bbox) -> str:
@@ -72,7 +172,7 @@ def _lead_in_line(doc: fitz.Document, page_index: int, bbox) -> str:
         return ""
     top = float(bbox[1])
     best = ""
-    for y0, y1, text in _page_lines(doc, page_index):
+    for _, y0, _, y1, text in _page_lines(doc, page_index):
         if y1 <= top + 1 and y1 >= top - _NEIGHBOUR_LOOK_UP and len(text) >= _NEIGHBOUR_MIN_CHARS:
             best = text
     return best
@@ -203,7 +303,7 @@ def _neighbour_anchor(
         max_page = min(max_page, end_page + 1)
     best, best_ratio = None, 0.0
     for page_index in range(start_page, max_page):
-        for y0, y1, text in _page_lines(doc, page_index):
+        for _, y0, _, y1, text in _page_lines(doc, page_index):
             if end and (page_index, y0) >= end:
                 continue
             ratio = difflib.SequenceMatcher(None, want, _norm(text), autojunk=False).ratio()
@@ -217,7 +317,15 @@ def _neighbour_anchor(
     band_y1 = min(rect.y1, y1 + depth)
     if end and end[0] == page_index:
         band_y1 = min(band_y1, end[1])
-    return page_index, (rect.x0, y0, rect.x1, band_y1)
+    # Box the space BELOW the lead-in, not the lead-in itself: this anchor is
+    # only reached when the other document has nothing of its own here, and a
+    # box drawn round the one line that IS there reads as "this text is the
+    # defect". Only when that leaves nothing worth looking at does the line
+    # come back inside the box.
+    top = y1 + 2.0
+    if band_y1 - top < _MIN_GAP_BAND:
+        top = y0
+    return page_index, (rect.x0, top, rect.x1, band_y1)
 
 
 def _next_heading_bound(entries, title: str) -> tuple[int, float] | None:
@@ -236,6 +344,34 @@ def _next_heading_bound(entries, title: str) -> tuple[int, float] | None:
         if e is match:
             return (ordered[i + 1].page, ordered[i + 1].y) if i + 1 < len(ordered) else None
     return None
+
+
+# What the orange counterpart box is showing, per anchor used to place it.
+_CAPTIONS = {
+    "content": "{other} p.{page} — the same content here, shown for comparison; not itself a defect",
+    "figure": "{other} p.{page} — the nearest figure here, shown for comparison; not itself a defect",
+    "place": "{other} p.{page} — nothing of this sits here; the box marks where it belongs",
+    "section": "{other} p.{page} — the same section (“{heading}”), the nearest the box could be placed",
+}
+
+# Detail keys that carry the flagged wording itself, in the order they are
+# worth trying: what Production has, then what Staging has, then the text the
+# finding quoted. Used when the finding has no region of its own to read.
+_TEXT_KEYS = ("expected", "actual", "text")
+
+
+def _finding_text(details: dict) -> str:
+    """The flagged wording, straight off the finding, for findings that carry no
+    bbox to read the page through (a content or callout difference)."""
+    for key in _TEXT_KEYS:
+        value = details.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+        if isinstance(value, (list, tuple)):
+            joined = " ".join(v for v in value if isinstance(v, str) and not v.startswith("... (+"))
+            if joined.strip():
+                return joined
+    return ""
 
 
 def fill_counterpart_screenshots(
@@ -300,20 +436,35 @@ def fill_counterpart_screenshots(
                 pass
             bound = _next_heading_bound(entries, heading)
             precise = None
+            how = "section"
             # A figure finding is answered by the other document's FIGURE, found
             # directly - never through the text around it.
             if check.name == "Image Validation" and src_bbox:
                 precise = _counterpart_figure(
                     doc, page, bound, src_bbox, figures_used.setdefault((side, heading), set())
                 )
+                if precise:
+                    how = "figure"
+            if precise is None:
+                # What the flagged region SAYS, found again over here. This is
+                # the only anchor that guarantees the two boxes frame the same
+                # thing: a table, a row, a paragraph is identified by its own
+                # words, not by where it happens to sit on the page.
+                source_text = _region_text(src_doc, src_page, src_bbox) or _finding_text(details)
+                lines = [ln for ln in source_text.splitlines() if ln.strip()]
+                precise = _counterpart_content(doc, page, bound, source_text, len(lines) or 1)
+                if precise:
+                    how = "content"
             if precise is None:
                 precise = _neighbour_anchor(
                     doc, page, lead_in, end=bound, source_height=source_height
                 )
-                if precise and check.name == "Image Validation":
-                    figure = _figure_in_band(doc, precise[0], precise[1])
-                    if figure:
-                        precise = (precise[0], figure)
+                if precise:
+                    how = "place"
+                    if check.name == "Image Validation":
+                        figure = _figure_in_band(doc, precise[0], precise[1])
+                        if figure:
+                            precise, how = (precise[0], figure), "figure"
             if precise:
                 page, bbox = precise
             seq = next(counter)
@@ -329,10 +480,14 @@ def fill_counterpart_screenshots(
                 continue
             other = "Staging" if side == "stage" else "Production"
             details[f"{side}_screenshot"] = path
-            details[f"{side}_screenshot_caption"] = (
-                f"{other} - p.{page + 1}, where this belongs" if precise
-                else f"{other} - p.{page + 1}, the same section ({heading})"
+            # Say what the orange box IS. Without this the reader sees a box
+            # round a paragraph opposite a box round a diagram and reads it as
+            # a second, text-level defect - which is exactly what the box is
+            # not: it is where to look in the other document.
+            details[f"{side}_screenshot_caption"] = _CAPTIONS[how].format(
+                other=other, page=page + 1, heading=heading
             )
+            details[f"{side}_screenshot_kind"] = how
             # The old "there is no corresponding place to show" placeholder is
             # no longer true for this finding.
             details.pop(f"{side}_screenshot_note", None)

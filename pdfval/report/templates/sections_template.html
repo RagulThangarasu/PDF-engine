@@ -93,6 +93,57 @@
   body.diffs-only tr.op-equal { display: none; }
   body.diffs-only section.sec.no-diff { display: none; }
 
+  /* --- what each line IS -------------------------------------------------
+     Every text unit on the page is shown, so every row says which kind it is:
+     the reader can tell a reworded sentence from a table cell the two
+     producers merely grouped differently, and can switch a kind off without
+     ever being left wondering what was filtered out. */
+  .kind { display: inline-block; font-size: 9px; font-weight: 700; letter-spacing: .03em;
+          border-radius: 3px; padding: 1px 5px; margin-top: 3px; white-space: nowrap;
+          border: 1px solid transparent; }
+  .kind.k-prose   { color: #33415c; background: #eef1f6; border-color: #dde3ec; }
+  .kind.k-heading { color: #5b3d8a; background: #f1ecf9; border-color: #e2d8f2; }
+  .kind.k-table   { color: #0f5c63; background: #e7f5f6; border-color: #cfe9eb; }
+  .kind.k-figure  { color: #8a5a13; background: #fbf1e2; border-color: #f2e2c8; }
+  .kind.k-value   { color: #14532d; background: #ecf6ef; border-color: #d6ebdd; }
+  .kind.k-chrome  { color: #6b7280; background: #f3f4f6; border-color: #e5e7eb; }
+  td.mark { line-height: 1.35; }
+  td.mark .kind { display: block; width: fit-content; }
+
+  /* Coverage strip: the section's own account of every unit it found. This is
+     the guarantee the old browser could not make - it showed prose and quietly
+     dropped the rest, so "no differences" could mean "nothing differs" or
+     "the part that differs was never displayed". */
+  .coverage { display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+              padding: 7px 14px 9px; border-bottom: 1px solid var(--line); background: #fcfcfd; }
+  .cov { display: inline-flex; align-items: baseline; gap: 5px; font-size: 11px;
+         border: 1px solid var(--line); border-radius: 999px; padding: 2px 9px;
+         background: #fff; cursor: pointer; user-select: none; }
+  .cov:hover { border-color: #b9c2cf; }
+  .cov.off { opacity: .45; text-decoration: line-through; }
+  .cov b { font-weight: 700; color: #1a1a1a; }
+  .cov .n { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .cov .d { color: #a31212; font-weight: 700; }
+  .cov .ok { color: #1a7a34; font-weight: 700; }
+  .cov-total { margin-left: auto; font-size: 11px; color: var(--muted); }
+  .cov-total b { color: #1a1a1a; }
+
+  /* Kind filter in the top bar. Page furniture starts off - a page number is
+     one-sided in every section by construction - but its count is always on
+     the strip above, so it is hidden, never omitted. */
+  .kindbar { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; padding: 6px 14px;
+             border-bottom: 1px solid var(--line); background: #fff; font-size: 11px; }
+  .kindbar .lbl { color: var(--muted); margin-right: 2px; }
+  .kindbar button { font: inherit; border: 1px solid var(--line); background: #fff; color: #33415c;
+                    border-radius: 999px; padding: 2px 10px; cursor: pointer; }
+  .kindbar button.on { background: #1a2b45; border-color: #1a2b45; color: #fff; }
+  body.hide-prose   tr[data-kind="prose"],
+  body.hide-heading tr[data-kind="heading"],
+  body.hide-table   tr[data-kind="table"],
+  body.hide-figure  tr[data-kind="figure"],
+  body.hide-value   tr[data-kind="value"],
+  body.hide-chrome  tr[data-kind="chrome"] { display: none; }
+
   details.rawhtml { margin: 10px 14px 14px; border-top: 1px dashed var(--line); padding-top: 8px; }
   details.rawhtml summary { cursor: pointer; font-size: 11px; color: var(--muted); font-weight: 600; }
   .rawhtml-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 8px; align-items: start; }
@@ -115,32 +166,47 @@
   .co.none { background: #fdecec; color: #a01515; }
   tr.callout-note td { background: #fffaf0; color: #7a5a12; font-size: 11px; font-style: italic; border-bottom: 1px solid #f0f1f3; }
   tr.link-note td { background: #f0f6ff; color: #274b9c; font-size: 11px; font-style: italic; border-bottom: 1px solid #f0f1f3; }
-  .fmt-note-box { padding: 8px 10px; margin-bottom: 6px; background: #fff6ec; border: 1px solid #f0dcc4; border-radius: 5px; }
-  .fmt-note-box.encoding { background: #fdeeee; border-color: #f0d2d2; }
-  .fmt-note-box-text { font-size: 12px; color: #8a4b12; }
-  .fmt-note-box.encoding .fmt-note-box-text { color: #7a1414; }
-  .fmt-label { display: inline-block; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em;
-               border-radius: 3px; padding: 1px 5px; margin-right: 6px; background: #f0dcc4; color: #8a4b12; vertical-align: 1px; }
-  .fmt-label.fmt-encoded { background: #f0d2d2; color: #7a1414; }
   /* A renumbered list is a content-level regression, so it is flagged the way
      a missing figure is - solid red - not in the amber used for styling. */
-  .list-notes { margin: 8px 14px 4px; }
-  .list-note { padding: 8px 10px; margin-bottom: 6px; background: #fdeeee; border: 1px solid #eab6b6; border-left: 4px solid #a31212; border-radius: 5px; }
-  .list-note-text { font-size: 12px; color: #7a1414; font-weight: 600; }
-  .list-note-markers { font-size: 11px; color: #8a4444; margin-top: 4px; font-weight: 400; }
-  .list-note-markers b { color: #7a1414; }
-  .list-label { display: inline-block; font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em;
-                border-radius: 3px; padding: 1px 5px; margin-right: 6px; background: #a31212; color: #fff; vertical-align: 1px; }
+  /* ---- the defect panel: one block per category, in a fixed order ---- */
+  .defects { margin: 10px 14px 14px; border-top: 1px solid var(--line); padding-top: 10px; }
+  .defects-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+  .defects-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: #1f2430; }
+  .defects-total { font-size: 11px; font-weight: 700; background: #a31212; color: #fff; border-radius: 9px; padding: 1px 7px; }
+  .defects-legend { font-size: 11px; color: var(--muted); }
+  .defects-legend .sw { display: inline-block; width: 20px; height: 9px; vertical-align: middle; border-radius: 2px; }
+  .defects-legend .sw.red { border: 2px solid #d21414; background: #ffeaea; }
+  .defects-legend .sw.orange { border: 2px solid #e68200; }
+
+  /* Each category keeps ONE colour everywhere - panel edge, chip, nav tag - so
+     "the green one is the table issue" holds from section to section. */
+  .dgroup { border-left: 4px solid var(--dg); background: var(--dg-bg); border: 1px solid var(--dg-line);
+            border-left-width: 4px; border-radius: 6px; padding: 8px 10px; margin-bottom: 8px; }
+  .dg-content { --dg: #9a5b06; --dg-bg: #fffaf0; --dg-line: #f0e0c4; }
+  .dg-table   { --dg: #14875f; --dg-bg: #f0f8f4; --dg-line: #cfe7db; }
+  .dg-image   { --dg: #7c4dcc; --dg-bg: #f8f5fe; --dg-line: #e0d6f6; }
+  .dg-numbering { --dg: #a31212; --dg-bg: #fdeeee; --dg-line: #eab6b6; }
+  .dg-formatting { --dg: #c9781f; --dg-bg: #fff6ec; --dg-line: #f0dcc4; }
+  .dgroup-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .dchip { font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .05em;
+           border-radius: 3px; padding: 2px 6px; color: #fff; background: var(--dg); white-space: nowrap; }
+  .dgroup-count { font-size: 11px; font-weight: 700; color: var(--dg); }
+  .dgroup-blurb { font-size: 11px; color: var(--muted); flex: 1 1 260px; }
+  .dnote { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--dg-line); }
+  .dgroup .dnote:first-of-type { border-top: 0; }
+  .dnote-title { font-size: 12px; font-weight: 600; color: #1f2430; }
+  .dnote-times { font-size: 10px; font-weight: 700; background: var(--dg); color: #fff; border-radius: 8px; padding: 0 5px; }
+  .dnote-where { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .dnote-markers { font-size: 11px; color: #7a1414; margin-top: 3px; font-weight: 600; }
+  .dnote-detail, .dnote-fix { font-size: 11px; color: #3a4757; margin-top: 4px; line-height: 1.5; }
+  .dnote-detail b, .dnote-fix b { color: #1f2430; }
+  .shot-why { font-weight: 400; text-transform: none; letter-spacing: 0; color: var(--muted); }
+  .shot-absent { font-size: 11px; color: #8a94a3; font-style: italic; border: 1px dashed var(--line);
+                 border-radius: 5px; padding: 10px; background: #fafbfc; }
   .index-note { margin: 8px 14px 4px; padding: 6px 10px; background: #f4f5f7; border-radius: 5px; font-size: 11px; color: var(--muted); }
   .image-notes { margin: 8px 14px 4px; }
-  .image-note { padding: 8px 10px; margin-bottom: 6px; background: #fdf4f4; border: 1px solid #f3d9d9; border-radius: 5px; }
-  .image-note-text { font-size: 12px; color: #7a1414; }
-  .table-notes { margin: 8px 14px 4px; }
-  .table-note { padding: 8px 10px; margin-bottom: 6px; background: #f0f8f4; border: 1px solid #cfe7db; border-radius: 5px; }
-  .table-note.likely { background: #f5f7f6; border-color: #e0e4e2; }
-  .table-note-text { font-size: 12px; color: #12664a; }
-  .table-note.likely .table-note-text { color: #55655e; }
-  .table-note-text .lk-tag { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; background: #e6e9e8; color: #55655e; border-radius: 3px; padding: 1px 4px; margin-left: 6px; }
+  .lk-tag { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em;
+            background: #e6e9e8; color: #55655e; border-radius: 3px; padding: 1px 4px; margin-left: 6px; }
   .image-note-shots { display: flex; gap: 10px; margin-top: 6px; flex-wrap: wrap; }
   .image-note-shots figure { margin: 0; flex: 1; min-width: 180px; }
   .image-note-shots figcaption { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin-bottom: 3px; }
@@ -198,7 +264,7 @@
     <div id="toclist">
     {% if not sections %}<div class="only-side" style="margin:10px 14px">Nothing to navigate.</div>{% endif %}
     {% for s in sections %}
-      <a href="#{{ s.id }}" data-id="{{ s.id }}" class="lvl-{{ s.level }} {{ s.status }}{{ ' hasdiff' if s.counts.diff else '' }}{{ ' hasimg' if s.image_notes else '' }}{{ ' hastbl' if s.table_notes else '' }}{{ ' hasfmt' if s.format_notes else '' }}{{ ' hasnum' if s.list_notes else '' }}">
+      <a href="#{{ s.id }}" data-id="{{ s.id }}" class="lvl-{{ s.level }} {{ s.status }}{{ ' hasdiff' if s.counts.real_diff else '' }}{{ ' hasimg' if s.image_notes else '' }}{{ ' hastbl' if s.table_notes else '' }}{{ ' hasfmt' if s.format_notes else '' }}{{ ' hasnum' if s.list_notes else '' }}">
         <span class="t">{{ s.heading }}</span>
         {% if s.list_notes %}<span class="tag num" title="{{ s.list_notes|length }} list(s) renumbered between Production and Staging">1→a {{ s.list_notes|length }}</span>{% endif %}
         {% if s.table_notes %}<span class="tag tbl" title="{{ s.table_notes|length }} table issue(s) in this section">▦ {{ s.table_notes|length }}</span>{% endif %}
@@ -206,8 +272,8 @@
         {% if s.image_notes %}<span class="tag img" title="{{ s.image_notes|length }} image issue(s) in this section">🖼 {{ s.image_notes|length }}</span>{% endif %}
         {% if s.toc_listing %}<span class="tag toc" title="Printed table-of-contents / index page — compared in the TOC Comparison report, not here">{% if s.status == 'missing' %}TOC · missing{% elif s.status == 'extra' %}TOC · extra{% else %}TOC{% endif %}</span>
         {% elif s.status == 'missing' %}<span class="tag missing">prod only</span>
-        {% elif s.status == 'extra' %}{% if s.counts.diff %}<span class="tag diff">{{ s.counts.diff }}</span>{% endif %}
-        {% elif s.counts.diff %}<span class="tag diff">{{ s.counts.diff }}</span>
+        {% elif s.status == 'extra' %}{% if s.counts.real_diff %}<span class="tag diff">{{ s.counts.real_diff }}</span>{% endif %}
+        {% elif s.counts.real_diff %}<span class="tag diff">{{ s.counts.real_diff }}</span>
         {% else %}<span class="tag ok">✓</span>{% endif %}
       </a>
     {% endfor %}
@@ -229,6 +295,14 @@
       <a href="report.html" style="margin-left:12px;font-size:12px;">← Validation report</a>
       <a href="toc.html" style="margin-left:10px;font-size:12px;">▤ TOC comparison</a>
     </div>
+    <div class="kindbar">
+      <span class="lbl">Show:</span>
+      {% for k, label in kind_labels %}
+      <button id="kb-{{ k }}" class="{{ '' if k == 'chrome' else 'on' }}" onclick="toggleKind('{{ k }}')"
+              title="{{ kind_help[k] }}">{{ label }}</button>
+      {% endfor %}
+      <span class="lbl" style="margin-left:6px">Every line the extractor found is here — switching a kind off hides its rows, never its count.</span>
+    </div>
 
     {% if not sections %}
     <div class="only-side">
@@ -238,7 +312,7 @@
     </div>
     {% endif %}
     {% for s in sections %}
-    <section class="sec status-{{ s.status }} {{ 'no-diff' if not s.counts.diff and not s.table_notes and not s.image_notes and not s.format_notes and not s.list_notes and s.status == 'matched' else '' }}" id="{{ s.id }}">
+    <section class="sec status-{{ s.status }} {{ 'no-diff' if not s.issue_groups and s.status == 'matched' else '' }}" id="{{ s.id }}">
       <h3>
         <span>{{ s.heading }}</span>
         <span class="pages">
@@ -250,6 +324,23 @@
         <button class="match-content-btn" onclick="matchSectionContent('{{ s.id }}', this)" title="These rows' content was also found elsewhere in the other document — click to mark them matched">⇄ Match content ({{ s.content_match_count }})</button>
         {% endif %}
       </h3>
+      {% if s.kind_counts %}
+      <div class="coverage">
+        {% for kc in s.kind_counts %}
+        <span class="cov" data-kind="{{ kc.kind }}" onclick="toggleKind('{{ kc.kind }}')"
+              title="{{ kind_help[kc.kind] }}">
+          <b>{{ kc.label }}</b>
+          <span class="n">{{ kc.total }}</span>
+          {%- if kc.diff and kc.kind == 'chrome' %} <span class="n">{{ kc.diff }} differ</span>
+          {%- elif kc.diff %} <span class="d">{{ kc.diff }} differ</span>
+          {%- else %} <span class="ok">✓</span>{% endif -%}
+        </span>
+        {% endfor %}
+        <span class="cov-total" title="Every text unit the extractor found under this heading is listed here by kind and compared — none is filtered out of the browser. A list marker (1., a., •) and a NOTE/TIP/WARNING label are carried as row chips rather than as body text, and are compared as numbering and callout findings.">
+          <b>{{ s.counts.shown }}</b> lines — every kind on the page
+        </span>
+      </div>
+      {% endif %}
       {% if s.counterpart_note %}
         <div class="only-side">{{ s.counterpart_note }}</div>
       {% elif s.status == 'missing' %}
@@ -265,12 +356,14 @@
         {% for r in s.rows %}
           {% set co = r.callout %}
           {% set lk = r.link %}
-          <tr class="op-{{ r.op }}{{ ' has-callout' if co }}"{% if r.content_match_text %} data-content-match="1" data-text="{{ r.content_match_text }}"{% endif %}>
+          <tr class="op-{{ r.op }}{{ ' has-callout' if co }}" data-kind="{{ r.kind or 'prose' }}"{% if r.content_match_text %} data-content-match="1" data-text="{{ r.content_match_text }}"{% endif %}>
             <td class="mark">
               {%- if r.op == 'prod' %}<span class="issue prod" title="This text is in Production and not in Staging">Missing</span>
               {%- elif r.op == 'stage' %}<span class="issue stage" title="This text is in Staging and not in Production">Added</span>
               {%- elif r.op == 'change' %}<span class="issue change" title="Both documents have this sentence, worded differently">Changed</span>
               {%- else %}<span class="same" title="Identical in both documents">match</span>{% endif -%}
+              {%- set rk = r.kind or 'prose' -%}
+              {%- if rk != 'prose' %}<span class="kind k-{{ rk }}" title="{{ kind_help[rk] }}">{{ kind_short[rk] }}</span>{% endif -%}
             </td>
             {% if r.op == 'change' %}
               {#- Split view: each column shows that side's OWN complete
@@ -313,11 +406,11 @@
         {% endfor %}
         </tbody>
       </table>
-      {% if s.status == 'matched' and not s.counts.diff and not s.table_notes and not s.format_notes and not s.list_notes %}
+      {% if s.status == 'matched' and not s.issue_groups %}
       <div class="nodiff">✓ No differences — Production and Staging match for this section.</div>
-      {% elif s.status == 'matched' and not s.counts.diff and (s.table_notes or s.format_notes or s.list_notes) %}
-      <div class="nodiff">✓ Text matches — but see the numbering / formatting / table difference(s) flagged below.</div>
-      {% elif s.status in ('missing', 'extra') and not s.counts.diff %}
+      {% elif s.status == 'matched' and not s.counts.real_diff %}
+      <div class="nodiff">✓ Text matches — every difference in this section is in how it is presented, listed below.</div>
+      {% elif s.status in ('missing', 'extra') and not s.counts.real_diff %}
       <div class="nodiff">✓ No unique content — the "stage only"/"prod only" tag means this exact heading isn't bookmarked on the other side; every sentence below already matches its counterpart (shown here, or under the parent section above).</div>
       {% endif %}
       {% if s.index_note %}<div class="index-note">▤ {{ s.index_note }}</div>{% endif %}
@@ -331,65 +424,50 @@
       {% else %}
       <div class="only-side">No text content extracted for this section.</div>
       {% endif %}
-      {% if s.list_notes %}
-      <div class="list-notes">
-        {% for ln in s.list_notes %}
-        <div class="list-note">
-          <div class="list-note-text"><span class="list-label">Numbering</span> {{ ln.text }}{% if ln.count > 1 %}  (×{{ ln.count }}){% endif %}</div>
-          {% if ln.prod_markers or ln.stage_markers %}
-          <div class="list-note-markers">Production: <b>{{ ln.prod_markers }}</b> &nbsp;·&nbsp; Staging: <b>{{ ln.stage_markers }}</b></div>
-          {% endif %}
-          {% if ln.prod_screenshot or ln.stage_screenshot %}
-          <div class="image-note-shots">
-            {% if ln.prod_screenshot %}<figure><figcaption>Production</figcaption><img loading="lazy" src="{{ ln.prod_screenshot }}" alt="Production list"></figure>{% endif %}
-            {% if ln.stage_screenshot %}<figure><figcaption>Staging</figcaption><img loading="lazy" src="{{ ln.stage_screenshot }}" alt="Staging list"></figure>{% endif %}
-          </div>
-          {% endif %}
+      {% if s.issue_groups %}
+      <div class="defects">
+        <div class="defects-head">
+          <span class="defects-title">Differences found in this section</span>
+          <span class="defects-total">{{ s.issue_total }}</span>
+          <span class="defects-legend">
+            <span class="sw red"></span> the difference itself &nbsp;·&nbsp;
+            <span class="sw orange"></span> the same place in the other document, for comparison
+          </span>
         </div>
-        {% endfor %}
-      </div>
-      {% endif %}
-      {% if s.table_notes %}
-      <div class="table-notes">
-        {% for tn in s.table_notes %}
-        <div class="table-note{{ ' likely' if tn.review }}">
-          <div class="table-note-text">{{ tn.text }} {% if tn.review %}<span class="lk-tag">likely</span>{% endif %}</div>
-          {% if tn.prod_screenshot or tn.stage_screenshot %}
-          <div class="image-note-shots">
-            {% if tn.prod_screenshot %}<figure><figcaption>Production</figcaption><img loading="lazy" src="{{ tn.prod_screenshot }}" alt="Production table"></figure>{% endif %}
-            {% if tn.stage_screenshot %}<figure><figcaption>Staging</figcaption><img loading="lazy" src="{{ tn.stage_screenshot }}" alt="Staging table"></figure>{% endif %}
+        {% for g in s.issue_groups %}
+        <div class="dgroup dg-{{ g.key }}">
+          <div class="dgroup-head">
+            <span class="dchip dc-{{ g.key }}">{{ g.icon }} {{ g.label }}</span>
+            <span class="dgroup-count">{{ g.count }} {{ 'issue' if g.count == 1 else 'issues' }}</span>
+            <span class="dgroup-blurb">{{ g.blurb }}</span>
           </div>
-          {% endif %}
-        </div>
-        {% endfor %}
-      </div>
-      {% endif %}
-      {% if s.format_notes %}
-      <div class="table-notes">
-        {% for fn in s.format_notes %}
-        <div class="fmt-note-box {{ 'encoding' if fn.kind == 'encoded' else fn.kind }}">
-          <div class="fmt-note-box-text"><span class="fmt-label fmt-{{ fn.kind }}">{{ fn.label }}</span> {{ fn.text }}</div>
-          {% if fn.prod_screenshot or fn.stage_screenshot %}
-          <div class="image-note-shots">
-            {% if fn.prod_screenshot %}<figure><figcaption>Production</figcaption><img loading="lazy" src="{{ fn.prod_screenshot }}" alt="Production text"></figure>{% endif %}
-            {% if fn.stage_screenshot %}<figure><figcaption>Staging</figcaption><img loading="lazy" src="{{ fn.stage_screenshot }}" alt="Staging text"></figure>{% endif %}
+          {% for n in g.notes %}
+          <div class="dnote">
+            <div class="dnote-title">
+              {{ n.title }}
+              {%- if n.count > 1 %} <span class="dnote-times">×{{ n.count }}</span>{% endif -%}
+              {%- if n.review %} <span class="lk-tag">likely</span>{% endif -%}
+            </div>
+            {% if n.where %}<div class="dnote-where">{{ n.where }}</div>{% endif %}
+            {% if n.markers %}<div class="dnote-markers">{{ n.markers }}</div>{% endif %}
+            {% if n.detail %}<div class="dnote-detail"><b>What this means:</b> {{ n.detail }}</div>{% endif %}
+            {% if n.fix %}<div class="dnote-fix"><b>What to do:</b> {{ n.fix }}</div>{% endif %}
+            {% if n.prod_screenshot or n.stage_screenshot or n.prod_note or n.stage_note %}
+            <div class="image-note-shots">
+              <figure>
+                <figcaption>Production{% if n.prod_caption %} <span class="shot-why">— {{ n.prod_caption }}</span>{% endif %}</figcaption>
+                {% if n.prod_screenshot %}<img loading="lazy" src="{{ n.prod_screenshot }}" alt="Production — {{ n.title }}">
+                {% else %}<div class="shot-absent">{{ n.prod_note or 'Nothing to show on this side.' }}</div>{% endif %}
+              </figure>
+              <figure>
+                <figcaption>Staging{% if n.stage_caption %} <span class="shot-why">— {{ n.stage_caption }}</span>{% endif %}</figcaption>
+                {% if n.stage_screenshot %}<img loading="lazy" src="{{ n.stage_screenshot }}" alt="Staging — {{ n.title }}">
+                {% else %}<div class="shot-absent">{{ n.stage_note or 'Nothing to show on this side.' }}</div>{% endif %}
+              </figure>
+            </div>
+            {% endif %}
           </div>
-          {% endif %}
-        </div>
-        {% endfor %}
-      </div>
-      {% endif %}
-      {% if s.image_notes %}
-      <div class="image-notes">
-        {% for im in s.image_notes %}
-        <div class="image-note">
-          <div class="image-note-text">{{ im.text }}</div>
-          {% if im.prod_screenshot or im.stage_screenshot %}
-          <div class="image-note-shots">
-            {% if im.prod_screenshot %}<figure><figcaption>Production</figcaption><img loading="lazy" src="{{ im.prod_screenshot }}" alt="Production figure"></figure>{% endif %}
-            {% if im.stage_screenshot %}<figure><figcaption>Staging</figcaption><img loading="lazy" src="{{ im.stage_screenshot }}" alt="Staging figure"></figure>{% endif %}
-          </div>
-          {% endif %}
+          {% endfor %}
         </div>
         {% endfor %}
       </div>
@@ -397,7 +475,7 @@
       {% if s.exp_shots or s.act_shots %}
       <details class="rawhtml"{{ ' open' if snapshots_open }}>
         <summary>Exact page snapshot from the PDF — layout, fonts &amp; images as printed</summary>
-        {% if s.counts.diff %}<div class="snap-legend"><span class="sw red"></span> a sentence that differs or was dropped &nbsp;·&nbsp; <span class="sw orange"></span> where that content belongs in the other document &nbsp;·&nbsp; <b class="snap-pair">same number = same difference</b> — box <span class="num">3</span> on the left is box <span class="num">3</span> on the right</div>{% endif %}
+        {% if s.counts.real_diff %}<div class="snap-legend"><span class="sw red"></span> a sentence that differs or was dropped &nbsp;·&nbsp; <span class="sw orange"></span> where that content belongs in the other document &nbsp;·&nbsp; <b class="snap-pair">same number = same difference</b> — box <span class="num">3</span> on the left is box <span class="num">3</span> on the right</div>{% endif %}
         <div class="rawhtml-pair">
           <div>
             <div class="col-label">Production{% if s.exp_shots and s.exp_shots_note %} <span class="snap-note">— {{ s.exp_shots_note }}</span>{% endif %}</div>
@@ -429,6 +507,15 @@
     document.getElementById('btn-all').classList.toggle('on', m === 'all');
     document.getElementById('btn-diff').classList.toggle('on', m === 'diffs');
   }
+  // Hiding a kind only hides its ROWS - the per-section coverage strip keeps
+  // reporting it, so the reader is never left guessing what is off screen.
+  function toggleKind(kind) {
+    const on = document.body.classList.toggle('hide-' + kind);
+    const btn = document.getElementById('kb-' + kind);
+    if (btn) btn.classList.toggle('on', !on);
+    document.querySelectorAll('.cov[data-kind="' + kind + '"]').forEach(c => c.classList.toggle('off', on));
+  }
+
   function toggleSnaps() {
     const btn = document.getElementById('btn-snaps');
     const on = !btn.classList.contains('on');
@@ -491,6 +578,12 @@
       btn.disabled = true;
     }
   }
+  // Page furniture is off to begin with: a page number cannot help but differ
+  // once the two documents paginate differently, so leaving it on would bury
+  // every real finding. Its count is still on every coverage strip.
+  document.body.classList.add('hide-chrome');
+  document.querySelectorAll('.cov[data-kind="chrome"]').forEach(c => c.classList.add('off'));
+
   function filterToc(q) {
     q = q.trim().toLowerCase();
     document.querySelectorAll('#toclist a').forEach(a => {

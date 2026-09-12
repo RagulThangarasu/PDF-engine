@@ -17,6 +17,7 @@ import fitz
 
 from pdfval.validators import content as _content
 from pdfval import ocr as _ocr
+from pdfval.report import explanations as _explain
 from pdfval.report import screenshots as _shots
 from pdfval.validators.headings import resolve_entries
 from pdfval.validators.toc import (
@@ -70,13 +71,21 @@ def _heading_band(
     return out
 
 
-def _capped_span(blocks: list[dict] | None, max_pages: int = _FALLBACK_MAX_PAGES) -> list[dict]:
+def _body_blocks(blocks: list[dict]) -> list[dict]:
+    """The section's own content, without the page furniture now carried
+    alongside it. A snapshot clipped to include a footer stretches to the page
+    edge, and a footer's words in a section's blob would let the presence
+    checks reconcile against chrome."""
+    return [b for b in blocks if b.get("kind") != KIND_CHROME]
+
+
+def _capped_span(blocks: list[dict] | None, max_pages: int = _FALLBACK_MAX_PAGES) -> list[dict]:  # noqa: D401
     """The first `max_pages` pages of a stand-in span - a fallback is there to
     show the reader WHERE in the other document to look, not to re-render a
     whole chapter beside a two-line section."""
     pages: list[int] = []
     out: list[dict] = []
-    for b in blocks or []:
+    for b in _body_blocks(blocks or []):
         p = b.get("page")
         if not isinstance(p, int):
             continue
@@ -139,32 +148,141 @@ def _is_heading_line(text: str, heading_titles: set[str]) -> bool:
     return _is_heading_title_run(nt, heading_titles)
 
 
-def _section_records(section_blocks: list[dict], heading_titles: set[str]) -> list[dict]:
-    for b in section_blocks:
+# What a line of a PDF page can BE. Every text unit the extractor finds is put
+# in exactly one of these and shown - none is discarded.
+#
+# This browser used to show flowing prose and nothing else: a table's cells, a
+# label on a diagram, a spec-sheet value, a sub-heading's own title line and
+# every running header were each dropped somewhere in the pipeline on the
+# grounds that another check owns them. Measured on a 61-page manual that hid
+# 20% of Production's text and 39% of Staging's - and, far worse, hid DIFFERENT
+# text on each side, because whether a box is ruled tightly enough for
+# pdfplumber to call it a table is a property of the producer, not of the
+# content. A reader looking at a section could not tell "these documents agree"
+# from "the part that disagrees was filtered out before you got here".
+#
+# So: classify, never discard. Each kind is aligned against its own kind (a
+# table's cells scatter differently from the prose around them, and mixing the
+# two into one sequence is what produced garbled pseudo-sentences), and the UI
+# can filter by kind - but the section always accounts for every unit it found.
+KIND_PROSE = "prose"        # flowing body text
+KIND_HEADING = "heading"    # a heading's own title line, printed in the body
+KIND_TABLE = "table"        # inside a region detected as a table
+KIND_FIGURE = "figure"      # a label sitting on or beside artwork
+KIND_VALUE = "value"        # spec values, diagram legends, menu paths - not sentences
+KIND_CHROME = "chrome"      # running header/footer, page number, contents listing
+# Reading order for the browser, and the order the panels appear in.
+KINDS = (KIND_PROSE, KIND_HEADING, KIND_TABLE, KIND_FIGURE, KIND_VALUE, KIND_CHROME)
+# Prose and headings are the document's actual words - a difference there is a
+# content difference, full stop. The rest are real content too and are shown and
+# compared, but they are each another check's specialty (Table Validation,
+# Image Validation) and they are the kinds whose extraction is least stable
+# between two producers, so they do not on their own turn a section red.
+PRIMARY_KINDS = (KIND_PROSE, KIND_HEADING)
+
+
+def _is_value_run(text: str) -> bool:
+    """A run of spec values, a numbered-diagram legend, a menu path - printed
+    content, but not a sentence. `_to_sentence_records` refuses these outright,
+    so they have to be recognized here to be kept at all."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    return bool(
+        _content._looks_like_bare_number_list(t)
+        or _content._looks_like_bare_part_labels(t)
+        or _content._looks_like_non_prose(t)
+    )
+
+
+def _classify_blocks(
+    blocks: list[dict], tables: "_content._TableBBoxCache", images: "_content._ImageBBoxCache"
+) -> list[dict]:
+    """Tag every block with its `kind`. Nothing is removed."""
+    chrome = [b for b in blocks if b.get("kind") == KIND_CHROME]
+    body = [b for b in blocks if b.get("kind") != KIND_CHROME]
+    body = _content._exclude_table_blocks(body, tables)
+    loose = [b for b in body if not b.get("in_table")]
+    # `_exclude_image_label_blocks` hands back what SURVIVES; the difference is
+    # the set it judged to be artwork labels.
+    survived = {id(b) for b in _content._exclude_image_label_blocks(list(loose), images)}
+    for b in body:
+        if b.get("in_table"):
+            b["kind"] = KIND_TABLE
+        elif id(b) not in survived:
+            b["kind"] = KIND_FIGURE
+        else:
+            b["kind"] = KIND_PROSE
         b["text"] = normalize_block_text(b.get("text", ""))
-    out = []
-    for r in _content._to_sentence_records(section_blocks):
-        if _is_heading_line(r["text"], heading_titles):
-            continue
-        out.append(r)
+    return body + chrome
+
+
+def _section_records(
+    section_blocks: list[dict], heading_titles: set[str],
+    tables: "_content._TableBBoxCache | None" = None,
+    images: "_content._ImageBBoxCache | None" = None,
+) -> list[dict]:
+    """Every text unit in the section, each carrying its `kind`.
+
+    Sentence-split per contiguous run of one kind, so the splitter still sees a
+    block's neighbours (it merges a punctuation-only fragment back onto the
+    sentence before it) without a table cell ever being joined to the paragraph
+    printed above it.
+    """
+    if tables is not None:
+        section_blocks = _classify_blocks(section_blocks, tables, images)
+    else:
+        for b in section_blocks:
+            b.setdefault("kind", KIND_PROSE)
+            b["text"] = normalize_block_text(b.get("text", ""))
+
+    out: list[dict] = []
+
+    def flush(run: list[dict], kind: str) -> None:
+        sentences: list[dict] = []
+        for b in run:
+            # A value run is not a sentence and `_to_sentence_records` refuses
+            # it outright - keep the block whole rather than lose it. Inside a
+            # table region it is a cell, which is the more useful thing to call
+            # it: it then lines up against the other document's cells.
+            if _is_value_run(b.get("text", "")):
+                out.append({
+                    "text": b["text"], "page": b.get("page"), "bbox": b.get("bbox"),
+                    # Page furniture stays page furniture: a print-shop slug
+                    # ("ST04_UM_V2_EN.indb 5 ... 2026/3/2 12:34") reads as a
+                    # value run, and letting that win filed 56 footers as
+                    # content the other document was missing.
+                    "kind": kind if kind == KIND_CHROME
+                            else (KIND_TABLE if b.get("in_table") else KIND_VALUE),
+                    "in_table": b.get("in_table", False),
+                })
+            else:
+                sentences.append(dict(b))
+        for r in _content._to_sentence_records(sentences):
+            r["kind"] = (
+                KIND_HEADING
+                if kind != KIND_CHROME and _is_heading_line(r["text"], heading_titles)
+                else kind
+            )
+            out.append(r)
+
+    run: list[dict] = []
+    run_kind: str | None = None
+    for b in section_blocks:
+        if b.get("kind") != run_kind:
+            flush(run, run_kind or KIND_PROSE)
+            run, run_kind = [], b.get("kind")
+        run.append(b)
+    flush(run, run_kind or KIND_PROSE)
+    out.sort(key=lambda r: (KINDS.index(r["kind"]), _pos(r)))
     return out
 
 
-def _prose_only(
-    blocks: list[dict], tables: "_content._TableBBoxCache", images: "_content._ImageBBoxCache"
-) -> list[dict]:
-    """Same exclusions Content Validation applies before diffing: a diagram
-    callout label ("Release button", "USB peripherals" pointing at a port
-    photo) is navigation for a figure, not a sentence, and a table's own
-    cells are Table Validation's job - left unfiltered, both show up here as
-    broken/duplicated fake "sentences" (a label split across lines reads as
-    a sentence fragment, and the same label repeated at each callout arrow
-    reads as a duplicate one) that have nothing to do with a genuine content
-    difference between the two documents.
-    """
-    blocks = _content._exclude_table_blocks(blocks, tables)
-    blocks = _content._exclude_image_label_blocks(blocks, images)
-    return [b for b in blocks if not b.get("in_table")]
+def _pos(rec: dict) -> tuple:
+    """A record's place in the document, for ordering."""
+    bbox = rec.get("bbox") or (0, 0, 0, 0)
+    page = rec.get("page")
+    return (page if isinstance(page, int) else 10**9, round(bbox[1], 1), round(bbox[0], 1))
 
 
 def _key(text: str) -> str:
@@ -225,6 +343,42 @@ def _align(exp: list[str], act: list[str]) -> list[dict]:
     return rows
 
 
+def _align_kinds(exp_recs: list[dict], act_recs: list[dict]) -> list[dict]:
+    """Align each kind against its own kind, then put the rows back in reading
+    order.
+
+    Aligning everything as one sequence is what the old prose-only browser was
+    avoiding: a table's cells come out of the two producers in different orders
+    and different groupings, so `difflib` pairs a Production cell against an
+    unrelated Staging paragraph and reports both as changed. Per kind, each
+    stream stays coherent - and a cell can still only ever be compared with a
+    cell.
+    """
+    rows: list[dict] = []
+    for kind in KINDS:
+        exp = [r for r in exp_recs if r["kind"] == kind]
+        act = [r for r in act_recs if r["kind"] == kind]
+        if not exp and not act:
+            continue
+        exp_at = {_key(r["text"]): _pos(r) for r in exp}
+        act_at = {_key(r["text"]): _pos(r) for r in act}
+        last = (0, 0.0, 0.0)
+        for row in _align([r["text"] for r in exp], [r["text"] for r in act]):
+            row["kind"] = kind
+            # Sort on Production's position where there is one - it is the
+            # reference document - and otherwise just after whatever came
+            # before, so a Staging-only row lands where the reader expects it
+            # rather than at the end.
+            at = exp_at.get(_key(row.get("prod") or "")) or act_at.get(_key(row.get("stage") or ""))
+            last = at or last
+            row["_at"] = last
+            rows.append(row)
+    rows.sort(key=lambda r: (KINDS.index(r["kind"]), r["_at"]))
+    for r in rows:
+        r.pop("_at", None)
+    return rows
+
+
 _CJK_CHAR_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿豈-﫿가-힯]")
 
 
@@ -275,7 +429,7 @@ def _blob_len(text: str) -> int:
 
 
 def _blocks_blob(blocks: list[dict]) -> str:
-    return _alnum_blob(" ".join(normalize_block_text(b.get("text", "")) for b in blocks))
+    return _alnum_blob(" ".join(normalize_block_text(b.get("text", "")) for b in _body_blocks(blocks)))
 
 
 _RECONCILE_STOPWORDS = {
@@ -457,6 +611,11 @@ def _fill_relocated_counterparts(
         sec["counts"] = _counts(sec["rows"])
 
 
+# Kinds whose text can plausibly be baked into a picture instead of the text
+# layer, and so are worth paying Tesseract to look for.
+_OCR_KINDS = (KIND_PROSE, KIND_HEADING, KIND_FIGURE)
+
+
 def _reconcile_ocr_present(
     rows: list[dict],
     exp_words: "_ocr.PageWords", exp_pages: list[int],
@@ -470,9 +629,18 @@ def _reconcile_ocr_present(
     Tesseract finds on the rendered page that the text layer doesn't already
     explain - if this row's own significant words are all found there, the
     content isn't actually missing, just not machine-readable on that side.
-    Only runs OCR (expensive) when there's at least one row left to check.
+    Only runs OCR (expensive) when there's at least one row it could answer
+    for. That means the document's words and the labels on its artwork - the
+    things that get baked into a picture. A page number, a running footer, a
+    table cell or a spec value is not one of them: page furniture is one-sided
+    in nearly every section by construction (the two documents paginate
+    differently), and letting those ask the question dragged Tesseract across
+    99 pages of a 61-page manual for answers nobody wanted.
     """
-    if not any(row["op"] in ("prod", "stage") for row in rows):
+    if not any(
+        row["op"] in ("prod", "stage") and row.get("kind", KIND_PROSE) in _OCR_KINDS
+        for row in rows
+    ):
         return
 
     def sig(text: str) -> set[str]:
@@ -515,6 +683,8 @@ def _reconcile_ocr_present(
     exp_artwork = artwork_words(exp_words, exp_words._doc, exp_pages) if exp_pages else set()
 
     for row in rows:
+        if row.get("kind", KIND_PROSE) not in _OCR_KINDS:
+            continue
         if row["op"] == "prod" and row.get("prod") and present(row["prod"], act_artwork):
             row["op"] = "equal"
             row["stage"] = row["prod"]
@@ -885,7 +1055,14 @@ def _strip_index_runs(rows: list[dict]) -> tuple[list[dict], int]:
             if len(run) >= 4:
                 idx_like = sum(1 for x in run if _INDEX_ENTRY_RE.search(x.get(r["op"]) or ""))
                 if idx_like / len(run) >= 0.6:
+                    # A run of contents/FAQ-index entries, each linking to a
+                    # page. Navigation, not content, and the TOC Comparison
+                    # report diffs it properly - but it IS printed here, so it
+                    # is filed as page furniture rather than deleted.
+                    for x in run:
+                        x["kind"] = KIND_CHROME
                     dropped += len(run)
+                    keep.extend(run)
                     i = j
                     continue
         keep.append(r)
@@ -904,17 +1081,16 @@ def _is_bare_callout_label(text: str) -> bool:
     return bool(core) and len(core) <= 12 and _content._match_callout_label(core + ":") is not None
 
 
-def _drop_bare_callout_label_rows(rows: list[dict]) -> list[dict]:
-    return [
-        r for r in rows
-        if not (
-            r["op"] in ("prod", "stage")
-            and _is_bare_callout_label(r.get("prod") or r.get("stage") or "")
-        )
-    ]
+def _mark_bare_callout_label_rows(rows: list[dict]) -> list[dict]:
+    """A bare NOTE/TIP/WARNING label is formatting, not content - but it is
+    printed, so it is refiled as a figure/callout label rather than deleted."""
+    for r in rows:
+        if r["op"] in ("prod", "stage") and _is_bare_callout_label(r.get("prod") or r.get("stage") or ""):
+            r["kind"] = KIND_FIGURE
+    return rows
 
 
-def _one_sided_rows(own: list[str], parent_other: list[str], own_side: str) -> list[dict]:
+def _one_sided_rows(own: list[dict], parent_other: list[dict], own_side: str) -> list[dict]:
     """Rows for a section bookmarked in only one document. Every sentence that
     is genuinely under this heading is shown; each is marked "=" when the same
     sentence also exists in the other document (under the parent heading) or
@@ -922,19 +1098,18 @@ def _one_sided_rows(own: list[str], parent_other: list[str], own_side: str) -> l
     pairs one of these sentences against an unrelated parent sentence - the
     parent body is only consulted as a presence check.
     """
-    other_keys = {_key(s) for s in parent_other}
-    other_by_key = {_key(s): s for s in parent_other}
+    other_by_key = {_key(r["text"]): r["text"] for r in parent_other}
     rows: list[dict] = []
-    for s in own:
-        k = _key(s)
-        if k in other_keys:
-            counterpart = other_by_key[k]
-            prod, stage = (s, counterpart) if own_side == "prod" else (counterpart, s)
-            rows.append({"op": "equal", "prod": prod, "stage": stage})
+    for rec in own:
+        text, kind = rec["text"], rec.get("kind", KIND_PROSE)
+        counterpart = other_by_key.get(_key(text))
+        if counterpart is not None:
+            prod, stage = (text, counterpart) if own_side == "prod" else (counterpart, text)
+            rows.append({"op": "equal", "prod": prod, "stage": stage, "kind": kind})
         elif own_side == "prod":
-            rows.append({"op": "prod", "prod": s, "stage": ""})
+            rows.append({"op": "prod", "prod": text, "stage": "", "kind": kind})
         else:
-            rows.append({"op": "stage", "prod": "", "stage": s})
+            rows.append({"op": "stage", "prod": "", "stage": text, "kind": kind})
     return rows
 
 
@@ -943,7 +1118,49 @@ def _counts(rows: list[dict]) -> dict:
     for r in rows:
         c[r["op"]] = c.get(r["op"], 0) + 1
     c["diff"] = c["change"] + c["prod"] + c["stage"]
+    # Only the document's actual words turn a section red. A table cell or a
+    # spec value the two producers merely group differently would otherwise
+    # light up half the report - those are still shown, still compared, and
+    # counted in `other_diff`, which the coverage strip reports in its own
+    # words. Page furniture is not counted as a difference at all: a page
+    # number is one-sided in nearly every section because the two documents
+    # paginate differently, which is not news.
+    def n(pred) -> int:
+        return sum(1 for r in rows if r["op"] != "equal" and pred(r.get("kind", KIND_PROSE)))
+
+    c["primary_diff"] = n(lambda k: k in PRIMARY_KINDS)
+    c["other_diff"] = n(lambda k: k not in PRIMARY_KINDS and k != KIND_CHROME)
+    c["chrome_diff"] = n(lambda k: k == KIND_CHROME)
+    # What the section is judged on - red badge, "differences only" filter.
+    c["real_diff"] = c["primary_diff"] + c["other_diff"]
+    c["shown"] = len(rows)
     return c
+
+
+def _counts_by_kind(rows: list[dict]) -> list[dict]:
+    """Per-kind tallies, for the section's coverage strip - the reader's proof
+    that nothing was quietly left out."""
+    out = []
+    for kind in KINDS:
+        sub = [r for r in rows if r.get("kind", KIND_PROSE) == kind]
+        if not sub:
+            continue
+        c = _counts(sub)
+        c["kind"] = kind
+        c["label"] = KIND_LABELS[kind]
+        c["total"] = len(sub)
+        out.append(c)
+    return out
+
+
+KIND_LABELS = {
+    KIND_PROSE: "Text",
+    KIND_HEADING: "Headings",
+    KIND_TABLE: "Table cells",
+    KIND_FIGURE: "Figure labels",
+    KIND_VALUE: "Values & legends",
+    KIND_CHROME: "Page furniture",
+}
 
 
 # A hard cap on how many pages' worth of HTML a single section embeds - a
@@ -1337,25 +1554,129 @@ def _section_snapshots(
     return shots
 
 
+# ---------------------------------------------------------------------------
+# The defects found in a section, split by what KIND of thing is wrong.
+#
+# A section's differences used to be four separate strips of coloured text
+# under the comparison table, each in its own wording, none of them saying what
+# the issue actually meant - a reader had to open report.html to find out what
+# "Image missing" was claiming. They are assembled here instead into one panel
+# per section, grouped by category (content, table, image, numbering,
+# formatting), each note carrying the SAME explanation report.html gives it
+# (`pdfval.report.explanations`), where in each document it is, and the two
+# page crops with a caption saying what each box frames.
+# ---------------------------------------------------------------------------
+
+# One short line per kind of image difference - the note's own headline. The
+# category chip carries the icon, so the line itself does not.
 _IMAGE_NOTE_TEMPLATES = {
-    "Image label missing": "🖼 Image label missing — Production labels a figure “{labels}”; that text is not on the matching Staging figure.",
-    "Diagram callouts stripped from figure": "🖼 Diagram callouts stripped — Production’s figure carries numbered callouts that Staging’s copy of it does not.",
-    "Diagram callout number missing": "🖼 Diagram callout number missing — a leader-line number on Production’s figure is absent from Staging’s.",
-    "Image missing": "🖼 Image missing — a figure in this Production section has no counterpart anywhere in the Staging section.",
-    "Image content differs": "🖼 Image content differs — the figure in this spot was replaced or its artwork changed in Staging.",
-    "Image alignment changed": "🖼 Image alignment changed — a figure sits left/centre/right differently in Staging.",
-    "Image size changed": "🖼 Image size changed — a figure is rendered at a materially different size in Staging.",
-    "Image width changed": "🖼 Image width changed — a figure is rendered materially wider/narrower in Staging.",
-    "Broken image": "🖼 Broken image — a figure in Staging failed to render.",
-    "Image highlight box missing": "🖼 Highlight box missing — a callout box drawn on Production’s figure is absent from Staging’s.",
+    "Image label missing": "Image label missing — Production labels a figure “{labels}”; that text is not on the matching Staging figure.",
+    "Diagram callouts stripped from figure": "Diagram callouts stripped — Production’s figure carries numbered callouts that Staging’s copy of it does not.",
+    "Diagram callout number missing": "Diagram callout number missing — a leader-line number on Production’s figure is absent from Staging’s.",
+    "Image missing": "Image missing — a figure in this Production section has no counterpart anywhere in the Staging section.",
+    "Image content differs": "Image content differs — the figure in this spot was replaced or its artwork changed in Staging.",
+    "Image alignment changed": "Image alignment changed — a figure sits left/centre/right differently in Staging.",
+    "Image size changed": "Image size changed — a figure is rendered at a materially different size in Staging.",
+    "Image width changed": "Image width changed — a figure is rendered materially wider/narrower in Staging.",
+    "Broken image": "Broken image — a figure in Staging failed to render.",
+    "Image highlight box missing": "Highlight box missing — a callout box drawn on Production’s figure is absent from Staging’s.",
 }
+_IMAGE_MESSAGE_ORDER = list(_IMAGE_NOTE_TEMPLATES)
+
+
+def _where(d: dict) -> str:
+    """Where the finding is, in both documents, the way the section header
+    writes it - so a note can be checked against the real pages."""
+    parts = []
+    if d.get("expected_page"):
+        parts.append(f"prod p.{d['expected_page']}")
+    if d.get("actual_page"):
+        parts.append(f"stage p.{d['actual_page']}")
+    return " · ".join(parts)
+
+
+_OWN_SHOT_CAPTION = "as printed; the red box is the difference"
+
+
+def _shot_why(caption: str) -> str:
+    """A crop's caption without the document name the figure caption already
+    carries, so the column header reads "Production — p.13, the same content"
+    rather than repeating "Production" twice."""
+    text = (caption or "").strip()
+    for prefix in ("Production ", "Staging "):
+        if text.startswith(prefix):
+            return text[len(prefix):]
+    return text
+
+
+def _shot_fields(d: dict) -> dict:
+    """The two crops and what each one is showing.
+
+    The caption matters as much as the crop: one side's box is the difference
+    itself (red), the other's is the same place in the other document (orange),
+    and without a caption a reader takes the orange box for a second defect -
+    "the image is flagged on the left but the TEXT is flagged on the right".
+    """
+    # A crop with no caption of its own is the finding's OWN evidence - the
+    # side the check actually looked at, boxed red. Only a crop filled in
+    # afterwards (`pdfval.report.counterparts`) carries a caption, and that one
+    # is the orange "same place over here" box.
+    prod, stage = d.get("prod_screenshot"), d.get("stage_screenshot")
+    return {
+        "prod_screenshot": prod,
+        "stage_screenshot": stage,
+        "prod_caption": _shot_why(d.get("prod_screenshot_caption")) or (_OWN_SHOT_CAPTION if prod else ""),
+        "stage_caption": _shot_why(d.get("stage_screenshot_caption")) or (_OWN_SHOT_CAPTION if stage else ""),
+        "prod_note": d.get("prod_screenshot_note") or "",
+        "stage_note": d.get("stage_screenshot_note") or "",
+    }
+
+
+def _note(message: str, title: str, d: dict, **extra) -> dict:
+    """One defect, as the section browser shows it: headline, where it is, the
+    full explanation report.html gives the same finding, and the crops."""
+    note = {
+        "message": message,
+        "title": title,
+        "count": 1,
+        "where": _where(d),
+        "detail": _explain.what(message),
+        "fix": _explain.fix(message),
+        "review": d.get("confidence") == "review",
+        **_shot_fields(d),
+    }
+    note.update(extra)
+    return note
+
+
+def _collapse(notes: list[dict]) -> list[dict]:
+    """Fold repeats of the same note under one heading into one line with a
+    count, keeping the first one's crops."""
+    out: list[dict] = []
+    seen: dict[str, dict] = {}
+    for note in notes:
+        key = note["title"]
+        first = seen.get(key)
+        if first is None:
+            seen[key] = note
+            out.append(note)
+            continue
+        first["count"] += 1
+        # A later copy may be the one that has crops (the first can be a
+        # finding the screenshot budget ran out on).
+        for field in ("prod_screenshot", "stage_screenshot"):
+            if not first.get(field) and note.get(field):
+                first[field] = note[field]
+                first[f"{field.split('_')[0]}_caption"] = note.get(
+                    f"{field.split('_')[0]}_caption", ""
+                )
+    return out
 
 
 def _image_notes_by_heading(findings: list[dict] | None) -> dict[str, list[dict]]:
-    """Group the report's confirmed image findings by section heading, as short
-    notes for the section browser (the browser compares prose; a figure-level
-    difference otherwise never surfaces there)."""
-    out: dict[str, list[dict]] = {}
+    """The confirmed image findings, per section heading (the browser compares
+    prose; a figure-level difference otherwise never surfaces there)."""
+    grouped: dict[str, list[dict]] = {}
     for f in findings or []:
         msg = f.get("message")
         d = f.get("details") or {}
@@ -1366,35 +1687,34 @@ def _image_notes_by_heading(findings: list[dict] | None) -> dict[str, list[dict]
         if not tmpl or not heading:
             continue
         labels = ", ".join(d.get("missing_labels") or []) or "…"
-        out.setdefault(heading, []).append({
-            "text": tmpl.format(labels=labels),
-            "prod_screenshot": d.get("prod_screenshot"),
-            "stage_screenshot": d.get("stage_screenshot"),
-        })
-    return out
+        grouped.setdefault(heading, []).append(
+            _note(msg, tmpl.format(labels=labels), d,
+                  _order=_IMAGE_MESSAGE_ORDER.index(msg))
+        )
+    return {h: _collapse(sorted(v, key=lambda n: n["_order"])) for h, v in grouped.items()}
 
 
 # One short line per kind of table difference, shown under the section in the
 # browser (which otherwise only diffs prose) and counted in the "▦" nav tag.
 _TABLE_NOTE_TEMPLATES = {
     "Table columns differ":
-        "▦ Column count differs — {expected_columns} columns in Production, {actual_columns} in Staging (a column was added, dropped, or split/merged).",
+        "Column count differs — {expected_columns} columns in Production, {actual_columns} in Staging (a column was added, dropped, or split/merged).",
     "Table column layout differs":
-        "▦ Column layout differs — a column was widened/narrowed in Staging (largest edge shift {largest_column_shift}), so the table reads differently.",
+        "Column layout differs — a column was widened/narrowed in Staging (largest edge shift {largest_column_shift}), so the table reads differently.",
     "Table cell layout differs":
-        "▦ Cells merged / split differently — {merge_detail}",
+        "Cells merged / split differently — {merge_detail}",
     "Table split across pages":
-        "▦ Table breaks across pages differently — {reason}.",
+        "Table breaks across pages differently — {reason}.",
     "Table header row not repeated on continuation page":
-        "▦ Header row not repeated where this table continues onto the next page in Staging.",
+        "Header row not repeated where this table continues onto the next page in Staging.",
     "Table row missing":
-        "▦ A row present in Production’s table is missing from Staging’s.",
+        "A row present in Production’s table is missing from Staging’s.",
     "Table heading missing":
-        "▦ A header cell present in Production is missing from Staging’s table.",
+        "A header cell present in Production is missing from Staging’s table.",
     "Table cell missing":
-        "▦ A cell’s content present in Production is missing from Staging’s table.",
+        "A cell’s content present in Production is missing from Staging’s table.",
     "Table breaking the margins":
-        "▦ Table runs outside the page text area in Staging.",
+        "Table runs outside the page text area in Staging.",
 }
 _TABLE_MESSAGE_ORDER = list(_TABLE_NOTE_TEMPLATES)
 
@@ -1420,12 +1740,11 @@ def _table_merge_detail(d: dict) -> str:
 
 
 def _table_notes_by_heading(findings: list[dict] | None) -> dict[str, list[dict]]:
-    """Group every table finding by section heading, one collapsed note per
-    distinct difference (repeats of the same kind under one heading carry a
-    ×N count). Unlike image notes, low-confidence ("review") findings are kept
-    - a column-layout / page-break difference is exactly what the user wants
-    surfaced here - but flagged so the UI can show them as "likely"."""
-    grouped: dict[str, dict[str, dict]] = {}
+    """Every table finding, per section heading. Unlike image notes,
+    low-confidence ("review") findings are kept - a column-layout / page-break
+    difference is exactly what the user wants surfaced here - but flagged so
+    the note can show them as "likely"."""
+    grouped: dict[str, list[dict]] = {}
     for f in findings or []:
         msg = f.get("message")
         d = f.get("details") or {}
@@ -1434,47 +1753,27 @@ def _table_notes_by_heading(findings: list[dict] | None) -> dict[str, list[dict]
         if not tmpl or not heading:
             continue
         try:
-            text = tmpl.format_map(_SafeFmt({**d, "merge_detail": _table_merge_detail(d)}))
+            title = tmpl.format_map(_SafeFmt({**d, "merge_detail": _table_merge_detail(d)}))
         except Exception:
-            text = tmpl.split(" — ")[0]
-        bucket = grouped.setdefault(heading, {})
-        note = bucket.get(text)
-        if note:
-            note["count"] += 1
-        else:
-            bucket[text] = {
-                "text": text,
-                "count": 1,
-                "review": d.get("confidence") == "review",
-                "prod_screenshot": d.get("prod_screenshot"),
-                "stage_screenshot": d.get("stage_screenshot"),
-                "_order": _TABLE_MESSAGE_ORDER.index(msg) if msg in _TABLE_MESSAGE_ORDER else 99,
-            }
-    out: dict[str, list[dict]] = {}
-    for heading, bucket in grouped.items():
-        notes = sorted(bucket.values(), key=lambda n: n["_order"])
-        for n in notes:
-            if n["count"] > 1:
-                n["text"] = f"{n['text']}  (×{n['count']})"
-            n.pop("_order", None)
-        out[heading] = notes
-    return out
+            title = tmpl.split(" — ")[0]
+        grouped.setdefault(heading, []).append(
+            _note(msg, title, d, _order=_TABLE_MESSAGE_ORDER.index(msg))
+        )
+    return {h: _collapse(sorted(v, key=lambda n: n["_order"])) for h, v in grouped.items()}
 
 
 _LIST_MARKER_MSG = "List marker changed"
 
 
 def _list_notes_by_heading(findings: list[dict] | None) -> dict[str, list[dict]]:
-    """Group the list-marker findings by section heading.
+    """The list-marker findings, per section heading.
 
-    Shown in RED, unlike the amber formatting notes: a procedure whose steps
-    are numbered 1,2,3 in Production and lettered a,b,c in Staging is not a
-    styling nicety - every cross-reference to "step 3" in the surrounding text
-    now points at nothing, and the two documents' instructions no longer read
-    the same. The section's own text diff can't show it, because the marker is
-    stripped from (or drawn outside) the sentence it belongs to.
+    Carried here rather than left to report.html because a procedure whose
+    steps are numbered 1,2,3 in Production and lettered a,b,c in Staging is
+    invisible to the text diff: the marker is either stripped from the sentence
+    or drawn outside it, so both columns read identically.
     """
-    grouped: dict[str, dict[str, dict]] = {}
+    grouped: dict[str, list[dict]] = {}
     for f in findings or []:
         if f.get("message") != _LIST_MARKER_MSG:
             continue
@@ -1484,26 +1783,17 @@ def _list_notes_by_heading(findings: list[dict] | None) -> dict[str, list[dict]]
             continue
         texts = d.get("text") or []
         quote = _one_line(texts[0]) if texts else ""
-        text = (
+        title = (
             (d.get("changed") or "the list marker style changed")
             + (f': first item “{quote}”' if quote else "")
             + "."
         )
-        bucket = grouped.setdefault(heading, {})
-        note = bucket.get(text)
-        if note:
-            note["count"] += 1
-        else:
-            bucket[text] = {
-                "text": text,
-                "count": 1,
-                "items": d.get("items") or 1,
-                "prod_markers": d.get("expected_marker") or "",
-                "stage_markers": d.get("actual_marker") or "",
-                "prod_screenshot": d.get("prod_screenshot"),
-                "stage_screenshot": d.get("stage_screenshot"),
-            }
-    return {heading: list(bucket.values()) for heading, bucket in grouped.items()}
+        grouped.setdefault(heading, []).append(
+            _note(_LIST_MARKER_MSG, title, d,
+                  markers=f"Production: {d.get('expected_marker') or '—'}"
+                          f"   ·   Staging: {d.get('actual_marker') or '—'}")
+        )
+    return {h: _collapse(v) for h, v in grouped.items()}
 
 
 _FMT_EMPHASIS_MSG = "Bold or italic emphasis removed"
@@ -1522,11 +1812,11 @@ _FMT_KIND_ORDER = {"bold": 0, "italic": 1, "encoded": 2}
 
 
 def _format_notes_by_heading(findings: list[dict] | None) -> dict[str, list[dict]]:
-    """Group the bold/italic-emphasis and text-encoding findings by section
+    """The bold/italic-emphasis and text-encoding findings, per section
     heading. Each note carries `kind` ("bold" / "italic" / "encoded") and the
-    matching `label`, so the section note and the left-nav chip use the same
-    name for the same issue."""
-    grouped: dict[str, dict[str, dict]] = {}
+    matching `label`, so the note and the left-nav chip use the same name for
+    the same issue."""
+    grouped: dict[str, list[dict]] = {}
     for f in findings or []:
         msg = f.get("message")
         d = f.get("details") or {}
@@ -1541,41 +1831,25 @@ def _format_notes_by_heading(findings: list[dict] | None) -> dict[str, list[dict
             emp = (d.get("emphasis") or "bold").lower()
             kind = "italic" if "italic" in emp and "bold" not in emp else "bold"
             pct = d.get("production_bold_pct") if kind == "bold" else d.get("production_italic_pct")
-            text = (
-                f"dropped in Staging"
+            title = (
+                f"{_FMT_LABELS[kind]} dropped in Staging"
                 + (f" — Production sets {pct} of the line {kind}" if pct else "")
                 + (f': “{quote}”' if quote else "") + "."
             )
         elif msg in _FMT_ENCODING_MSGS:
             kind = "encoded"
             chars = ", ".join(d.get("characters") or []) or "an un-decodable character"
-            text = (
-                f"character in Staging — {chars} where Production has readable text"
+            title = (
+                f"Un-decodable character in Staging — {chars} where Production has readable text"
                 + (f': “{quote}”' if quote else "") + "."
             )
         else:
             continue
-        bucket = grouped.setdefault(heading, {})
-        note = bucket.get(text)
-        if note:
-            note["count"] += 1
-        else:
-            bucket[text] = {
-                "text": text,
-                "count": 1,
-                "kind": kind,
-                "label": _FMT_LABELS[kind],
-                "prod_screenshot": d.get("prod_screenshot"),
-                "stage_screenshot": d.get("stage_screenshot"),
-            }
-    out: dict[str, list[dict]] = {}
-    for heading, bucket in grouped.items():
-        notes = sorted(bucket.values(), key=lambda n: (_FMT_KIND_ORDER[n["kind"]], n["text"]))
-        for n in notes:
-            if n["count"] > 1:
-                n["text"] = f"{n['text']}  (×{n['count']})"
-        out[heading] = notes
-    return out
+        grouped.setdefault(heading, []).append(
+            _note(msg, title, d, kind=kind, label=_FMT_LABELS[kind],
+                  _order=_FMT_KIND_ORDER[kind])
+        )
+    return {h: _collapse(sorted(v, key=lambda n: (n["_order"], n["title"]))) for h, v in grouped.items()}
 
 
 def _format_kind_chips(notes: list[dict]) -> list[dict]:
@@ -1589,6 +1863,106 @@ def _format_kind_chips(notes: list[dict]) -> list[dict]:
         {"kind": k, "label": _FMT_LABELS[k], "count": counts[k]}
         for k in sorted(counts, key=lambda k: _FMT_KIND_ORDER[k])
     ]
+
+
+# The categories a section's defects are split into, in the order they are
+# shown. `key` is also the CSS class, so each category keeps one colour
+# everywhere it appears - panel, chip and left-nav marker.
+_CATEGORIES = [
+    {"key": "content", "label": "Content", "icon": "✎",
+     "blurb": "What the two documents SAY. Every line is listed in the table above: "
+              "red = in Production only, green = in Staging only, amber = same line, "
+              "different wording."},
+    {"key": "table", "label": "Table", "icon": "▦",
+     "blurb": "The structure of a table - its columns, rows, cell merges and page breaks - "
+              "compared as a grid rather than as loose sentences."},
+    {"key": "image", "label": "Image", "icon": "🖼",
+     "blurb": "Figures and the labels drawn on them, matched by appearance across the "
+              "whole section, so a figure that merely moved pages is never reported."},
+    {"key": "numbering", "label": "Numbering", "icon": "1→a",
+     "blurb": "How the lists in this section are marked. The step text is identical, "
+              "which is why the comparison above shows nothing."},
+    {"key": "formatting", "label": "Formatting", "icon": "Aa",
+     "blurb": "How the same words are SET - emphasis that was dropped, characters that "
+              "no longer decode. The wording itself matches."},
+]
+_CATEGORY_BY_KEY = {c["key"]: c for c in _CATEGORIES}
+
+
+def _content_notes(section: dict) -> list[dict]:
+    """The section's own text differences, as one note - the table above
+    already lists them line by line, so repeating each line here would say the
+    same thing twice.
+
+    Counted over the document's real content only. Page furniture is excluded:
+    a running footer and a page number are one-sided in nearly every section
+    because the two documents paginate differently, and a note announcing "58
+    lines in Production only" about page numbers would drown the section's one
+    genuine reworded sentence.
+    """
+    rows = [r for r in (section.get("rows") or []) if r.get("kind", KIND_PROSE) != KIND_CHROME]
+    counts = _counts(rows)
+    parts = []
+    if counts.get("change"):
+        parts.append(f"{counts['change']} line(s) reworded")
+    if counts.get("prod"):
+        parts.append(f"{counts['prod']} line(s) in Production only")
+    if counts.get("stage"):
+        parts.append(f"{counts['stage']} line(s) in Staging only")
+    if not parts:
+        return []
+    by_kind = ", ".join(
+        f"{kc['diff']} in {kc['label'].lower()}"
+        for kc in _counts_by_kind(rows) if kc["diff"]
+    )
+    return [{
+        "message": "Content differences",
+        "title": "; ".join(parts) + ".",
+        "count": 1,
+        "where": "",
+        "detail": (
+            f"Where they are: {by_kind}. "
+            "Each of these is shown in full in the comparison above, with the changed "
+            "words marked inside the line. A line in one column only is content the "
+            "other document does not have under this heading - use “⇄ Match content” "
+            "to check whether it merely moved elsewhere."
+        ),
+        "fix": "",
+        "review": False,
+        "prod_screenshot": None, "stage_screenshot": None,
+        "prod_caption": "", "stage_caption": "", "prod_note": "", "stage_note": "",
+    }]
+
+
+def _issue_groups(row: dict) -> list[dict]:
+    """A section's defects, split by category, each with its full description.
+
+    This is the answer to "what is wrong in this section, and what does it
+    mean" - one panel, one block per kind of defect, in a fixed order so the
+    same category is always in the same place from section to section.
+    """
+    by_key = {
+        "content": _content_notes(row),
+        "table": row.get("table_notes") or [],
+        "image": row.get("image_notes") or [],
+        "numbering": row.get("list_notes") or [],
+        "formatting": row.get("format_notes") or [],
+    }
+    groups = []
+    for meta in _CATEGORIES:
+        notes = by_key.get(meta["key"]) or []
+        if not notes:
+            continue
+        # Content is ONE note standing for many differing lines, so its count
+        # comes from the lines. `real_diff`, not `diff`: the same number the
+        # section's red badge and the "differences only" filter use, so the
+        # panel cannot claim more differences than the nav does.
+        count = (
+            (row.get("counts") or {}).get("real_diff", 0) if meta["key"] == "content"
+            else sum(n.get("count", 1) for n in notes)
+        )
+        groups.append({**meta, "notes": notes, "count": count})
+    return groups
 
 
 def build_section_comparison(
@@ -1643,8 +2017,8 @@ def build_section_comparison(
     # any kind, so a heading unique to one document maps to just its own
     # content (that sub-section then shows as its own "stage only" / "prod
     # only" entry right below in the list) and nothing is double-counted.
-    exp_sections = extract_section_blocks(expected, exp_entries)
-    act_sections = extract_section_blocks(actual, act_entries)
+    exp_sections = extract_section_blocks(expected, exp_entries, keep_chrome=True)
+    act_sections = extract_section_blocks(actual, act_entries, keep_chrome=True)
     # BUT a genuinely matched pair's own body must be bounded ONLY by the next
     # MUTUALLY matched heading, or a sub-heading bookmarked in just one
     # document (e.g. Staging auto-bookmarking every numbered step - "1.
@@ -1657,8 +2031,8 @@ def build_section_comparison(
     matched = [m for m in matches if m.expected_index is not None and m.actual_index is not None]
     exp_matched_entries = [exp_entries[m.expected_index] for m in matched]
     act_matched_entries = [act_entries[m.actual_index] for m in matched]
-    exp_sections_wide = extract_section_blocks(expected, exp_matched_entries)
-    act_sections_wide = extract_section_blocks(actual, act_matched_entries)
+    exp_sections_wide = extract_section_blocks(expected, exp_matched_entries, keep_chrome=True)
+    act_sections_wide = extract_section_blocks(actual, act_matched_entries, keep_chrome=True)
     exp_wide_pos = {m.expected_index: i for i, m in enumerate(matched)}
     act_wide_pos = {m.actual_index: i for i, m in enumerate(matched)}
     # The nearest mutually-matched heading before and after each entry in the
@@ -1735,11 +2109,13 @@ def build_section_comparison(
     # filled from the best match anywhere in the other document.
     exp_all_sent = [
         r["text"] for blocks in exp_sections
-        for r in _section_records(_prose_only(list(blocks), exp_tables, exp_images), all_heading_titles)
+        for r in _section_records(list(blocks), all_heading_titles, exp_tables, exp_images)
+        if r["kind"] != KIND_CHROME
     ]
     act_all_sent = [
         r["text"] for blocks in act_sections
-        for r in _section_records(_prose_only(list(blocks), act_tables, act_images), all_heading_titles)
+        for r in _section_records(list(blocks), all_heading_titles, act_tables, act_images)
+        if r["kind"] != KIND_CHROME
     ]
 
     out: list[dict] = []
@@ -1814,9 +2190,9 @@ def build_section_comparison(
         if status == "matched":
             exp_blocks = exp_sections_wide[exp_wide_pos[ei]]
             act_blocks = act_sections_wide[act_wide_pos[ai]]
-            exp_recs = _section_records(_prose_only(exp_blocks, exp_tables, exp_images), all_heading_titles)
-            act_recs = _section_records(_prose_only(act_blocks, act_tables, act_images), all_heading_titles)
-            rows = _align([r["text"] for r in exp_recs], [r["text"] for r in act_recs])
+            exp_recs = _section_records(exp_blocks, all_heading_titles, exp_tables, exp_images)
+            act_recs = _section_records(act_blocks, all_heading_titles, act_tables, act_images)
+            rows = _align_kinds(exp_recs, act_recs)
             _reconcile_cross_present(rows, _blocks_blob(exp_blocks), _blocks_blob(act_blocks))
             exp_pages = sorted({b["page"] for b in exp_blocks if isinstance(b.get("page"), int)})
             act_pages = sorted({b["page"] for b in act_blocks if isinstance(b.get("page"), int)})
@@ -1828,18 +2204,17 @@ def build_section_comparison(
             parent_exp_recs, parent_act_recs, parent_heading = exp_recs, act_recs, head
             parent_exp_blocks, parent_act_blocks = exp_blocks, act_blocks
             counterpart_note = None
-            exp_span, act_span = exp_blocks, act_blocks
+            exp_span, act_span = _body_blocks(exp_blocks), _body_blocks(act_blocks)
         elif status == "missing":
             exp_blocks = exp_sections[ei]
-            exp_recs = _section_records(_prose_only(exp_blocks, exp_tables, exp_images), all_heading_titles)
+            exp_recs = _section_records(exp_blocks, all_heading_titles, exp_tables, exp_images)
             # Show every sentence that's actually under this Production-only
             # sub-heading, and line each one up against its counterpart in the
             # Staging parent (so a match reads "=" and a genuinely dropped
             # sentence reads "prod only"). Parent sentences that belong to
             # OTHER sub-sections are dropped - only rows that carry a sentence
             # from THIS section are kept.
-            rows = _one_sided_rows([r["text"] for r in exp_recs],
-                                   [r["text"] for r in parent_act_recs], "prod")
+            rows = _one_sided_rows(exp_recs, parent_act_recs, "prod")
             _reconcile_cross_present(rows, _blocks_blob(exp_blocks), _blocks_blob(parent_act_blocks))
             act_pages = sorted({b["page"] for b in parent_act_blocks if isinstance(b.get("page"), int)})
             _reconcile_ocr_present(rows, exp_words, [], act_words, act_pages)
@@ -1854,13 +2229,12 @@ def build_section_comparison(
             # Staging snapshot = the patch of the parent section where this
             # sub-section's sentences actually live.
             own_keys = {_key(r["text"]) for r in exp_recs}
-            exp_span = exp_blocks
+            exp_span = _body_blocks(exp_blocks)
             act_span = [r for r in parent_act_recs if _key(r["text"]) in own_keys]
         else:  # extra / Staging-only
             act_blocks = act_sections[ai]
-            act_recs = _section_records(_prose_only(act_blocks, act_tables, act_images), all_heading_titles)
-            rows = _one_sided_rows([r["text"] for r in act_recs],
-                                   [r["text"] for r in parent_exp_recs], "stage")
+            act_recs = _section_records(act_blocks, all_heading_titles, act_tables, act_images)
+            rows = _one_sided_rows(act_recs, parent_exp_recs, "stage")
             _reconcile_cross_present(rows, _blocks_blob(parent_exp_blocks), _blocks_blob(act_blocks))
             exp_pages = sorted({b["page"] for b in parent_exp_blocks if isinstance(b.get("page"), int)})
             _reconcile_ocr_present(rows, exp_words, exp_pages, act_words, [])
@@ -1874,10 +2248,10 @@ def build_section_comparison(
             )
             own_keys = {_key(r["text"]) for r in act_recs}
             exp_span = [r for r in parent_exp_recs if _key(r["text"]) in own_keys]
-            act_span = act_blocks
+            act_span = _body_blocks(act_blocks)
 
         rows, n_index = _strip_index_runs(rows)
-        rows = _drop_bare_callout_label_rows(rows)
+        rows = _mark_bare_callout_label_rows(rows)
 
         # Neither column may be left empty. A section can have no text blocks
         # of its own on one side - a container heading, a page that is all
@@ -1909,6 +2283,7 @@ def build_section_comparison(
             "actual_page": (act_e.page + 1) if act_e else None,
             "rows": rows,
             "counts": _counts(rows),
+            "kind_counts": _counts_by_kind(rows),
             "exp_shots": [],
             "act_shots": [],
             # Rendered after `_fill_relocated_counterparts` below, once every
@@ -1958,6 +2333,14 @@ def build_section_comparison(
     # document's full text, so a cell is never left blank for content that
     # merely moved to a different heading.
     _fill_relocated_counterparts(out, exp_all_sent, act_all_sent)
+
+    # Everything wrong with each section, split by category and explained.
+    # After the fill above, which recounts the text rows: a line whose
+    # counterpart turned up elsewhere is no longer a content difference, and
+    # the panel must not still claim it is.
+    for s in out:
+        s["issue_groups"] = _issue_groups(s)
+        s["issue_total"] = sum(g["count"] for g in s["issue_groups"])
 
     # Snapshots last. `_fill_relocated_counterparts` above can turn a row that
     # looked one-sided into a plain match, and a highlight box drawn before

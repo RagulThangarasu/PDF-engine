@@ -72,6 +72,7 @@
         <span class="recommended-badge">Recommended</span>
         <a class="btn secondary" href="{{ url_for('download', run_id=run_id, filename='sections.html') }}">Side-by-Side by Section (Prod vs Stage)</a>
       </span>
+      <a class="btn secondary" href="{{ url_for('download', run_id=run_id, filename='toc.html') }}">TOC Comparison (Prod vs Stage)</a>
       <form method="post" action="{{ url_for('rerun', run_id=run_id) }}" style="display:inline">
         <button class="btn ghost" type="submit" title="Run the whole comparison again on the same two PDFs">↻ Re-run comparison</button>
       </form>

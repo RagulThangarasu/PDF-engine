@@ -50,9 +50,9 @@ _RUN_LOCK = threading.Lock()
 # run_ids not yet finished, in submission order - lets a queued job report a
 # real position ("2 comparisons ahead of you") instead of a flat "waiting".
 _QUEUE_ORDER: list[str] = []
-# The validation report and the side-by-side section browser are exposed.
-# report.json is still written (the result page reads it server-side) but is
-# not downloadable, and report.pdf is not produced for web runs at all.
+# The validation report, the side-by-side section browser and the TOC
+# comparison are exposed. report.json is still written (the result page reads
+# it server-side) but is not downloadable; report.pdf is not produced at all.
 _DOWNLOAD_NAME_RE = re.compile(
     r"^((report|sections|toc)\.html|(screenshots|sections)/[\w\-.]+\.(png|jpg))$"
 )

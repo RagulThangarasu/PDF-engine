@@ -1,4 +1,5 @@
-"""Writes report.html, report.pdf and report.json from a ValidationReport."""
+"""Writes report.html, sections.html, toc.html and report.json from a
+ValidationReport. report.pdf is no longer produced - see `ALL_FORMATS`."""
 from __future__ import annotations
 
 import json
@@ -9,6 +10,7 @@ import fitz
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from pdfval.models import ValidationReport
+from pdfval.report.explanations import ISSUE_HELP
 
 TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), "templates")
 PDF_PAGE_SIZE = "letter"
@@ -35,6 +37,8 @@ def _env() -> Environment:
         autoescape=select_autoescape(["html"]),
     )
     env.filters["group_by_heading"] = _group_by_heading
+    # One source of truth for what a finding means; both templates read it.
+    env.globals["issue_help_map"] = ISSUE_HELP
     return env
 
 
@@ -42,12 +46,35 @@ def render_report_html(report: ValidationReport, **extra_context: Any) -> str:
     return _env().get_template("report_template.html").render(report=report.to_dict(), **extra_context)
 
 
+# What each kind of line is, in the reader's words. The browser shows every
+# text unit it finds and says which kind each one is, so these have to explain
+# themselves without the reader knowing anything about how a PDF is parsed.
+_KIND_HELP = {
+    "prose": "Flowing body text — the document's own sentences.",
+    "heading": "A heading's own title line, as printed in the body.",
+    "table": "A cell inside a region detected as a table. Also compared, in full, by Table Validation.",
+    "figure": "A label printed on or beside artwork — a diagram callout, a figure caption.",
+    "value": "A run of spec values, a numbered-diagram legend, a menu path — printed content, but not a sentence.",
+    "chrome": "Page furniture: a running header or footer, a page number, a printed contents listing. "
+              "Shown for completeness; it differs by design once the two documents paginate differently.",
+}
+_KIND_SHORT = {
+    "prose": "text", "heading": "heading", "table": "table cell",
+    "figure": "figure label", "value": "value", "chrome": "page furniture",
+}
+
+
 def render_sections_html(report: ValidationReport, sections: list) -> str:
     """The standalone TOC-navigated side-by-side content browser."""
+    from pdfval.report.sections import KIND_LABELS, KINDS
+
     return _env().get_template("sections_template.html").render(
         sections=sections,
         expected_path=report.expected_path,
         actual_path=report.actual_path,
+        kind_labels=[(k, KIND_LABELS[k]) for k in KINDS],
+        kind_help=_KIND_HELP,
+        kind_short=_KIND_SHORT,
     )
 
 
@@ -121,7 +148,13 @@ def write_pdf_report(report: ValidationReport, output_dir: str, html: str | None
     return path
 
 
-ALL_FORMATS = ("json", "html", "pdf", "sections", "toc")
+# report.pdf is deliberately NOT here: nobody reads it. The three HTML reports
+# are what anyone opens - the side-by-side section browser above all - and a
+# paginated copy of the findings costs every run a few seconds and a ~7 MB file
+# (2.9s / 7.4 MB on a 61-page manual) that is strictly worse to read than the
+# report.html it was rendered from. `write_pdf_report` is still callable for
+# anyone who explicitly asks for `formats=("pdf",)`; nothing does by default.
+ALL_FORMATS = ("json", "html", "sections", "toc")
 
 
 def generate_reports(
@@ -132,14 +165,10 @@ def generate_reports(
 ) -> dict[str, str]:
     """Write the requested report formats; returns a dict of their paths.
 
-    `formats` exists so the web UI can skip report.pdf, which it no longer
-    offers: paginating a report carrying hundreds of screenshots through
-    Story/DocumentWriter is by far the slowest step of a run, and there is no
-    reason to pay it for a file nobody can reach.
-
     "sections" writes sections.html - the standalone TOC-navigated side-by-side
     content browser - from `report.section_comparison` (set by `cli.run`);
-    skipped silently when that isn't present.
+    skipped silently when that isn't present. "toc" writes toc.html the same
+    way from `report.toc_report`.
     """
     html = render_report_html(report, **extra_context)
     section_data = getattr(report, "section_comparison", None)
