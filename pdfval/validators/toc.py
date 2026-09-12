@@ -798,10 +798,17 @@ def extract_sections(doc: fitz.Document, entries: list[TocEntry]) -> list[str]:
     return ["\n".join(b["text"] for b in blocks) for blocks in extract_section_blocks(doc, entries)]
 
 
-def extract_section_blocks(doc: fitz.Document, entries: list[TocEntry]) -> list[list[dict]]:
+def extract_section_blocks(
+    doc: fitz.Document, entries: list[TocEntry], keep_chrome: bool = False
+) -> list[list[dict]]:
     """Same section boundaries as `extract_sections`, but keep each text block's
     own page/bbox so callers can locate a specific sentence on the rendered
     page (e.g. to draw a highlight box in a screenshot).
+
+    `keep_chrome=True` keeps the page furniture this normally drops - running
+    headers and footers, bare page numbers, a printed contents listing - tagged
+    `kind="chrome"` instead of discarded, for the section browser, which must be
+    able to account for every line on the page rather than quietly lose some.
     """
     reading_order = sorted(range(len(entries)), key=lambda i: (entries[i].page, entries[i].y))
     next_index: dict[int, int | None] = {}
@@ -815,7 +822,11 @@ def extract_section_blocks(doc: fitz.Document, entries: list[TocEntry]) -> list[
             end_page, end_y = entries[next_idx].page, entries[next_idx].y
         else:
             end_page, end_y = doc.page_count - 1, float("inf")
-        sections.append(_extract_blocks_range(doc, entry.page, entry.y, end_page, end_y, entry.title))
+        sections.append(
+            _extract_blocks_range(
+                doc, entry.page, entry.y, end_page, end_y, entry.title, keep_chrome
+            )
+        )
     return sections
 
 
@@ -1077,11 +1088,13 @@ def _drop_heading_lines(lines: list[dict], normalized_heading: str) -> list[dict
 
 
 def _extract_blocks_range(
-    doc: fitz.Document, start_page: int, start_y: float, end_page: int, end_y: float, heading_title: str = ""
+    doc: fitz.Document, start_page: int, start_y: float, end_page: int, end_y: float,
+    heading_title: str = "", keep_chrome: bool = False,
 ) -> list[dict]:
     tolerance = 3.0
     normalized_heading = normalize_title(heading_title)
     blocks_out: list[dict] = []
+    chrome_out: list[dict] = []
     last_page = min(end_page, doc.page_count - 1)
     for page_index in range(start_page, last_page + 1):
         page = doc[page_index]
@@ -1128,9 +1141,21 @@ def _extract_blocks_range(
                 continue
             elif page_index == end_page and y0 >= end_y - tolerance:
                 continue
-            if is_toc or looks_like_page_number(text):
-                continue
-            if is_running_header_footer(doc, page_index, (x0, y0, x1, y1), text):
+            # Page furniture. Dropped from every comparison - a page number
+            # cannot help but differ once the two documents paginate
+            # differently - but handed back tagged when the caller has to
+            # account for every line on the page (see `keep_chrome`), never
+            # merged into the content blocks below.
+            if (
+                is_toc
+                or looks_like_page_number(text)
+                or is_running_header_footer(doc, page_index, (x0, y0, x1, y1), text)
+            ):
+                if keep_chrome:
+                    chrome_out.append({
+                        "text": normalize_block_text(text), "page": page_index,
+                        "bbox": (x0, y0, x1, y1), "kind": "chrome",
+                    })
                 continue
             # The heading's own title line is already validated by the TOC
             # comparison table - skip it here so it isn't also reported as a
@@ -1142,7 +1167,10 @@ def _extract_blocks_range(
     # merge_wrapped_sentence_blocks is now a light safety net (paragraphs are
     # already whole); merge_bare_marker_blocks still attaches stray bullet
     # glyphs that PyMuPDF emits as their own line.
-    return merge_bare_marker_blocks(merge_wrapped_sentence_blocks(blocks_out))
+    out = merge_bare_marker_blocks(merge_wrapped_sentence_blocks(blocks_out))
+    if chrome_out:
+        out = out + chrome_out
+    return out
 
 
 def validate_toc(expected: fitz.Document, actual: fitz.Document) -> CheckResult:
