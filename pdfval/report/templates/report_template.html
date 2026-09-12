@@ -58,6 +58,11 @@
   .screenshot-col { flex: 1 1 220px; max-width: 320px; }
   .screenshot-col img { width: 100%; border: 1px solid #ddd; border-radius: 4px; }
   .screenshot-absent { font-size: 7pt; color: #888; font-style: italic; background: #f7f7f7; border: 1px dashed #ddd; border-radius: 4px; padding: 8pt 6pt; }
+  .shot-legend { font-size: 7pt; color: #667085; margin-top: 5pt; }
+  .shot-legend .sw { display: inline-block; width: 16pt; height: 7pt; vertical-align: middle; border-radius: 2px; }
+  .shot-legend .sw.red { border: 1.5pt solid #d21414; background: #ffeaea; }
+  .shot-legend .sw.orange { border: 1.5pt solid #e68200; }
+  .shot-legend .num { display: inline-block; padding: 0 3pt; border-radius: 2px; background: #d21414; color: #fff; font-weight: 700; }
   .issue-help { font-size: 7pt; color: #444; background: #f7f7f7; border-radius: 4px; padding: 3pt 5pt; margin-bottom: 3pt; }
   .issue-help-label { font-weight: bold; color: #333; }
   .subhead { margin: 8pt 0 3pt; font-size: 9pt; }
@@ -116,7 +121,7 @@
                       or (d.text is defined and d.text is sequence and d.text is not string)
                       or (d.word_diff is defined) -%}
     {%- set known_keys = ('heading', 'expected_page', 'actual_page', 'expected', 'actual', 'text', 'word_diff', 'prod_screenshot', 'stage_screenshot') -%}
-    {%- set hidden_keys = ('bbox', 'expected_bbox', 'actual_bbox', 'page_rect', 'delta', 'prod_screenshot_caption', 'stage_screenshot_caption', 'prod_screenshot_note', 'stage_screenshot_note') -%}
+    {%- set hidden_keys = ('bbox', 'expected_bbox', 'actual_bbox', 'page_rect', 'delta', 'prod_screenshot_caption', 'stage_screenshot_caption', 'prod_screenshot_note', 'stage_screenshot_note', 'shot_label') -%}
     {%- set extra_keys = d.keys()|reject('in', known_keys)|reject('in', hidden_keys)|list -%}
     {%- if has_diff and (d.expected_page is defined or d.actual_page is defined or extra_keys) %}
     <div class="issue-meta">
@@ -179,6 +184,13 @@
     </div>
     {%- endif %}
     {%- if d.prod_screenshot or d.stage_screenshot or d.prod_screenshot_note or d.stage_screenshot_note %}
+    {%- if d.prod_screenshot and d.stage_screenshot %}
+    <div class="shot-legend">
+      <span class="sw red"></span> what this finding is about &nbsp;·&nbsp;
+      <span class="sw orange"></span> the same place in the other document &nbsp;·&nbsp;
+      the <span class="num">n</span> badge is the same on both crops
+    </div>
+    {%- endif %}
     <div class="screenshot-pair">
       <div class="screenshot-col">
         <div class="diff-label">{{ d.prod_screenshot_caption or 'Production (prod)' }}</div>
@@ -223,7 +235,7 @@
     'Table breaking the margins': {'what': 'The table extends past the page margins in Staging.', 'fix': 'Resize or reflow the table so it fits within the page margins.'},
     'Table heading missing': {'what': "A header cell present in Production is missing from Staging. The row was located by its anchor cell, and only that cell's own words were compared.", 'fix': 'Restore the missing header text.'},
     'Table cell missing': {'what': "Part of a cell's content is gone in Staging. The row was located by its anchor cell (not by position), and the cell's words were compared as an unordered set - so a reordering alone is never reported.", 'fix': 'Restore the missing words listed above to that cell.'},
-    'List marker changed': {'what': 'The same list item is marked differently between Production and Staging (numbered 1,2,3 vs lettered a,b,c vs a bullet).', 'fix': 'Align the Staging list marker style with Production.'},
+    'List marker changed': {'what': 'The same list items are marked differently in the two documents - Production numbers a procedure 1., 2., 3. where Staging letters it a., b., c. (or drops it to a bullet). The step text is identical, which is why the content diff shows nothing: only the markers changed. It is reported as a mismatch because it changes what the reader is told - any "repeat step 3" around the list no longer resolves, and the marker is often drawn as its own text object beside the step, so it is invisible in the text comparison.', 'fix': "Restore Production's marker style for these list items in Staging, or renumber the cross-references that point at them."},
     'List alignment/indent changed': {'what': "A list item's indent moved - it changed nesting level, or lost its hanging indent.", 'fix': 'Restore the original indent, or confirm the nesting change was intended.'},
     'Text alignment changed': {'what': 'The same text is aligned differently (left / center / right / justified).', 'fix': 'Restore the Production alignment, or confirm the change was intended.'},
     'Paragraph merged with heading': {'what': "A numbered item's description has been pulled up onto the same line as its bold label, where Production keeps the label on its own line.", 'fix': 'Put the description back on its own line beneath the label.'},

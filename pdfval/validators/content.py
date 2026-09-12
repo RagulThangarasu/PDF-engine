@@ -25,10 +25,10 @@ import fitz
 from pdfval import i18n
 from pdfval.models import CheckResult, Issue
 from pdfval.report import screenshots
+from pdfval.validators.headings import resolve_entries
 from pdfval.validators.toc import (
     extract_section_blocks,
     filter_toc_page_blocks,
-    get_toc_entries,
     is_running_header_footer,
     looks_like_page_number,
     looks_like_toc_listing,
@@ -158,8 +158,30 @@ _SPEC_VALUE_RE = re.compile(r"^[<>~+-]?\d[\d.,:/°%-]*(?:m|mm|cm|kg|g|hz|khz|w|v
 _MENU_NAV_WORDS = {"or", "and", ">", "»", "→", "-", "/"}
 
 
+# A list marker ("3.", "a)", a bullet) and a trailing footnote-reference digit
+# are typography, not content - and the two producers do not emit them the same
+# way. The very same diagram callout comes out of Production as
+# "3.\tHDMI in ports\n3" (the marker and the superscript each their own token)
+# and out of Staging as "HDMI in ports3". Counted as tokens, those two extra
+# numeric tokens swing the ratio below from 0.4 to 0.6, so the identical label
+# reads as a diagram legend in one document and as prose in the other - one
+# side drops it, the other diffs it, and the report shows content printed in
+# BOTH documents as "not in Production". Measuring only the label's own words
+# makes the two sides agree.
+_LEADING_LIST_MARKER_RE = re.compile(
+    r"^\s*(?:\(?\d{1,2}[.)]|\(?[A-Za-z][.)]|[\u2022\u25e6\u25aa\u25b8\u2023\u2043\u00b7])\s+"
+)
+_TRAILING_FOOTNOTE_RE = re.compile(r"\s+\d{1,2}$")
+
+
+def _prose_tokens(text: str) -> list[str]:
+    """`text`'s own words, with a leading list marker and a trailing footnote
+    reference removed - the parts of a block that differ purely by producer."""
+    return _TRAILING_FOOTNOTE_RE.sub("", _LEADING_LIST_MARKER_RE.sub("", text)).split()
+
+
 def _looks_like_non_prose(text: str) -> bool:
-    tokens = text.split()
+    tokens = _prose_tokens(text)
     if len(tokens) < 2:
         return False
     # A stray bullet glyph from the NEXT list item sometimes rides along at
@@ -246,8 +268,7 @@ def validate_content(
     result = CheckResult(name="Content Validation")
     encoding_result = CheckResult(name="Encoding Validation")
 
-    exp_entries = get_toc_entries(expected)
-    act_entries = get_toc_entries(actual)
+    exp_entries, act_entries = resolve_entries(expected, actual)
     counter = itertools.count(1)
     exp_tables = _TableBBoxCache(expected_path)
     act_tables = _TableBBoxCache(actual_path)
@@ -1192,30 +1213,16 @@ def _diff_text(
             if not exp_slice_records:
                 continue
             details["expected"] = _cap([r["text"] for r in exp_slice_records])
-            # Missing text: the sentence exists only in Production. Show the
-            # Production location (its own text, boxed, with a little context).
-            # The Staging side has NOTHING that corresponds to it - a "context"
-            # crop of whatever sentences the diff happened to align either side
-            # of the gap is a picture of a different, unrelated place, which is
-            # worse than showing nothing.
-            _attach_screenshots(
-                details, expected_doc, actual_doc, output_dir, counter,
-                None, None,
-                _context_span(exp_records, i1, i2, expected_doc, expected_page),
-                (None, None),
-            )
+            # Missing text: the sentence exists only in Production. The exact
+            # wording is printed below, and the section browser shows it in
+            # place beside Staging - see `_attach_screenshots` on why a crop
+            # adds nothing here.
             result.issues.append(Issue(severity="error", page=expected_page, message="Missing text", details=details))
         elif tag == "insert":
             if not act_slice_records:
                 continue
             details["actual"] = _cap([r["text"] for r in act_slice_records])
-            # Added text: the sentence exists only in Staging - show only that.
-            _attach_screenshots(
-                details, expected_doc, actual_doc, output_dir, counter,
-                None, None,
-                (None, None),
-                _context_span(act_records, j1, j2, actual_doc, actual_page),
-            )
+            # Added text: the sentence exists only in Staging.
             result.issues.append(Issue(severity="error", page=actual_page, message="Added text", details=details))
         elif tag == "replace":
             # Apply the same reordering / heading-title allowance to both
@@ -1250,12 +1257,6 @@ def _diff_text(
                         details["expected"] = _cap([r["text"] for r in exp_lax])
                         details["actual"] = _cap([r["text"] for r in act_lax])
                     details["confidence"] = "review"
-                    _attach_screenshots(
-                        details, expected_doc, actual_doc, output_dir, counter,
-                        None, None,
-                        _context_span(exp_records, i1, i2, expected_doc, expected_page),
-                        _context_span(act_records, j1, j2, actual_doc, actual_page),
-                    )
                     result.issues.append(
                         Issue(
                             severity="warning", page=expected_page,
@@ -1265,22 +1266,10 @@ def _diff_text(
                 continue
             if not exp_slice_records:
                 details["actual"] = _cap([r["text"] for r in act_slice_records])
-                _attach_screenshots(
-                    details, expected_doc, actual_doc, output_dir, counter,
-                    None, None,
-                    (None, None),
-                    _context_span(act_records, j1, j2, actual_doc, actual_page),
-                )
                 result.issues.append(Issue(severity="error", page=actual_page, message="Added text", details=details))
                 continue
             if not act_slice_records:
                 details["expected"] = _cap([r["text"] for r in exp_slice_records])
-                _attach_screenshots(
-                    details, expected_doc, actual_doc, output_dir, counter,
-                    None, None,
-                    _context_span(exp_records, i1, i2, expected_doc, expected_page),
-                    (None, None),
-                )
                 result.issues.append(Issue(severity="error", page=expected_page, message="Missing text", details=details))
                 continue
             exp_slice = [r["text"] for r in exp_slice_records]
@@ -1291,14 +1280,8 @@ def _diff_text(
             else:
                 details["expected"] = _cap(exp_slice)
                 details["actual"] = _cap(act_slice)
-            # Changed text: both sides carry the reworded sentence, so both
-            # screenshots box a real, corresponding location.
-            _attach_screenshots(
-                details, expected_doc, actual_doc, output_dir, counter,
-                None, None,
-                _context_span(exp_records, i1, i2, expected_doc, expected_page),
-                _context_span(act_records, j1, j2, actual_doc, actual_page),
-            )
+            # Changed text: both sides carry the reworded sentence, and the
+            # word-level diff below shows exactly how they differ.
             result.issues.append(Issue(severity="error", page=expected_page, message="Changed text", details=details))
 
 
@@ -1326,12 +1309,19 @@ def _attach_screenshots(
     act_fallback: tuple[int | None, tuple | None],
 ) -> None:
     """Render a genuine, zoomed screenshot of the relevant page from each
-    document, with a red box around the diffed text (or, on the side that has
-    no diffed text of its own - a Missing/Added text finding - around the
-    nearest neighboring sentence instead), so the issue can be verified
-    against the real prod/stage page layout on BOTH sides. Uses
-    `capture_region`, not `capture_page`, so the crop is zoomed in on the
-    highlighted area rather than handing back a full, hard-to-read page.
+    document, with a red box around the region the finding is about, so the
+    issue can be verified against the real prod/stage page layout on BOTH
+    sides. Uses `capture_region`, not `capture_page`, so the crop is zoomed in
+    on the highlighted area rather than handing back a full, hard-to-read page.
+
+    Only the VISUAL findings call this - a dropped bold run, an encoding
+    regression, a formatting change, a missing callout icon - where a picture
+    of the page is the only way to judge the finding, and where the section
+    browser reuses the crop for its own notes. The plain text-diff findings
+    (Missing / Added / Changed / Minor text) do NOT: the report already prints
+    the exact Production and Staging wording with the word-level diff, and the
+    side-by-side browser shows the same text in its real page context, so the
+    crops were two more images per finding that said nothing the words hadn't.
     """
     if not output_dir:
         return
@@ -1342,8 +1332,22 @@ def _attach_screenshots(
     exp_page, exp_bbox = _slice_anchor(exp_slice, exp_fallback)
     act_page, act_bbox = _slice_anchor(act_slice, act_fallback)
 
-    prod_path = screenshots.capture_region(expected_doc, exp_page, output_dir, f"content_{seq}_prod", exp_bbox)
-    stage_path = screenshots.capture_region(actual_doc, act_page, output_dir, f"content_{seq}_stage", act_bbox)
+    # Both crops carry the finding's number, so the reader can see at a glance
+    # that the two columns are framing the same spot. A side that gets a crop
+    # here is showing a real region of its own document, so it is boxed red;
+    # the thin orange CONTEXT box belongs to a side that has nothing of its own
+    # and is filled in later from the matching section (see
+    # `pdfval.report.counterparts`).
+    label = str(seq)
+    details["shot_label"] = label
+    prod_path = screenshots.capture_region(
+        expected_doc, exp_page, output_dir, f"content_{seq}_prod", exp_bbox,
+        screenshots.KIND_DIFF, label,
+    )
+    stage_path = screenshots.capture_region(
+        actual_doc, act_page, output_dir, f"content_{seq}_stage", act_bbox,
+        screenshots.KIND_DIFF, label,
+    )
 
     if prod_path:
         details["prod_screenshot"] = prod_path

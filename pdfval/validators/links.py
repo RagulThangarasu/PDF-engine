@@ -29,7 +29,8 @@ import fitz
 
 from pdfval.models import CheckResult, Issue
 from pdfval.report import screenshots
-from pdfval.validators.toc import get_toc_entries, heading_at, looks_like_toc_listing
+from pdfval.validators.headings import resolve_entries
+from pdfval.validators.toc import heading_at, looks_like_toc_listing
 
 MAX_SCREENSHOTS = 100
 MIN_HOTSPOT_SIDE = 2.0  # points - a hotspot thinner than this cannot be hit
@@ -50,7 +51,7 @@ def validate_links(
 ) -> CheckResult:
     result = CheckResult(name="Hyperlink Validation")
     counter = itertools.count(1)
-    entries = get_toc_entries(actual)
+    _, entries = resolve_entries(expected, actual)
 
     for page_index in range(actual.page_count):
         try:
@@ -242,7 +243,9 @@ def _attach(
     seq = next(counter)
     if seq > MAX_SCREENSHOTS:
         return
-    path = screenshots.capture_region(doc, page_index, output_dir, f"link_{seq}_stage", bbox)
+    path = screenshots.capture_region(
+        doc, page_index, output_dir, f"link_{seq}_stage", bbox, screenshots.KIND_DIFF, str(seq)
+    )
     if path:
         details["stage_screenshot"] = path
         details["stage_screenshot_caption"] = f"Staging - p.{page_index + 1}"

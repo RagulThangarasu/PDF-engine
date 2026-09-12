@@ -13,6 +13,87 @@ PADDING = 4.0  # points of padding around the highlighted region
 BOX_COLOR = (220, 20, 20)
 BOX_WIDTH = 4  # px
 
+# Both reports speak the same visual language, so the drawing lives here and
+# the section browser (`pdfval.report.sections`) draws through it too:
+#
+#   DIFF (bold red)     - the thing this finding is about, on the side that has
+#                         it: the changed sentence, the dropped row, the figure.
+#   CONTEXT (thin orange) - the SAME place in the other document. A highlight
+#                         with no partner left the reader hunting the second
+#                         column by eye for the spot being talked about.
+#
+# Both carry the same number badge, so box 3 on the left is box 3 on the right.
+KIND_DIFF = "diff"
+KIND_CONTEXT = "context"
+DIFF_COLOR = (210, 20, 20)
+CONTEXT_COLOR = (230, 130, 0)
+DIFF_FILL = (255, 70, 70, 40)
+CONTEXT_WIDTH = 2
+BADGE_FONT_SIZE = 24
+BADGE_PAD = 5
+_badge_font_cache: list = []
+
+
+def badge_font():
+    """The number badge's font. Pillow's default bitmap face is unreadably
+    small on a 150-DPI page render, so ask for a scaled one where the installed
+    Pillow supports it."""
+    if not _badge_font_cache:
+        try:
+            from PIL import ImageFont
+
+            try:
+                font = ImageFont.load_default(size=BADGE_FONT_SIZE)
+            except TypeError:  # Pillow < 10.1: unscalable default only
+                font = ImageFont.load_default()
+        except Exception:
+            font = None
+        _badge_font_cache.append(font)
+    return _badge_font_cache[0]
+
+
+def draw_badge(draw, img, label: str, x0: float, y0: float, color: tuple) -> None:
+    """The difference number, in a filled tab pinned to the box's top-left
+    corner: above it by preference, in the left margin when the box starts at
+    the top of the render, and only as a last resort inside the box - where it
+    would sit over the first word it is pointing at."""
+    font = badge_font()
+    if not label or font is None:
+        return
+    try:
+        left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
+    except Exception:
+        return
+    bw = (right - left) + 2 * BADGE_PAD
+    bh = (bottom - top) + 2 * BADGE_PAD
+    bx = min(max(0.0, x0), max(0.0, img.width - bw))
+    by = y0 - bh - 1
+    if by < 0:
+        if x0 - bw - 2 >= 0:
+            bx, by = x0 - bw - 2, max(0.0, y0)
+        else:
+            by = min(max(0.0, y0), max(0.0, img.height - bh))
+    draw.rectangle([bx, by, bx + bw, by + bh], fill=color + (255,))
+    draw.text(
+        (bx + BADGE_PAD - left, by + BADGE_PAD - top), label,
+        fill=(255, 255, 255, 255), font=font,
+    )
+
+
+def draw_highlight(draw, img, rect: tuple, kind: str, label: str | None) -> None:
+    """One highlight rectangle plus its number badge, in the shared style."""
+    x0, y0, x1, y1 = rect
+    if x1 <= x0 or y1 <= y0:
+        return
+    context = kind == KIND_CONTEXT
+    color = CONTEXT_COLOR if context else DIFF_COLOR
+    if context:
+        draw.rectangle([x0, y0, x1, y1], outline=color + (255,), width=CONTEXT_WIDTH)
+    else:
+        draw.rectangle([x0, y0, x1, y1], fill=DIFF_FILL, outline=color + (255,), width=BOX_WIDTH - 1)
+    if label:
+        draw_badge(draw, img, label, x0, y0, color)
+
 CROP_DPI = 200  # close-ups are rendered finer than the full page
 CROP_MARGIN = 24.0  # points of surrounding page kept around a cropped region
 
@@ -114,10 +195,15 @@ def capture_page(
     output_dir: str,
     name: str,
     bbox: tuple[float, float, float, float] | None = None,
+    kind: str = KIND_DIFF,
+    label: str | None = None,
 ) -> str | None:
     """Render `page_index` from `doc` to a PNG under `output_dir/screenshots/`,
-    drawing a red box around `bbox` (in PDF point space) if given. Returns the
-    path relative to `output_dir` (for use as an <img src>), or None on failure.
+    drawing a highlight around `bbox` (in PDF point space) if given - bold red
+    for the difference itself, thin orange for the same place in the other
+    document - tagged with `label`, the number that ties the two columns
+    together. Returns the path relative to `output_dir` (for use as an <img
+    src>), or None on failure.
     """
     if page_index is None or not (0 <= page_index < doc.page_count):
         return None
@@ -126,7 +212,7 @@ def capture_page(
         img, zoom = _render(page, DPI)
 
         if bbox is not None:
-            _draw_box(img, page, bbox, zoom, origin=(page.rect.x0, page.rect.y0))
+            _draw_box(img, page, bbox, zoom, origin=(page.rect.x0, page.rect.y0), kind=kind, label=label)
 
         return _save(img, output_dir, name)
     except Exception:
@@ -139,6 +225,8 @@ def capture_region(
     output_dir: str,
     name: str,
     bbox: tuple[float, float, float, float] | None = None,
+    kind: str = KIND_DIFF,
+    label: str | None = None,
 ) -> str | None:
     """Like `capture_page`, but zoomed in on `bbox` (plus a margin of
     surrounding page for context) instead of showing the whole page. A figure
@@ -149,7 +237,7 @@ def capture_region(
     if page_index is None or not (0 <= page_index < doc.page_count):
         return None
     if bbox is None:
-        return capture_page(doc, page_index, output_dir, name, None)
+        return capture_page(doc, page_index, output_dir, name, None, kind, label)
     try:
         page = doc[page_index]
         page_rect = page.rect
@@ -165,13 +253,13 @@ def capture_region(
             min(page_rect.y1, y1 + CROP_MARGIN),
         )
         if clip.is_empty or clip.width < 1 or clip.height < 1:
-            return capture_page(doc, page_index, output_dir, name, bbox)
+            return capture_page(doc, page_index, output_dir, name, bbox, kind, label)
 
         img, zoom = _render(page, CROP_DPI, clip=clip)
-        _draw_box(img, page, bbox, zoom, origin=(clip.x0, clip.y0))
+        _draw_box(img, page, bbox, zoom, origin=(clip.x0, clip.y0), kind=kind, label=label)
         return _save(img, output_dir, name)
     except Exception:
-        return capture_page(doc, page_index, output_dir, name, bbox)
+        return capture_page(doc, page_index, output_dir, name, bbox, kind, label)
 
 
 def _draw_box(
@@ -180,8 +268,10 @@ def _draw_box(
     bbox: tuple[float, float, float, float],
     zoom: float,
     origin: tuple[float, float],
+    kind: str = KIND_DIFF,
+    label: str | None = None,
 ) -> None:
-    """Draw the red highlight. Pixel (0,0) of a render corresponds to the
+    """Draw the highlight. Pixel (0,0) of a render corresponds to the
     top-left of the *rendered area*, not to PDF point (0,0) - so the render
     origin has to be subtracted, or the box lands offset on any page whose
     MediaBox does not start at the origin, and on every cropped render.
@@ -194,9 +284,7 @@ def _draw_box(
         min(img.width, (x1 + PADDING - ox) * zoom),
         min(img.height, (y1 + PADDING - oy) * zoom),
     )
-    if rect[2] <= rect[0] or rect[3] <= rect[1]:
-        return
-    ImageDraw.Draw(img).rectangle(rect, outline=BOX_COLOR, width=BOX_WIDTH)
+    draw_highlight(ImageDraw.Draw(img, "RGBA"), img, rect, kind, label)
 
 
 def _save(img: Image.Image, output_dir: str, name: str) -> str:

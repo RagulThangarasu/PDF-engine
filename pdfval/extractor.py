@@ -253,6 +253,27 @@ def _has_invalid_cell_geometry(cells: list | None) -> bool:
     return False
 
 
+def _column_count(rows: list) -> int:
+    return max((len(row or []) for row in rows or []), default=0)
+
+
+def is_single_column_region(rows: list) -> bool:
+    """A detected "table" with one column is a bordered BOX, not tabular data -
+    a Note/Important/Warning admonition, a tinted callout panel, an icon frame.
+
+    This matters far more than it sounds. Whether a box like that is ruled with
+    strokes pdfplumber's line detector can see is purely a property of the
+    producer: on the pair this was built against, Production's admonition boxes
+    came back as 36 single-column "tables" and Staging's identical ones as 2.
+    Every one of those made Content Validation drop the box's prose from
+    Production's side of the diff while keeping Staging's - so text printed
+    verbatim in BOTH documents was reported as "not in Production". Tabular
+    data has at least two columns; anything narrower is prose in a frame and is
+    compared as prose.
+    """
+    return _column_count(rows) < 2
+
+
 def _looks_like_real_table(rows: list, cells: list | None = None) -> bool:
     has_text = False
     for row in rows or []:
@@ -265,6 +286,8 @@ def _looks_like_real_table(rows: list, cells: list | None = None) -> bool:
     # bordered box (an icon frame, a diagram outline) with no cell text at
     # all - that's not a data table either.
     if not has_text:
+        return False
+    if is_single_column_region(rows):
         return False
     return not _has_invalid_cell_geometry(cells)
 
@@ -470,9 +493,13 @@ def get_all_detected_regions(pdf_path: str, page_index: int) -> list[tuple[float
     rather than tight-bboxed - it isn't a mockup either, it's pdfplumber
     merging unrelated prose into a phantom cell, and that prose still needs
     to be diffed as content, not swallowed by the phantom cell's bogus bbox.
+    So is a single-column region: that is a bordered Note/Warning box whose
+    text is ordinary prose, and only one of the two documents usually draws it
+    with strokes pdfplumber can see (see `is_single_column_region`).
     """
     return [
         _tight_content_bbox(r)
         for r in _TABLE_CACHE.page_regions(pdf_path, page_index)
         if not _has_invalid_cell_geometry(r.get("cells"))
+        and not is_single_column_region(r.get("rows"))
     ]
