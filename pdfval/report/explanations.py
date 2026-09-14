@@ -107,6 +107,10 @@ ISSUE_HELP: dict[str, dict[str, str]] = {
         "what": 'The same list items are marked differently in the two documents - Production numbers a procedure 1., 2., 3. where Staging letters it a., b., c. (or drops it to a bullet). The step text is identical, which is why the content diff shows nothing: only the markers changed. It is reported as a mismatch because it changes what the reader is told - any "repeat step 3" around the list no longer resolves, and the marker is often drawn as its own text object beside the step, so it is invisible in the text comparison.',
         "fix": "Restore Production's marker style for these list items in Staging, or renumber the cross-references that point at them.",
     },
+    'List marker size changed': {
+        "what": "The same list items use the same kind of marker on both sides (e.g. a bullet on both), but the marker itself prints at a noticeably different size in Staging - larger or smaller than its Production counterpart. The item's own text is unaffected; only the marker glyph's size changed.",
+        "fix": "Restore Production's marker size for these list items in Staging, or confirm the size change was intended.",
+    },
     'List alignment/indent changed': {
         "what": "A list item's indent moved - it changed nesting level, or lost its hanging indent.",
         "fix": 'Restore the original indent, or confirm the nesting change was intended.',
@@ -178,6 +182,14 @@ ISSUE_HELP: dict[str, dict[str, str]] = {
     'Table row missing': {
         "what": 'A row present in Production could not be found in Staging. The row was located by its anchor cell rather than by position, so an inserted row elsewhere does not cause this.',
         "fix": 'Add the missing row back into the Staging table.',
+    },
+    'Underline missing in Staging': {
+        "what": 'A drawn underline rule sits under this text in Production; the same words print with no rule under them in Staging. A PDF has no font flag for underline, so this is judged from the drawing itself, not a style name.',
+        "fix": 'Restore the underline rule in Staging, or confirm removing it was intended.',
+    },
+    'Underline added in Staging': {
+        "what": 'These words print plain in Production, but Staging draws a rule under them.',
+        "fix": 'Remove the underline in Staging, or confirm adding it was intended.',
     },
 }
 

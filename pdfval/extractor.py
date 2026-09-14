@@ -81,6 +81,20 @@ def get_images(doc: fitz.Document, page_index: int) -> list[ImageInfo]:
 # background tint.
 _VECTOR_MIN_SIDE = 60.0  # points - a figure is at least this wide AND tall
 _VECTOR_MIN_AREA = 6000.0  # points^2
+# Print-ready manuals (the chapter engine): small drawn artwork counts - a 30pt
+# safety symbol drawn as vectors is the figure Staging embeds as an image.
+_PRINT_VECTOR_MIN_SIDE = 20.0
+_PRINT_VECTOR_MIN_AREA = 500.0
+_PRINT_VECTOR_MIN_PRIMITIVES = 3
+_PRINT_RASTER_COVER = 0.3   # a drawn cluster this covered by embedded images is their backgrounds
+# Printer's marks - crop marks, registration targets, colour bars - sit in the
+# outer band of a print-ready page. Left in, they sit within the cluster gap of
+# each other and chain every shape on the page into one page-sized "figure",
+# which is then discarded as a background: no vector figure survived at all.
+_VECTOR_EDGE_BAND = 40.0  # points
+_VECTOR_FRAME_SHARE = 0.5          # a single shape covering this much of the page is a frame
+_VECTOR_LINE_THICKNESS = 1.0       # points: thinner than this is a rule, not artwork
+_VECTOR_PANEL_MIN_HEIGHT = 40.0    # points: a filled half-page-wide rect this tall is a panel
 _VECTOR_MIN_PRIMITIVES = 4  # a lone rectangle is a box/tint, not an illustration
 _VECTOR_CLUSTER_GAP = 12.0  # points - primitives at most this far apart are one figure
 _VECTOR_MAX_PAGE_FRACTION = 0.85  # a "figure" covering the whole page is a background
@@ -116,7 +130,7 @@ def _cluster_rects(rects: list[tuple], gap: float) -> list[tuple[tuple, int]]:
     return [(tuple(bbox), count) for bbox, count in clusters]
 
 
-def get_vector_figures(doc: fitz.Document, page_index: int) -> list[ImageInfo]:
+def get_vector_figures(doc: fitz.Document, page_index: int, print_ready: bool = False) -> list[ImageInfo]:
     """Illustrations drawn with vector primitives rather than embedded as a
     raster image - on-screen-display mockups, panel/port diagrams, connection
     schematics. `get_image_info` cannot see these at all, so without this a
@@ -132,6 +146,7 @@ def get_vector_figures(doc: fitz.Document, page_index: int) -> list[ImageInfo]:
         drawings = page.get_drawings()
     except Exception:
         return []
+    band = _VECTOR_EDGE_BAND
     for d in drawings:
         r = d.get("rect")
         if r is None:
@@ -139,17 +154,32 @@ def get_vector_figures(doc: fitz.Document, page_index: int) -> list[ImageInfo]:
         # Hairline rules, underlines and table borders are effectively 1-D.
         if r.width < 2 and r.height < 2:
             continue
+        if not print_ready:
+            rects.append((r.x0, r.y0, r.x1, r.y1))
+            continue
+        if (r.x1 <= page_rect.x0 + band or r.x0 >= page_rect.x1 - band
+                or r.y1 <= page_rect.y0 + band or r.y0 >= page_rect.y1 - band):
+            continue  # printer's marks in the outer band
+        if r.width * r.height >= _VECTOR_FRAME_SHARE * page_area:
+            continue  # the page's trim/bleed frame: touches every shape on the page
+        if min(r.width, r.height) < _VECTOR_LINE_THICKNESS:
+            continue  # a rule line: it runs across a panel and chains what it passes
+        if "f" in (d.get("type") or "") and r.width >= 0.5 * page_rect.width and r.height >= _VECTOR_PANEL_MIN_HEIGHT:
+            continue  # a shaded panel or tint behind text, not artwork
         rects.append((r.x0, r.y0, r.x1, r.y1))
 
     if not rects:
         return []
 
+    min_side = _PRINT_VECTOR_MIN_SIDE if print_ready else _VECTOR_MIN_SIDE
+    min_area = _PRINT_VECTOR_MIN_AREA if print_ready else _VECTOR_MIN_AREA
+    min_shapes = _PRINT_VECTOR_MIN_PRIMITIVES if print_ready else _VECTOR_MIN_PRIMITIVES
     figures: list[ImageInfo] = []
     for bbox, count in _cluster_rects(rects, _VECTOR_CLUSTER_GAP):
         w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        if count < _VECTOR_MIN_PRIMITIVES:
+        if count < min_shapes:
             continue
-        if w < _VECTOR_MIN_SIDE or h < _VECTOR_MIN_SIDE or w * h < _VECTOR_MIN_AREA:
+        if w < min_side or h < min_side or w * h < min_area:
             continue
         if (w * h) / page_area > _VECTOR_MAX_PAGE_FRACTION:
             continue
@@ -159,7 +189,7 @@ def get_vector_figures(doc: fitz.Document, page_index: int) -> list[ImageInfo]:
     return figures
 
 
-def get_figures(doc: fitz.Document, page_index: int) -> list[ImageInfo]:
+def get_figures(doc: fitz.Document, page_index: int, print_ready: bool = False) -> list[ImageInfo]:
     """Everything on the page that reads as a figure: embedded raster images
     plus vector-drawn illustrations.
 
@@ -176,8 +206,15 @@ def get_figures(doc: fitz.Document, page_index: int) -> list[ImageInfo]:
     rasters = get_images(doc, page_index)
     table_bboxes = _page_table_bboxes(doc, page_index)
     vectors = []
-    for fig in get_vector_figures(doc, page_index):
+    for fig in get_vector_figures(doc, page_index, print_ready=print_ready):
         if any(_overlap_fraction(fig.bbox, r.bbox) > 0.6 for r in rasters):
+            continue
+        # The coloured tiles behind a column of embedded app icons chain into
+        # one tall drawn "figure" that is really those images' backgrounds.
+        if print_ready and (
+            _covered_fraction(fig.bbox, [r.bbox for r in rasters]) > _PRINT_RASTER_COVER
+            or sum(1 for r in rasters if _overlap_fraction(r.bbox, fig.bbox) > 0.8) >= 2
+        ):
             continue
         # Covered by the tables on the page - one table, or (as with a stacked
         # pair of spec tables sharing a border) several that together fill the
@@ -274,11 +311,11 @@ def is_single_column_region(rows: list) -> bool:
     return _column_count(rows) < 2
 
 
-def _looks_like_real_table(rows: list, cells: list | None = None) -> bool:
+def _looks_like_real_table(rows: list, cells: list | None = None, allow_tall_cells: bool = False) -> bool:
     has_text = False
     for row in rows or []:
         for cell in row or []:
-            if cell and cell.count("\n") > _MAX_CELL_NEWLINES:
+            if cell and cell.count("\n") > _MAX_CELL_NEWLINES and not allow_tall_cells:
                 return False
             if cell and cell.strip():
                 has_text = True
@@ -361,6 +398,11 @@ class _PageTableCache:
                                 # text alone says nothing about geometry.
                                 "cells": cells,
                                 "is_table": _looks_like_real_table(rows, cells),
+                                # A clean grid whose only fault is a tall cell -
+                                # Staging's "UI element" table carries a whole
+                                # WARNING callout inside one description cell.
+                                "is_tall_table": _looks_like_real_table(rows, cells, allow_tall_cells=True)
+                                and _is_well_formed_grid(rows),
                             }
                         )
                 except Exception:
@@ -432,8 +474,18 @@ def _measure_dark_coverage(doc: "fitz.Document", page_index: int, bbox: tuple) -
     return best
 
 
+def _is_well_formed_grid(rows: list) -> bool:
+    """At least 3 rows, and most of them filled in 2 or more columns - a data
+    table, not prose pdfplumber boxed into one tall phantom cell."""
+    rows = [r for r in rows or [] if r]
+    if len(rows) < 3:
+        return False
+    filled = sum(1 for r in rows if sum(1 for c in r if (c or "").strip()) >= 2)
+    return filled >= 0.8 * len(rows)
+
+
 def get_tables(
-    pdf_path: str, page_index: int, doc: "fitz.Document | None" = None
+    pdf_path: str, page_index: int, doc: "fitz.Document | None" = None, allow_tall_cells: bool = False
 ) -> list[dict[str, Any]]:
     """Extract tables (with bboxes) for a single page using pdfplumber.
 
@@ -449,7 +501,8 @@ def get_tables(
     return [
         {"bbox": r["bbox"], "rows": r["rows"], "cells": r["cells"]}
         for r in _TABLE_CACHE.page_regions(pdf_path, page_index)
-        if r["is_table"] and not (doc is not None and _looks_like_ui_mockup(doc, page_index, r["bbox"]))
+        if (r["is_table"] or (allow_tall_cells and r.get("is_tall_table")))
+        and not (doc is not None and _looks_like_ui_mockup(doc, page_index, r["bbox"]))
     ]
 
 

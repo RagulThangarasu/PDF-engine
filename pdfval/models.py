@@ -74,6 +74,16 @@ class ValidationReport:
     actual_path: str
     checks: list[CheckResult] = field(default_factory=list)
     toc_comparison: list[dict[str, Any]] = field(default_factory=list)
+    # Data behind chapters.html - each L1 chapter whole, both sides (set by
+    # cli.run). Not part of to_dict(): it carries rendered page images, and the
+    # JSON report is a record of findings, not of the browser's pictures.
+    chapter_comparison: list[dict[str, Any]] = field(default_factory=list)
+    # Data behind issues.html - every issue by category, and both documents'
+    # page renders (set by cli.run). Not part of to_dict() either.
+    issue_report: dict[str, Any] | None = None
+    # Data behind pdf.html - both PDFs whole, every finding placed on its
+    # page (set by cli.run). Not part of to_dict(), for the same reason.
+    pdf_view: dict[str, Any] | None = None
     # Full Prod-vs-Stage bookmark comparison behind toc.html (set by cli.run).
     toc_report: dict[str, Any] | None = None
 

@@ -24,6 +24,7 @@ from flask import (
 )
 from werkzeug.exceptions import RequestEntityTooLarge
 
+from pdfval import ai_review
 from pdfval.cli import run
 from pdfval.report.html_report import generate_reports
 
@@ -50,11 +51,13 @@ _RUN_LOCK = threading.Lock()
 # run_ids not yet finished, in submission order - lets a queued job report a
 # real position ("2 comparisons ahead of you") instead of a flat "waiting".
 _QUEUE_ORDER: list[str] = []
-# The validation report, the side-by-side section browser and the TOC
-# comparison are exposed. report.json is still written (the result page reads
-# it server-side) but is not downloadable; report.pdf is not produced at all.
+# The validation report, the side-by-side section browser, the chapter
+# comparison (with its page renders under chapters/), the full-PDF viewer
+# (pdf.html, pages under pdfview/) and the TOC comparison are
+# exposed. report.json is still written (the result page reads it server-side)
+# but is not downloadable; report.pdf is not produced at all.
 _DOWNLOAD_NAME_RE = re.compile(
-    r"^((report|sections|toc)\.html|(screenshots|sections)/[\w\-.]+\.(png|jpg))$"
+    r"^((report|sections|toc|chapters|pdf)\.html|issues\.pdf|(screenshots|sections|chapters|pdfview)/[\w\-.]+\.(png|jpg))$"
 )
 
 
@@ -107,7 +110,10 @@ def create_app() -> Flask:
 
         exp_name = _display_name(expected_file.filename, "expected.pdf")
         act_name = _display_name(actual_file.filename, "actual.pdf")
-        _start_job(app, run_id, run_dir, expected_path, actual_path, exp_name, act_name)
+        ai_enabled = request.form.get("ai_review") == "on"
+        if ai_enabled:
+            open(os.path.join(run_dir, "ai_enabled"), "w").close()
+        _start_job(app, run_id, run_dir, expected_path, actual_path, exp_name, act_name, ai_enabled)
         return redirect(url_for("processing", run_id=run_id))
 
     @app.post("/runs/<run_id>/rerun")
@@ -125,7 +131,8 @@ def create_app() -> Flask:
             busy = run_id in _JOBS and not _JOBS[run_id].get("done")
         if not busy:
             names = _run_names(run_dir)
-            _start_job(app, run_id, run_dir, expected_path, actual_path, *names)
+            ai_enabled = os.path.isfile(os.path.join(run_dir, "ai_enabled"))
+            _start_job(app, run_id, run_dir, expected_path, actual_path, *names, ai_enabled)
         return redirect(url_for("processing", run_id=run_id))
 
     @app.get("/runs/<run_id>/processing")
@@ -155,15 +162,53 @@ def create_app() -> Flask:
             abort(404)
         with open(json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return render_template("result.html", run_id=run_id, report=data)
+        categories, total = _category_counts(data)
+        ai_notes = None
+        try:
+            with open(os.path.join(RUNS_DIR, run_id, "ai_review.json"), "r", encoding="utf-8") as f:
+                ai_notes = json.load(f)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            ai_notes = None
+        return render_template("result.html", run_id=run_id, report=data, categories=categories, total=total,
+                              ai_notes=ai_notes)
 
     @app.get("/runs/<run_id>/<path:filename>")
     def download(run_id: str, filename: str):
         if not _RUN_ID_RE.match(run_id) or not _DOWNLOAD_NAME_RE.match(filename):
             abort(404)
-        return send_from_directory(os.path.join(RUNS_DIR, run_id), filename)
+        # A rerun rewrites pdf.html / report.json in place, same file name -
+        # without this a browser that already cached the old copy (or an
+        # in-flight "is this stale?" check that never lands) keeps showing the
+        # pre-rerun issues, which reads as the fix not having worked at all.
+        response = send_from_directory(os.path.join(RUNS_DIR, run_id), filename)
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return response
 
     return app
+
+
+def _category_counts(data: dict) -> tuple[list[dict] | None, int]:
+    """(issues per category, total) from report.json - the same categories
+    pdf.html's nav files each issue under, so the two agree. None for a run made
+    before issues carried a category, whose result page lists its checks instead.
+    """
+    from pdfval.validators.chapter import CATEGORIES
+
+    counts = {c["label"]: 0 for c in CATEGORIES}
+    total = uncategorised = 0
+    for check in data.get("checks") or []:
+        for issue in check.get("issues") or []:
+            total += 1
+            label = (issue.get("details") or {}).get("category")
+            if label in counts:
+                counts[label] += 1
+            else:
+                uncategorised += 1
+    if uncategorised and uncategorised == total:
+        return None, total
+    return [{"label": c["label"], "help": c["help"], "count": counts[c["label"]]} for c in CATEGORIES], total
 
 
 def _is_valid_pdf(file_storage) -> bool:
@@ -227,10 +272,37 @@ def _queue_position(run_id: str) -> int:
             return 1
 
 
+def _run_ai_review(run_dir: str, run_id: str, expected_path: str, actual_path: str) -> None:
+    """The optional AI pass - runs after the deterministic report is already
+    written, and can never fail the run: any error here (Ollama not running,
+    model missing, a page timing out) is swallowed and simply leaves no
+    ai_review.json, so the page just doesn't show that section.
+    """
+    try:
+        import fitz
+        if not ai_review.available():
+            return
+        exp_pages = fitz.open(expected_path).page_count
+        act_pages = fitz.open(actual_path).page_count
+        page_count = min(exp_pages, act_pages)
+        pdfview_dir = os.path.join(run_dir, "pdfview")
+
+        def cb(i: int, n: int) -> None:
+            _set_progress(run_dir, run_id, percent=98, label=f"AI visual review — page {i}/{n}")
+
+        _set_progress(run_dir, run_id, percent=98, label="AI visual review starting…")
+        notes = ai_review.review_pages(pdfview_dir, page_count, progress_cb=cb)
+        with open(os.path.join(run_dir, "ai_review.json"), "w", encoding="utf-8") as f:
+            json.dump({"model": ai_review.VISION_MODEL, "notes": notes}, f)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+
+
 _QUEUE_POLL_SECONDS = 3.0
 
 
-def _start_job(app, run_id, run_dir, expected_path, actual_path, exp_name, act_name) -> None:
+def _start_job(app, run_id, run_dir, expected_path, actual_path, exp_name, act_name,
+               ai_enabled: bool = False) -> None:
     with _JOBS_LOCK:
         _QUEUE_ORDER.append(run_id)
     _set_progress(run_dir, run_id, percent=1, label="Starting…", done=False, error=None,
@@ -262,9 +334,11 @@ def _start_job(app, run_id, run_dir, expected_path, actual_path, exp_name, act_n
             _set_progress(run_dir, run_id, percent=97, label="Writing report files")
             with app.test_request_context():
                 generate_reports(
-                    report, run_dir, formats=("json", "html", "sections", "toc"),
+                    report, run_dir, formats=("json", "pdfview", "toc"),
                     new_comparison_url=url_for("upload_form"),
                 )
+            if ai_enabled:
+                _run_ai_review(run_dir, run_id, expected_path, actual_path)
             _set_progress(run_dir, run_id, percent=100, label="Done", done=True)
         except Exception as exc:  # noqa: BLE001
             traceback.print_exc()

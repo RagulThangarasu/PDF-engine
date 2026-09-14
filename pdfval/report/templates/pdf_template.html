@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF comparison — Production vs Staging</title>
+<style>
+  :root { --line: #e3e6eb; --muted: #667085; --ink: #16181d; --accent: #2d6cdf;
+          --box: rgba(239, 68, 68, .75); --box-on: #dc2626;
+          --box-critical: rgba(153, 27, 27, .9); --box-critical-on: #7f1d1d;
+          --box-minor: rgba(230, 130, 0, .85); --box-minor-on: #e68200;
+          --c-content: #b45309; --c-images: #7c3aed; --c-links: #2563eb;
+          --c-lists: #0f766e; --c-bold: #475467; --c-tables: #15803d;
+          --c-formatting: #be185d; }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; margin: 0; }
+  body { font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif; color: var(--ink); background: #eef0f3;
+         display: flex; flex-direction: column; font-size: 14px; }
+  .cat-content { --c: var(--c-content); } .cat-images { --c: var(--c-images); } .cat-links { --c: var(--c-links); }
+  .cat-lists { --c: var(--c-lists); } .cat-bold { --c: var(--c-bold); } .cat-tables { --c: var(--c-tables); }
+  .cat-formatting { --c: var(--c-formatting); }
+
+  .topbar { background: #fff; border-bottom: 1px solid var(--line); padding: 8px 14px; display: flex;
+            flex-wrap: wrap; gap: 8px 14px; align-items: center; }
+  .topbar .files { flex: 1 1 280px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+                   font-size: 13px; color: var(--muted); }
+  .topbar .files b { color: var(--ink); }
+  .verdict { font-weight: 700; font-size: 12px; border-radius: 999px; padding: 3px 10px; white-space: nowrap; }
+  .verdict.fail { background: #fdecea; color: #b42318; }
+  .verdict.pass { background: #e8f5ee; color: #067647; }
+  .ctl { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 13px; }
+  .ctl label { display: inline-flex; gap: 4px; align-items: center; white-space: nowrap; }
+  .ctl button, .links a { font: inherit; font-size: 13px; padding: 4px 10px; border-radius: 6px; background: #eef1f6;
+                          color: var(--ink); text-decoration: none; border: 0; cursor: pointer; }
+  .ctl select { font: inherit; font-size: 13px; padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px;
+                max-width: 240px; background: #fff; }
+  .links { display: flex; gap: 6px; }
+  .links a.on { background: var(--accent); color: #fff; }
+  .main { flex: 1; display: flex; min-height: 0; }
+  .ctl button.on { background: var(--ink); color: #fff; }
+  .zoomval { font-variant-numeric: tabular-nums; min-width: 3.2em; text-align: center; }
+
+  /* ---- the issues ---- */
+  nav { width: 370px; flex: none; background: #fff; border-right: 1px solid var(--line); display: flex;
+        flex-direction: column; min-height: 0; }
+  .cats { display: flex; flex-wrap: wrap; gap: 5px; padding: 8px; border-bottom: 1px solid var(--line); }
+  .chip { font: inherit; font-size: 12px; border: 1px solid var(--line); background: #fff; border-radius: 999px;
+          padding: 3px 9px; cursor: pointer; color: var(--ink); white-space: nowrap; }
+  .chip b { font-variant-numeric: tabular-nums; margin-left: 3px; }
+  .chip.zero b { color: #067647; }
+  .chip.on { background: var(--ink); border-color: var(--ink); color: #fff; }
+  .chip.on b { color: #fff; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--c, var(--ink));
+         margin-right: 5px; vertical-align: 0; }
+  nav .search { padding: 8px; border-bottom: 1px solid var(--line); }
+  nav input { width: 100%; font: inherit; font-size: 13px; padding: 6px 8px; border: 1px solid #ccd; border-radius: 6px; }
+  nav .list { overflow: auto; flex: 1; }
+  details.grp > summary { position: sticky; top: 0; z-index: 1; background: #f7f8fa; padding: 7px 10px; font-weight: 700;
+                          cursor: pointer; border-bottom: 1px solid var(--line); color: var(--c); }
+  details.grp > summary .cnt { float: right; color: var(--ink); background: #eef1f6; border-radius: 10px;
+                               padding: 0 7px; font-size: 12px; }
+  .grp .help { font-size: 11px; color: var(--muted); padding: 6px 10px; border-bottom: 1px solid #f0f1f4; line-height: 1.45; }
+  .it { padding: 8px 10px 9px 12px; border-bottom: 1px solid #f0f1f4; cursor: pointer; border-left: 3px solid transparent; }
+  .it:hover { background: #fafbfc; }
+  .it.on { background: #fff5f5; border-left-color: var(--box-on); }
+  .it .m { font-weight: 600; }
+  .it .n { color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 5px; }
+  .it .h, .it .pg { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .it .d { font-size: 12px; margin-top: 3px; line-height: 1.45; }
+  .it .t { font-size: 12px; margin-top: 3px; line-height: 1.5; overflow-wrap: anywhere; display: -webkit-box;
+           -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+  .it.on .t { display: block; }
+  .it .t b { font-weight: 600; }
+  mark.red { background: #fbd5d5; color: #8a1111; font-weight: 700; border-radius: 2px; padding: 0 1px; }
+  .gap { color: #b42318; font-weight: 800; }
+  .empty { padding: 16px; color: var(--muted); }
+
+  /* ---- the two documents ---- */
+  .panes { flex: 1; display: flex; min-width: 0; position: relative; }
+  .pane { flex: 1; display: flex; flex-direction: column; min-width: 0; border-right: 1px solid var(--line); }
+  .pane > .ph { background: #fff; padding: 6px 12px; border-bottom: 1px solid var(--line); font-weight: 700;
+                display: flex; gap: 8px; align-items: baseline; min-width: 0; }
+  .pane > .ph span { color: var(--muted); font-weight: 400; font-size: 13px; }
+  .pane > .ph .now { margin-left: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .scroll { overflow: auto; flex: 1; padding: 22px 12px 60vh; }
+  /* A page and, beside it, its comment column - comments never sit on the page. */
+  /* Pages are shown at the PDF's own size - 1pt is 96/72 CSS px at 100%, as a PDF
+     reader shows it - never stretched to the pane: an A5 page stays smaller than
+     an A4 one. A page wider than its pane scrolls sideways. */
+  .pagewrap { position: relative; display: flex; gap: 10px; align-items: flex-start; margin: 0 auto 26px; width: max-content; }
+  .lines { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+  .link { stroke: var(--box); stroke-width: 1.25; }
+  .link.hover, .link.on { stroke: var(--box-on); stroke-width: 2; }
+  .link.minor { stroke: var(--box-minor); }
+  .link.minor.hover, .link.minor.on { stroke: var(--box-minor-on); }
+  .link.critical { stroke: var(--box-critical); stroke-width: 1.75; }
+  .link.critical.hover, .link.critical.on { stroke: var(--box-critical-on); }
+  /* --pscale: Production is scaled up to Staging's page size when the two
+     were set on different paper sizes (an A5 baseline against an A4 rebuild),
+     so the same paragraph lines up at roughly the same screen position and
+     size on both sides instead of reading smaller just because its source
+     page was smaller. Staging itself is never rescaled - it stays 1. */
+  .page { position: relative; flex: none; width: calc(var(--pw) * 1px * 96 / 72 * var(--zoom, 1) * var(--pscale, 1));
+          background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,.15); }
+  .gutter { position: relative; flex: 0 0 var(--gutter, 190px); align-self: stretch; }
+  .no-notes .gutter { flex-basis: 0; }
+  /* Staging's comment column sits on the left of its pages, so both columns meet
+     in the middle - each issue's single comment is between its two boxes. */
+  #stage .pagewrap { flex-direction: row-reverse; }
+  /* A page wider than its pane would push its comments out of sight: the column
+     sticks to the pane's inner edge instead, over the page's blank margin. */
+  .gutter { position: sticky; z-index: 4; }
+  #prod .gutter { right: 0; }
+  #stage .gutter { left: 0; }
+  .note .ttl { font-weight: 700; margin-bottom: 2px; }
+  .note ul { margin: 0; padding-left: 14px; }
+  .note li { margin: 1px 0; }
+  .note .pp { color: var(--muted); font-size: 11px; margin-top: 3px; font-weight: 400; }
+  /* The line from the other document's box, across the panes, to the same comment. */
+  .xlines { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; z-index: 6; }
+  .xlink { stroke: var(--box-on); stroke-width: 1.5; stroke-dasharray: 5 3; }
+  .page img { display: block; width: 100%; height: 100%; }
+  .page .no { position: absolute; top: 4px; right: 6px; font-size: 11px; color: var(--muted);
+              background: rgba(255,255,255,.85); padding: 0 4px; border-radius: 3px; }
+  /* An issue on the page: a light red outline - never a fill, the text under it
+     stays exactly as printed - with a black comment saying what is wrong there.
+     Orange (never failing the run) for how something is laid out - a list's
+     indent, a figure's alignment - never for what the document says or lacks. */
+  .box { position: absolute; border: 2px solid var(--box); border-radius: 3px; cursor: pointer; }
+  .box:hover { border-color: var(--box-on); }
+  .box.on { border: 3px solid var(--box-on); box-shadow: 0 0 0 3px rgba(239, 68, 68, .2); z-index: 3; }
+  .box.minor { border-color: var(--box-minor); }
+  .box.minor:hover { border-color: var(--box-minor-on); }
+  .box.minor.on { border-color: var(--box-minor-on); box-shadow: 0 0 0 3px rgba(230, 130, 0, .2); }
+  /* Critical (level 1 - what the document says or lacks outright) draws a
+     darker, thicker red than every other failing finding, so it is the one a
+     reader's eye lands on first among the rest. */
+  .box.critical { border-color: var(--box-critical); border-width: 3px; }
+  .box.critical:hover { border-color: var(--box-critical-on); }
+  .box.critical.on { border-color: var(--box-critical-on); box-shadow: 0 0 0 3px rgba(153, 27, 27, .25); }
+  /* No number badge — the box is tied to its comment by the line drawn between them. */
+  .note { position: absolute; left: 0; right: 0; font-size: 12px; line-height: 1.35; color: #111; background: #fff;
+          border: 1px solid #f1b4b4; border-left: 3px solid var(--box); border-radius: 4px; padding: 4px 6px;
+          cursor: pointer; overflow-wrap: anywhere; box-shadow: 0 1px 2px rgba(0,0,0,.06); }
+  .note:hover, .note.hover { border-color: var(--box-on); }
+  .note.on { border-color: var(--box-on); border-left-width: 4px; background: #fff5f5; font-weight: 600; z-index: 2; }
+  .box.hover { border-color: var(--box-on); box-shadow: 0 0 0 3px rgba(239, 68, 68, .2); }
+  .note.minor { border: 1px solid #f5d7a8; border-left: 3px solid var(--box-minor); }
+  .note.minor:hover, .note.minor.hover { border-color: var(--box-minor-on); }
+  .note.minor.on { border-color: var(--box-minor-on); background: #fff8ec; }
+  .note.critical { border-left: 4px solid var(--box-critical); font-weight: 600; }
+  .note.critical:hover, .note.critical.hover { border-color: var(--box-critical-on); }
+  .note.critical.on { border-color: var(--box-critical-on); background: #fdf0f0; }
+  .box.minor.hover { border-color: var(--box-minor-on); box-shadow: 0 0 0 3px rgba(230, 130, 0, .2); }
+  .box.critical.hover { border-color: var(--box-critical-on); box-shadow: 0 0 0 3px rgba(153, 27, 27, .25); }
+  .no-notes .note, .no-notes .lines { display: none; }
+  .hide-others .box:not(.on), .hide-others .note:not(.on), .hide-others .link:not(.on) { display: none; }
+  body[data-cat="content"] .box:not(.cat-content), body[data-cat="images"] .box:not(.cat-images),
+  body[data-cat="links"] .box:not(.cat-links), body[data-cat="lists"] .box:not(.cat-lists),
+  body[data-cat="bold"] .box:not(.cat-bold), body[data-cat="tables"] .box:not(.cat-tables), body[data-cat="formatting"] .box:not(.cat-formatting),
+  body[data-cat="content"] .note:not(.cat-content), body[data-cat="images"] .note:not(.cat-images),
+  body[data-cat="links"] .note:not(.cat-links), body[data-cat="lists"] .note:not(.cat-lists),
+  body[data-cat="bold"] .note:not(.cat-bold), body[data-cat="tables"] .note:not(.cat-tables), body[data-cat="formatting"] .note:not(.cat-formatting),
+  body[data-cat="content"] .link:not(.cat-content), body[data-cat="images"] .link:not(.cat-images),
+  body[data-cat="links"] .link:not(.cat-links), body[data-cat="lists"] .link:not(.cat-lists),
+  body[data-cat="bold"] .link:not(.cat-bold), body[data-cat="tables"] .link:not(.cat-tables), body[data-cat="formatting"] .link:not(.cat-formatting) { display: none; }
+  @media (max-width: 900px) {
+    .main { flex-direction: column; }
+    nav { width: auto; height: 38vh; border-right: 0; border-bottom: 1px solid var(--line); }
+    .panes { min-height: 60vh; }
+    .pagewrap { --gutter: 130px; }
+  }
+</style>
+</head>
+<body data-cat="">
+{%- set prod_name = expected_path.replace('\\', '/').split('/')|last -%}
+{%- set stage_name = actual_path.replace('\\', '/').split('/')|last -%}
+  <div class="topbar">
+    <div class="files"><b>Production</b> (baseline) <span title="{{ expected_path }}">{{ prod_name }}</span> &nbsp;→&nbsp; <b>Staging</b> <span title="{{ actual_path }}">{{ stage_name }}</span></div>
+    {% if view.passed %}<span class="verdict pass">PASS · no issues</span>
+    {% else %}<span class="verdict fail">FAIL · {{ view.total }} {{ 'issue' if view.total == 1 else 'issues' }}</span>{% endif %}
+    <div class="ctl">
+      <button id="navBtn" onclick="toggleNav()" title="Show or hide the list of issues">☰ Issues</button>
+      <button onclick="step(-1)" title="Previous issue (k)">↑ Prev</button>
+      <button onclick="step(1)" title="Next issue (j)">↓ Next</button>
+      <label title="Scrolling one document brings the other to the same heading"><input type="checkbox" id="sync" checked> Scroll together</label>
+      <label><input type="checkbox" id="notes" checked> Comments</label>
+      <label><input type="checkbox" id="onlyActive"> Selected issue only</label>
+      <select id="heading" onchange="jumpHeading(this.value)">
+        <option value="">Go to heading…</option>
+        {% for h in view.anchors %}<option value="{{ loop.index0 }}">{{ '— ' * (h.level - 1) }}{{ h.title }}</option>{% endfor %}
+      </select>
+      <button onclick="zoom(-0.1)" title="Zoom out">−</button><span class="zoomval" id="zoomval">100%</span><button onclick="zoom(0.1)" title="Zoom in">+</button><button onclick="zoom(0)" title="Show pages at the PDF's actual size">Actual size</button>
+    </div>
+    <div class="links">
+      <a class="on" href="pdf.html">PDF</a>
+      <a href="toc.html">TOC</a>
+      <a href="issues.pdf" download="issues.pdf" title="Every issue with its topic, description and both screenshots">⬇ Issues PDF</a>
+    </div>
+  </div>
+  <div class="main">
+    <nav id="nav" hidden>
+      <div class="cats">
+        <button class="chip on" data-cat="" onclick="setCat('')">All<b>{{ view.total }}</b></button>
+        {% for c in view.categories %}
+        <button class="chip cat-{{ c.key }}{{ ' zero' if not c.count }}" data-cat="{{ c.key }}" onclick="setCat('{{ c.key }}')" title="{{ c.help }}"><span class="dot"></span>{{ c.label }}<b>{{ c.count }}</b></button>
+        {% endfor %}
+      </div>
+      <div class="search"><input id="q" type="search" placeholder="Search issues…" oninput="filterNav()"></div>
+      <div class="list" id="list"></div>
+    </nav>
+    <div class="panes">
+      <div class="pane"><div class="ph">Production <span>baseline · {{ view.prod_pages|length }} pages</span><span class="now" id="now"></span></div><div class="scroll" id="prod"></div></div>
+      <div class="pane"><div class="ph">Staging <span>{{ view.stage_pages|length }} pages</span></div><div class="scroll" id="stage"></div></div>
+    </div>
+  </div>
+<script>
+const VIEW = {{ view|tojson }};
+const issues = VIEW.issues;
+const ANCHORS = VIEW.anchors;
+const SIDES = ['prod', 'stage'];
+const panes = { prod: document.getElementById('prod'), stage: document.getElementById('stage') };
+const PAGE_H = { prod: {}, stage: {} };
+VIEW.prod_pages.forEach(p => { PAGE_H.prod[p.n] = p.h; });
+VIEW.stage_pages.forEach(p => { PAGE_H.stage[p.n] = p.h; });
+// Production is shown at Staging's physical page size when the two paper
+// sizes differ (an A5 baseline against an A4 rebuild) - never the other way
+// round, and never shrunk, only ever grown up to Staging's size.
+const prodRef = Math.max(1, ...VIEW.prod_pages.map(p => p.h));
+const stageRef = Math.max(1, ...VIEW.stage_pages.map(p => p.h));
+const PSCALE = Math.max(1, stageRef / prodRef);
+let active = null, z = 1;
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+const boxesOf = (it, side) => side === 'prod' ? it.prod_boxes : it.stage_boxes;
+const other = side => side === 'prod' ? 'stage' : 'prod';
+
+// ---- pages, with every issue outlined on them ----
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const LINKS = []; // {box, note, line, wrap} - redrawn on every relayout
+const CROSS = []; // {box, id} - the other document's boxes, lined to the comment across the panes
+const homeOf = it => (it.prod_boxes.length ? 'prod' : 'stage');
+function pagesOf(it, side) { return [...new Set(boxesOf(it, side).map(b => b.page))]; }
+// What the comment says: the issue, each spot that differs on this page, and
+// where it is on both documents.
+function noteFor(it, side, page) {
+  const note = el('div', 'note cat-' + it.category + (it.minor ? ' minor' : '') + (it.critical ? ' critical' : ''));
+  note.appendChild(el('div', 'ttl', it.title));
+  const own = [...new Set(boxesOf(it, side).filter(b => b.page === page && b.note).map(b => b.note))];
+  const listed = it.changes && it.changes.length;
+  const lines = listed ? it.changes : own.length ? own : [side === 'prod' ? it.comment_prod : it.comment_stage].filter(Boolean);
+  const cap = listed ? 20 : 4;
+  if (lines.length) {
+    const ul = el(listed ? 'ol' : 'ul');
+    lines.slice(0, cap).forEach(t => ul.appendChild(el('li', null, t)));
+    if (lines.length > cap) ul.appendChild(el('li', null, '+ ' + (lines.length - cap) + ' more'));
+    note.appendChild(ul);
+  } else if (it.description) {
+    note.appendChild(el('div', null, it.description));
+  }
+  const where = SIDES.map(sd => {
+    const label = sd === 'prod' ? 'Production' : 'Staging';
+    const ps = pagesOf(it, sd);
+    return ps.length ? label + ' p. ' + ps.slice(0, 3).join(', ') + (ps.length > 3 ? '…' : '') : 'nothing in ' + label;
+  });
+  note.appendChild(el('div', 'pp', where.join('  ↔  ')));
+  return note;
+}
+let hovered = null;
+function hoverId(id, on) {
+  hovered = on ? id : null;
+  document.querySelectorAll('.box[data-id="' + id + '"], .note[data-id="' + id + '"], .link[data-id="' + id + '"]')
+    .forEach(e => e.classList.toggle('hover', on));
+  drawCross();
+}
+function buildPane(side, pages) {
+  const root = panes[side];
+  const byPage = {};
+  pages.forEach(p => {
+    const d = el('div', 'page'); d.id = side + '-p' + p.n;
+    d.style.aspectRatio = p.w + ' / ' + p.h;
+    d.style.setProperty('--pw', p.w);
+    if (side === 'prod' && PSCALE !== 1) d.style.setProperty('--pscale', PSCALE);
+    const img = el('img'); img.loading = 'lazy'; img.src = p.src; img.alt = (side === 'prod' ? 'Production' : 'Staging') + ' page ' + p.n;
+    d.append(img, el('span', 'no', 'p. ' + p.n));
+    const wrap = el('div', 'pagewrap'), gutter = el('div', 'gutter');
+    const svg = document.createElementNS(SVG_NS, 'svg'); svg.setAttribute('class', 'lines');
+    wrap.append(d, svg, gutter);
+    root.appendChild(wrap);
+    byPage[p.n] = { el: d, gutter, wrap, svg, w: p.w, h: p.h };
+  });
+  issues.forEach(it => {
+    const home = homeOf(it);
+    const notes = new Map();
+    boxesOf(it, side).forEach(b => {
+      const pg = byPage[b.page];
+      if (!pg) return;
+      const [x0, y0, x1, y1] = b.bbox, pad = 2;
+      const box = el('div', 'box cat-' + it.category + (it.minor ? ' minor' : '') + (it.critical ? ' critical' : ''));
+      box.style.left = ((x0 - pad) / pg.w * 100) + '%';
+      box.style.top = ((y0 - pad) / pg.h * 100) + '%';
+      box.style.width = ((x1 - x0 + 2 * pad) / pg.w * 100) + '%';
+      box.style.height = ((y1 - y0 + 2 * pad) / pg.h * 100) + '%';
+      box.dataset.id = it.id;
+      box.title = it.title + ' — ' + it.description;
+      box.onmouseenter = () => hoverId(it.id, true); box.onmouseleave = () => hoverId(it.id, false);
+      box.onclick = e => { e.stopPropagation(); select(it.id, side); };
+      pg.el.appendChild(box);
+      // ONE comment per issue: it lives beside the Production box (Staging's when
+      // Production has none) and says what differs on both sides. The other
+      // document's boxes are tied to it by a line drawn across the panes.
+      if (side !== home) { CROSS.push({ box, id: it.id }); return; }
+      let note = notes.get(b.page);
+      if (!note) {
+        note = noteFor(it, side, b.page);
+        note.dataset.id = it.id;
+        note.dataset.y = y0 / pg.h;
+        note.title = box.title;
+        note.onclick = e => { e.stopPropagation(); select(it.id, side); };
+        note.onmouseenter = () => hoverId(it.id, true); note.onmouseleave = () => hoverId(it.id, false);
+        notes.set(b.page, note);
+        pg.gutter.appendChild(note);
+      }
+      const line = document.createElementNS(SVG_NS, 'line');
+      line.setAttribute('class', 'link cat-' + it.category + (it.minor ? ' minor' : '') + (it.critical ? ' critical' : ''));
+      line.dataset.id = it.id;
+      pg.svg.appendChild(line);
+      LINKS.push({ box, note, line, wrap: pg.wrap });
+    });
+  });
+  if (!pages.length) root.appendChild(el('div', 'empty', 'No pages.'));
+}
+
+// Stack each page's comments down its column: each sits level with its box,
+// pushed down just enough to clear the one above, and pulled back up if the
+// stack would run past the page's bottom.
+function layoutNotes() {
+  document.querySelectorAll('.gutter').forEach(g => {
+    const notes = [...g.children].filter(n => n.offsetParent !== null);
+    const H = g.previousElementSibling.clientHeight, gap = 4;
+    notes.sort((a, b) => a.dataset.y - b.dataset.y);
+    let bottom = 0;
+    const tops = notes.map(n => { const t = Math.max(+n.dataset.y * H, bottom); bottom = t + n.offsetHeight + gap; return t; });
+    let limit = H;
+    for (let i = notes.length - 1; i >= 0; i--) {
+      tops[i] = Math.max(0, Math.min(tops[i], limit - notes[i].offsetHeight));
+      limit = tops[i] - gap;
+    }
+    notes.forEach((n, i) => { n.style.top = tops[i] + 'px'; });
+  });
+  drawLines();
+}
+
+// The line from a box to its comment, redrawn whenever either moves (a note
+// pushed down the stack, a page reflowed by zoom or a window resize).
+function drawLines() {
+  LINKS.forEach(({ box, note, line, wrap }) => {
+    if (box.offsetParent === null || note.offsetParent === null) { line.setAttribute('opacity', '0'); return; }
+    const wr = wrap.getBoundingClientRect(), br = box.getBoundingClientRect(), nr = note.getBoundingClientRect();
+    line.setAttribute('opacity', '1');
+    const right = nr.left >= br.right - 1;
+    line.setAttribute('x1', (right ? br.right : br.left) - wr.left);
+    line.setAttribute('y1', br.top + br.height / 2 - wr.top);
+    line.setAttribute('x2', (right ? nr.left : nr.right) - wr.left);
+    line.setAttribute('y2', nr.top + nr.height / 2 - wr.top);
+  });
+  drawCross();
+}
+
+// Lines across the panes, from the other document's boxes to the issue's one
+// comment - for the selected and the hovered issue only, so the page stays clean.
+let XSVG = null;
+function drawCross() {
+  if (!XSVG) {
+    XSVG = document.createElementNS(SVG_NS, 'svg');
+    XSVG.setAttribute('class', 'xlines');
+    document.querySelector('.panes').appendChild(XSVG);
+  }
+  XSVG.textContent = '';
+  if (document.querySelector('.panes').classList.contains('no-notes')) return;
+  const host = XSVG.getBoundingClientRect();
+  const seen = (r, pr) => r.width > 0 && r.bottom > pr.top && r.top < pr.bottom;
+  const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+  new Set([active, hovered].filter(v => v != null)).forEach(id => {
+    const it = issues[id], home = homeOf(it), away = other(home);
+    const hr = panes[home].getBoundingClientRect(), ar = panes[away].getBoundingClientRect();
+    const notes = [...panes[home].querySelectorAll('.note[data-id="' + id + '"]')]
+      .filter(n => n.offsetParent !== null).map(n => n.getBoundingClientRect()).filter(r => seen(r, hr));
+    if (!notes.length) return;
+    CROSS.forEach(c => {
+      if (c.id !== id || c.box.offsetParent === null) return;
+      const br = c.box.getBoundingClientRect();
+      if (!seen(br, ar)) return;
+      const cy = br.top + br.height / 2;
+      const nr = notes.reduce((a, r) => Math.abs(r.top + r.height / 2 - cy) < Math.abs(a.top + a.height / 2 - cy) ? r : a);
+      const left = nr.right <= br.left;
+      const ln = document.createElementNS(SVG_NS, 'line');
+      ln.setAttribute('class', 'xlink');
+      ln.setAttribute('x1', clamp(left ? br.left : br.right, ar.left, ar.right) - host.left);
+      ln.setAttribute('y1', clamp(cy, ar.top, ar.bottom) - host.top);
+      ln.setAttribute('x2', clamp(left ? nr.right : nr.left, hr.left, hr.right) - host.left);
+      ln.setAttribute('y2', clamp(nr.top + nr.height / 2, hr.top, hr.bottom) - host.top);
+      XSVG.appendChild(ln);
+    });
+  });
+}
+let layoutQueued = false;
+function relayout() {
+  if (layoutQueued) return;
+  layoutQueued = true;
+  requestAnimationFrame(() => { layoutQueued = false; layoutNotes(); });
+}
+
+// ---- the nav: every issue, by category ----
+function textWithMarks(parts) {
+  const f = document.createDocumentFragment();
+  parts.forEach(p => {
+    if (p.hl) f.appendChild(el('mark', 'red', p.t));
+    else if (p.gap) { const g = el('span', 'gap', '‸'); g.title = 'The other document has words here'; f.appendChild(g); }
+    else f.appendChild(document.createTextNode(p.t));
+    f.appendChild(document.createTextNode(' '));
+  });
+  return f;
+}
+function buildNav() {
+  const list = document.getElementById('list');
+  if (!issues.length) { list.appendChild(el('div', 'empty', '✓ No issues — Staging matches Production.')); return; }
+  VIEW.groups.forEach(g => {
+    if (!g.ids.length) return;
+    const det = el('details', 'grp cat-' + g.key); det.open = true;
+    const sum = el('summary', null, g.label); sum.appendChild(el('span', 'cnt', g.ids.length));
+    det.append(sum, el('div', 'help', g.help));
+    g.ids.forEach(id => {
+      const it = issues[id];
+      const row = el('div', 'it cat-' + it.category); row.dataset.id = id;
+      const head = el('div', 'm');
+      head.append(el('span', 'dot'), document.createTextNode(it.title));
+      row.append(head, el('div', 'h', it.chapter + (it.section ? ' › ' + it.section : '')), el('div', 'd', it.description));
+      [['prod_parts', 'Production: '], ['stage_parts', 'Staging: ']].forEach(([key, label]) => {
+        if (!it[key].length) return;
+        const t = el('div', 't'); t.append(el('b', null, label), textWithMarks(it[key])); row.appendChild(t);
+      });
+      if (!it.prod_parts.length && !it.stage_parts.length && it.detail) row.appendChild(el('div', 'd', it.detail));
+      const where = [];
+      if (it.prod_page) where.push('Production p. ' + it.prod_page);
+      if (it.stage_page) where.push('Staging p. ' + it.stage_page);
+      if (it.occurrences > 1) where.push(it.occurrences + ' places');
+      row.appendChild(el('div', 'pg', where.join(' · ')));
+      row.onclick = () => select(id);
+      det.appendChild(row);
+    });
+    list.appendChild(det);
+  });
+}
+
+// ---- scrolling the two documents together, heading by heading ----
+// The reader's place in a pane is the line READ_LINE px below its top. The
+// other pane is put at the same heading, and between two headings it moves in
+// proportion - so a chapter three pages long here and four there stays in step.
+const READ_LINE = 90;
+const quietUntil = { prod: 0, stage: 0 };
+function pageTop(side, page, share) {
+  const p = document.getElementById(side + '-p' + page);
+  if (!p) return null;
+  const pane = panes[side];
+  return p.getBoundingClientRect().top - pane.getBoundingClientRect().top + pane.scrollTop + share * p.clientHeight;
+}
+// Always an instant jump: a smooth scroll outlasts the pause the other pane's
+// sync waits for, the two then correct each other mid-animation, and a jump to
+// an issue far down the document stopped pages short of it.
+function scrollPane(side, top) {
+  quietUntil[side] = performance.now() + 150;
+  panes[side].scrollTo({ top: Math.max(0, top), behavior: 'auto' });
+}
+function follow(side, force) {
+  const to = other(side);
+  const a = ANCHORS.map(h => pageTop(side, h[side].page, h[side].y));
+  const b = ANCHORS.map(h => pageTop(to, h[to].page, h[to].y));
+  const usable = k => a[k] != null && b[k] != null;
+  const line = panes[side].scrollTop + READ_LINE;
+  let at = -1;
+  for (let k = 0; k < ANCHORS.length; k++) { if (!usable(k)) continue; if (a[k] <= line) at = k; else break; }
+  showNow(at);
+  if (!force && !document.getElementById('sync').checked) return;
+  let target;
+  // Before the first shared heading - or with this pane still at its very top,
+  // where its reading line can already sit a little past that heading - keep
+  // the same distance to the first heading in both panes. Interpolating there
+  // stretched a 41px offset into 174px across a long first section.
+  if (at < 0 || (at === ANCHORS.findIndex((_, k) => usable(k)) && panes[side].scrollTop <= 1)) {
+    let first = 0;
+    while (first < ANCHORS.length && !usable(first)) first++;
+    if (first >= ANCHORS.length) return;
+    // Same distance to the first shared heading in both panes - so a cover
+    // and contents pages only one document has are skipped, not scaled into.
+    target = b[first] - (a[first] - line) - READ_LINE;
+  } else {
+    let next = at + 1;
+    while (next < ANCHORS.length && !usable(next)) next++;
+    const a1 = next < ANCHORS.length ? a[next] : panes[side].scrollHeight;
+    const b1 = next < ANCHORS.length ? b[next] : panes[to].scrollHeight;
+    const t = Math.min(1, Math.max(0, (line - a[at]) / Math.max(1, a1 - a[at])));
+    target = b[at] + t * (b1 - b[at]) - READ_LINE;
+  }
+  scrollPane(to, target);
+}
+function showNow(at) {
+  document.getElementById('now').textContent = at < 0 ? '' : ANCHORS[at].title;
+}
+SIDES.forEach(side => {
+  let pending = false;
+  panes[side].addEventListener('scroll', () => {
+    if (performance.now() < quietUntil[side] || pending) return;
+    pending = true;
+    requestAnimationFrame(() => { pending = false; follow(side); });
+  });
+  // Sideways scrolling slides the sticky comment column, so every line is redrawn.
+  panes[side].addEventListener('scroll', () => requestAnimationFrame(drawLines), { passive: true });
+});
+function jumpHeading(value) {
+  if (value === '') return;
+  const h = ANCHORS[+value];
+  SIDES.forEach(side => { const top = pageTop(side, h[side].page, h[side].y); if (top != null) scrollPane(side, top - READ_LINE + 20); });
+  showNow(+value);
+}
+
+// ---- choosing an issue ----
+// The exact same heading, tracked by both documents (ANCHORS), nearest the
+// page the issue is actually on - not just the first heading with this title.
+// Two chapters sharing a sub-heading name ("Settings menu" in two different
+// procedures) picked the wrong one when this only matched by title.
+function findAnchor(title, side, pageHint) {
+  if (!title) return -1;
+  const key = title.trim().toLowerCase();
+  let best = -1, bestDist = Infinity;
+  ANCHORS.forEach((h, i) => {
+    if (h.title.trim().toLowerCase() !== key) return;
+    const dist = pageHint == null ? 0 : Math.abs(h[side].page - pageHint);
+    if (dist < bestDist) { best = i; bestDist = dist; }
+  });
+  return best;
+}
+function select(id, from) {
+  active = id;
+  document.querySelectorAll('.on[data-id]').forEach(e => e.classList.remove('on'));
+  document.querySelectorAll('[data-id="' + id + '"]').forEach(e => e.classList.add('on'));
+  layoutNotes();
+  const it = issues[id];
+  const placed = {};
+  SIDES.forEach(side => {
+    const b = boxesOf(it, side)[0];
+    if (!b) return;
+    placed[side] = true;
+    if (side === from) return;
+    const top = pageTop(side, b.page, b.bbox[1] / (PAGE_H[side][b.page] || 1));
+    if (top != null) scrollPane(side, top - panes[side].clientHeight / 3);
+  });
+  // An issue only one document has a box for: bring the other to the same
+  // heading - the exact tracked anchor when this issue's own section names
+  // one, falling back to positional interpolation only when it doesn't.
+  SIDES.forEach(side => {
+    if (placed[side] || side === from) return;
+    // The matched topic's own start on this side - the same topic, never a
+    // proportional guess that can land in a different one.
+    const anchor = it[side + '_anchor'];
+    if (anchor) {
+      const top = pageTop(side, anchor.page, anchor.y);
+      if (top != null) { scrollPane(side, top - READ_LINE + 20); return; }
+    }
+    if (!placed[other(side)]) return;
+    const b = boxesOf(it, other(side))[0];
+    const idx = findAnchor(it.section || it.chapter, other(side), b ? b.page : null);
+    if (idx >= 0) {
+      const h = ANCHORS[idx];
+      const top = pageTop(side, h[side].page, h[side].y);
+      if (top != null) { scrollPane(side, top - panes[side].clientHeight / 3); return; }
+    }
+    follow(other(side), true);
+  });
+  const row = document.querySelector('.it[data-id="' + id + '"]');
+  if (row) { row.closest('details').open = true; row.scrollIntoView({ block: 'nearest' }); }
+  try { history.replaceState(null, '', '#issue-' + it.n); } catch (e) {}
+  requestAnimationFrame(drawLines);
+}
+function visibleIds() { return [...document.querySelectorAll('.it')].filter(r => !r.hidden).map(r => +r.dataset.id); }
+function step(d) {
+  const ids = visibleIds();
+  if (!ids.length) return;
+  const i = ids.indexOf(active);
+  select(ids[i < 0 ? 0 : Math.min(ids.length - 1, Math.max(0, i + d))]);
+}
+
+// ---- filters ----
+let category = '';
+function setCat(key) {
+  category = key;
+  document.body.dataset.cat = key;
+  document.querySelectorAll('.chip').forEach(c => c.classList.toggle('on', c.dataset.cat === key));
+  filterNav();
+  relayout();
+}
+function filterNav() {
+  const q = document.getElementById('q').value.trim().toLowerCase();
+  document.querySelectorAll('.it').forEach(r => {
+    r.hidden = !((!category || r.classList.contains('cat-' + category)) && (!q || r.textContent.toLowerCase().includes(q)));
+  });
+  document.querySelectorAll('details.grp').forEach(g => {
+    const n = g.querySelectorAll('.it:not([hidden])').length;
+    g.hidden = !n;
+    g.querySelector('.cnt').textContent = n;
+  });
+}
+function zoom(d) {
+  z = d === 0 ? 1 : Math.round(Math.min(4, Math.max(0.25, z + d)) * 100) / 100;
+  document.querySelectorAll('.scroll').forEach(s => s.style.setProperty('--zoom', z));
+  document.getElementById('zoomval').textContent = Math.round(z * 100) + '%';
+  relayout();
+}
+// The issue list starts hidden so both documents get the full width.
+function toggleNav(show) {
+  const nav = document.getElementById('nav');
+  nav.hidden = show === undefined ? !nav.hidden : !show;
+  document.getElementById('navBtn').classList.toggle('on', !nav.hidden);
+  relayout();
+}
+
+buildPane('prod', VIEW.prod_pages);
+buildPane('stage', VIEW.stage_pages);
+buildNav();
+document.getElementById('notes').onchange = e => { document.querySelector('.panes').classList.toggle('no-notes', !e.target.checked); relayout(); };
+document.getElementById('onlyActive').onchange = e => { document.querySelector('.panes').classList.toggle('hide-others', e.target.checked); relayout(); };
+window.addEventListener('resize', relayout);
+layoutNotes();
+// Open with Staging at Production's first heading, not on its cover page.
+follow('prod', true);
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  if (e.key === 'j' || (e.key === 'ArrowDown' && e.altKey)) step(1);
+  if (e.key === 'k' || (e.key === 'ArrowUp' && e.altKey)) step(-1);
+});
+const m = location.hash.match(/^#issue-(\d+)$/);
+if (m && issues[+m[1] - 1]) window.addEventListener('load', () => select(+m[1] - 1));
+</script>
+</body>
+</html>

@@ -12,6 +12,7 @@ import difflib
 import html
 import os
 import re
+from collections import Counter
 
 import fitz
 
@@ -289,6 +290,22 @@ def _key(text: str) -> str:
     return _content._cmp_key(text)
 
 
+# A control character is a glyph the font's encoding could not map - it prints
+# as a bullet or a box, never as a word. Encoding Validation reports it (the
+# section's Formatting finding), so it must not ALSO make the line "reworded".
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _align_key(text: str) -> str:
+    """What two lines are lined up on: `_key` with every space and control
+    character folded out. A reference number set tight against its word in one
+    PDF and a space away in the other ("audio out jack1" / "audio out jack 1")
+    is the same printed line, and so is a line whose bullet one export extracts
+    as an undecodable glyph; aligning on `_key` alone reported every one of them
+    as reworded. The glyph itself is a Formatting finding, so nothing is lost."""
+    return re.sub(r"\s+", "", _CONTROL_CHAR_RE.sub("", _key(text)))
+
+
 def _align(exp: list[str], act: list[str]) -> list[dict]:
     """Line the two sentence lists up. Each row is one of:
       equal   - same sentence on both sides
@@ -296,7 +313,9 @@ def _align(exp: list[str], act: list[str]) -> list[dict]:
       prod    - a sentence only in Production
       stage   - a sentence only in Staging
     """
-    matcher = difflib.SequenceMatcher(a=[_key(s) for s in exp], b=[_key(s) for s in act], autojunk=False)
+    matcher = difflib.SequenceMatcher(
+        a=[_align_key(s) for s in exp], b=[_align_key(s) for s in act], autojunk=False
+    )
     rows: list[dict] = []
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
@@ -377,6 +396,80 @@ def _align_kinds(exp_recs: list[dict], act_recs: list[dict]) -> list[dict]:
     for r in rows:
         r.pop("_at", None)
     return rows
+
+
+# Kinds the two producers break into lines differently: a spec table comes out
+# one row per line in one PDF and several rows run together in the other, a
+# diagram legend as one run or three. Aligned chunk against chunk, those read as
+# "changed" even when every cell is identical - 30 such rows in one 61-page
+# manual, each a wall of struck-through and underlined values.
+_REGROUP_KINDS = (KIND_TABLE, KIND_VALUE, KIND_FIGURE)
+
+
+def _settle_regrouped(rows: list[dict], exp_blob: str = "", act_blob: str = "") -> None:
+    """Mark a table / value / figure-label row that differs only in how its
+    words were grouped into lines as a match.
+
+    Two passes. First, the words of every unmatched row of these kinds are
+    pooled per side; what one pool has and the other lacks is the real
+    difference. A row holding none of those leftover words has every word
+    accounted for on the other side, just in a different grouping.
+
+    Second, a reworded row whose every added and removed fragment is a real
+    run of text (not a lone value) printed verbatim elsewhere in the other
+    document's section: a table's header row that one producer glued to its
+    first data row ("Connection Configuration HDMI 1 (ARC)" against
+    "Connection Configuration"), where the other set that first row as a
+    paragraph the table detector did not claim. A short fragment - "8ms"
+    against "9ms" - is never settled this way: a value printed in some other
+    column proves nothing.
+
+    Either way the row becomes `equal`, tagged `regrouped`. Prose is left out
+    on purpose: two sentences can share every word and still say different
+    things ("do not" moving from one step to the next).
+    """
+    open_rows = [r for r in rows if r.get("kind") in _REGROUP_KINDS and r["op"] != "equal"]
+    if not open_rows:
+        return
+
+    def words(text: str | None) -> list[str]:
+        return _alnum_blob(text or "").split()
+
+    def settle(r: dict) -> None:
+        r["op"] = "equal"
+        r["regrouped"] = True
+        r.pop("word_diff", None)
+
+    prod = Counter(w for r in open_rows for w in words(r.get("prod")))
+    stage = Counter(w for r in open_rows for w in words(r.get("stage")))
+    missing, added = prod - stage, stage - prod
+    for r in open_rows:
+        real = False
+        for w in words(r.get("prod")):
+            if missing[w] > 0:
+                missing[w] -= 1
+                real = True
+        for w in words(r.get("stage")):
+            if added[w] > 0:
+                added[w] -= 1
+                real = True
+        if not real:
+            settle(r)
+
+    def printed_elsewhere(fragment: str, other_blob: str) -> bool:
+        return (
+            len(_alnum_blob(fragment).replace(" ", "")) >= _RUN_MIN_CHARS
+            and _contains_run(other_blob, fragment)
+        )
+
+    for r in open_rows:
+        if r["op"] != "change" or not r.get("word_diff"):
+            continue
+        dels = [op["text"] for op in r["word_diff"] if op["type"] == "del"]
+        ins = [op["text"] for op in r["word_diff"] if op["type"] == "ins"]
+        if (dels or ins) and all(printed_elsewhere(f, act_blob) for f in dels) \
+                and all(printed_elsewhere(f, exp_blob) for f in ins):
+            settle(r)
 
 
 _CJK_CHAR_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿豈-﫿가-힯]")
@@ -523,6 +616,8 @@ def _mark_whole_doc_matches(rows: list[dict], exp_all_blob: str, act_all_blob: s
         return bool(words) and words <= other_words and (n <= 5 or (n <= 14 and len(words) >= 3))
 
     for row in rows:
+        if row.get("kind") == KIND_CHROME:
+            continue  # page furniture is never a difference to reconcile
         if row["op"] == "prod" and row.get("prod") and candidate(row["prod"], act_words):
             row["content_match_text"] = row["prod"]
         elif row["op"] == "stage" and row.get("stage") and candidate(row["stage"], exp_words):
@@ -585,6 +680,8 @@ def _fill_relocated_counterparts(
     for sec in sections:
         for row in sec["rows"]:
             op = row["op"]
+            if row.get("kind") == KIND_CHROME:
+                continue
             if op == "prod" and row.get("prod") and not row.get("stage"):
                 text, index, side = row["prod"], act_index, "stage"
             elif op == "stage" and row.get("stage") and not row.get("prod"):
@@ -771,7 +868,7 @@ def _diff_highlight_boxes(rows: list[dict]) -> tuple[list[dict], list[dict]]:
         """The closest row above or below that does have a location on `side`."""
         for step in range(1, max(2, len(rows))):
             for j in (idx - step, idx + step):
-                if 0 <= j < len(rows):
+                if 0 <= j < len(rows) and rows[j].get("kind") != KIND_CHROME:
                     loc = rows[j].get(side)
                     if loc and loc.get("bbox"):
                         return loc
@@ -779,7 +876,9 @@ def _diff_highlight_boxes(rows: list[dict]) -> tuple[list[dict], list[dict]]:
 
     number = 0
     for i, row in enumerate(rows):
-        if row["op"] == "equal":
+        # Page furniture is listed but never a difference, so it is never boxed:
+        # numbered boxes on page numbers and print slugs buried the real ones.
+        if row["op"] == "equal" or row.get("kind") == KIND_CHROME:
             continue
         pl, sl = row.get("prod_loc"), row.get("stage_loc")
         prod_hit = bool(row.get("prod") and pl and pl.get("bbox"))
@@ -1118,13 +1217,10 @@ def _counts(rows: list[dict]) -> dict:
     for r in rows:
         c[r["op"]] = c.get(r["op"], 0) + 1
     c["diff"] = c["change"] + c["prod"] + c["stage"]
-    # Only the document's actual words turn a section red. A table cell or a
-    # spec value the two producers merely group differently would otherwise
-    # light up half the report - those are still shown, still compared, and
-    # counted in `other_diff`, which the coverage strip reports in its own
-    # words. Page furniture is not counted as a difference at all: a page
-    # number is one-sided in nearly every section because the two documents
-    # paginate differently, which is not news.
+    # Page furniture is not counted as a difference at all: a page number is
+    # one-sided in nearly every section because the two documents paginate
+    # differently, which is not news. It is still listed, folded away with the
+    # matching lines, and counted on its own in `chrome`.
     def n(pred) -> int:
         return sum(1 for r in rows if r["op"] != "equal" and pred(r.get("kind", KIND_PROSE)))
 
@@ -1133,24 +1229,14 @@ def _counts(rows: list[dict]) -> dict:
     c["chrome_diff"] = n(lambda k: k == KIND_CHROME)
     # What the section is judged on - red badge, "differences only" filter.
     c["real_diff"] = c["primary_diff"] + c["other_diff"]
+    # What the "Show matching lines" button folds away: the lines that match,
+    # and the page furniture that is never compared.
+    c["chrome"] = sum(1 for r in rows if r.get("kind", KIND_PROSE) == KIND_CHROME)
+    c["same"] = c["equal"] - sum(
+        1 for r in rows if r["op"] == "equal" and r.get("kind", KIND_PROSE) == KIND_CHROME
+    )
     c["shown"] = len(rows)
     return c
-
-
-def _counts_by_kind(rows: list[dict]) -> list[dict]:
-    """Per-kind tallies, for the section's coverage strip - the reader's proof
-    that nothing was quietly left out."""
-    out = []
-    for kind in KINDS:
-        sub = [r for r in rows if r.get("kind", KIND_PROSE) == kind]
-        if not sub:
-            continue
-        c = _counts(sub)
-        c["kind"] = kind
-        c["label"] = KIND_LABELS[kind]
-        c["total"] = len(sub)
-        out.append(c)
-    return out
 
 
 KIND_LABELS = {
@@ -1839,8 +1925,13 @@ def _format_notes_by_heading(findings: list[dict] | None) -> dict[str, list[dict
         elif msg in _FMT_ENCODING_MSGS:
             kind = "encoded"
             chars = ", ".join(d.get("characters") or []) or "an un-decodable character"
+            # "Possible text encoding issue" is raised against whichever
+            # document carries the glyph - on the ST6504 manual, Production -
+            # so the title names that side rather than assuming Staging.
+            side = d.get("side") or "Staging"
+            other = "Staging" if side == "Production" else "Production"
             title = (
-                f"Un-decodable character in Staging — {chars} where Production has readable text"
+                f"Un-decodable character in {side} — {chars} where {other} has readable text"
                 + (f': “{quote}”' if quote else "") + "."
             )
         else:
@@ -1865,14 +1956,15 @@ def _format_kind_chips(notes: list[dict]) -> list[dict]:
     ]
 
 
-# The categories a section's defects are split into, in the order they are
-# shown. `key` is also the CSS class, so each category keeps one colour
-# everywhere it appears - panel, chip and left-nav marker.
+# The categories a section's non-text findings are split into, in the order
+# they are shown. `key` is also the CSS class, so each category keeps one colour
+# everywhere it appears - finding edge, chip and left-nav marker. The blurb is
+# the chip's tooltip, not a paragraph repeated in every section.
+#
+# There is no "content" category: a section's text differences ARE the rows of
+# its comparison table, and a note restating "4 line(s) reworded" underneath
+# them said the same thing twice. They count toward `issue_total` directly.
 _CATEGORIES = [
-    {"key": "content", "label": "Content", "icon": "✎",
-     "blurb": "What the two documents SAY. Every line is listed in the table above: "
-              "red = in Production only, green = in Staging only, amber = same line, "
-              "different wording."},
     {"key": "table", "label": "Table", "icon": "▦",
      "blurb": "The structure of a table - its columns, rows, cell merges and page breaks - "
               "compared as a grid rather than as loose sentences."},
@@ -1889,60 +1981,11 @@ _CATEGORIES = [
 _CATEGORY_BY_KEY = {c["key"]: c for c in _CATEGORIES}
 
 
-def _content_notes(section: dict) -> list[dict]:
-    """The section's own text differences, as one note - the table above
-    already lists them line by line, so repeating each line here would say the
-    same thing twice.
-
-    Counted over the document's real content only. Page furniture is excluded:
-    a running footer and a page number are one-sided in nearly every section
-    because the two documents paginate differently, and a note announcing "58
-    lines in Production only" about page numbers would drown the section's one
-    genuine reworded sentence.
-    """
-    rows = [r for r in (section.get("rows") or []) if r.get("kind", KIND_PROSE) != KIND_CHROME]
-    counts = _counts(rows)
-    parts = []
-    if counts.get("change"):
-        parts.append(f"{counts['change']} line(s) reworded")
-    if counts.get("prod"):
-        parts.append(f"{counts['prod']} line(s) in Production only")
-    if counts.get("stage"):
-        parts.append(f"{counts['stage']} line(s) in Staging only")
-    if not parts:
-        return []
-    by_kind = ", ".join(
-        f"{kc['diff']} in {kc['label'].lower()}"
-        for kc in _counts_by_kind(rows) if kc["diff"]
-    )
-    return [{
-        "message": "Content differences",
-        "title": "; ".join(parts) + ".",
-        "count": 1,
-        "where": "",
-        "detail": (
-            f"Where they are: {by_kind}. "
-            "Each of these is shown in full in the comparison above, with the changed "
-            "words marked inside the line. A line in one column only is content the "
-            "other document does not have under this heading - use “⇄ Match content” "
-            "to check whether it merely moved elsewhere."
-        ),
-        "fix": "",
-        "review": False,
-        "prod_screenshot": None, "stage_screenshot": None,
-        "prod_caption": "", "stage_caption": "", "prod_note": "", "stage_note": "",
-    }]
-
-
 def _issue_groups(row: dict) -> list[dict]:
-    """A section's defects, split by category, each with its full description.
-
-    This is the answer to "what is wrong in this section, and what does it
-    mean" - one panel, one block per kind of defect, in a fixed order so the
-    same category is always in the same place from section to section.
-    """
+    """A section's non-text findings, split by category, each with its full
+    description - in a fixed order so the same category is always in the same
+    place from section to section."""
     by_key = {
-        "content": _content_notes(row),
         "table": row.get("table_notes") or [],
         "image": row.get("image_notes") or [],
         "numbering": row.get("list_notes") or [],
@@ -1951,18 +1994,18 @@ def _issue_groups(row: dict) -> list[dict]:
     groups = []
     for meta in _CATEGORIES:
         notes = by_key.get(meta["key"]) or []
-        if not notes:
-            continue
-        # Content is ONE note standing for many differing lines, so its count
-        # comes from the lines. `real_diff`, not `diff`: the same number the
-        # section's red badge and the "differences only" filter use, so the
-        # panel cannot claim more differences than the nav does.
-        count = (
-            (row.get("counts") or {}).get("real_diff", 0) if meta["key"] == "content"
-            else sum(n.get("count", 1) for n in notes)
-        )
-        groups.append({**meta, "notes": notes, "count": count})
+        if notes:
+            groups.append({**meta, "notes": notes, "count": sum(n.get("count", 1) for n in notes)})
     return groups
+
+
+def _issue_total(row: dict) -> int:
+    """Everything that differs in a section, as the one number its header and
+    its nav entry both show: each differing line (`real_diff` - page furniture
+    excluded) plus each table, image, numbering and formatting finding."""
+    return (row.get("counts") or {}).get("real_diff", 0) + sum(
+        g["count"] for g in row.get("issue_groups") or []
+    )
 
 
 def build_section_comparison(
@@ -2168,7 +2211,7 @@ def build_section_comparison(
                 "expected_page": (exp_e.page + 1) if exp_e else None,
                 "actual_page": (act_e.page + 1) if act_e else None,
                 "rows": [],
-                "counts": {"equal": 0, "change": 0, "prod": 0, "stage": 0, "diff": 0},
+                "counts": _counts([]),
                 "exp_shots": [],
                 "act_shots": [],
                 # Not diffed line by line, but both sides still get their page
@@ -2193,7 +2236,12 @@ def build_section_comparison(
             exp_recs = _section_records(exp_blocks, all_heading_titles, exp_tables, exp_images)
             act_recs = _section_records(act_blocks, all_heading_titles, act_tables, act_images)
             rows = _align_kinds(exp_recs, act_recs)
-            _reconcile_cross_present(rows, _blocks_blob(exp_blocks), _blocks_blob(act_blocks))
+            # Before the presence check below: that one settles a row against
+            # the other side's whole section text, which would clear one half
+            # of a regrouped pair and leave its partner looking one-sided.
+            exp_blob, act_blob = _blocks_blob(exp_blocks), _blocks_blob(act_blocks)
+            _settle_regrouped(rows, exp_blob, act_blob)
+            _reconcile_cross_present(rows, exp_blob, act_blob)
             exp_pages = sorted({b["page"] for b in exp_blocks if isinstance(b.get("page"), int)})
             act_pages = sorted({b["page"] for b in act_blocks if isinstance(b.get("page"), int)})
             _reconcile_ocr_present(rows, exp_words, exp_pages, act_words, act_pages)
@@ -2283,7 +2331,6 @@ def build_section_comparison(
             "actual_page": (act_e.page + 1) if act_e else None,
             "rows": rows,
             "counts": _counts(rows),
-            "kind_counts": _counts_by_kind(rows),
             "exp_shots": [],
             "act_shots": [],
             # Rendered after `_fill_relocated_counterparts` below, once every
@@ -2323,9 +2370,9 @@ def build_section_comparison(
             row_dict["list_notes"] = list_notes_by_heading[head]
         if n_index:
             row_dict["index_note"] = (
-                f"{n_index} contents / FAQ-index navigation entries in this section "
-                "(each linking to a page) are not shown here or compared line by line — "
-                "see the page snapshot below for the full list."
+                f"{n_index} contents / FAQ-index entries in this section (each linking "
+                "to a page) are listed as page furniture and not compared line by line — "
+                "the TOC comparison covers them."
             )
         out.append(row_dict)
 
@@ -2340,7 +2387,7 @@ def build_section_comparison(
     # the panel must not still claim it is.
     for s in out:
         s["issue_groups"] = _issue_groups(s)
-        s["issue_total"] = sum(g["count"] for g in s["issue_groups"])
+        s["issue_total"] = _issue_total(s)
 
     # Snapshots last. `_fill_relocated_counterparts` above can turn a row that
     # looked one-sided into a plain match, and a highlight box drawn before

@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter Comparison — Production vs Staging</title>
+<style>
+  :root { --line: #e3e6ec; --muted: #6b7280; --ink: #15181d; --paper: #f4f5f7;
+          --prod: #a01515; --stage: #0f6b34; --accent: #2d6cdf; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; color: var(--ink);
+         background: var(--paper); font-size: 13px; }
+  .layout { display: grid; grid-template-columns: 280px 1fr; height: 100vh; }
+
+  /* ---- chapter list ---- */
+  .side { border-right: 1px solid var(--line); background: #fff; overflow-y: auto; padding: 12px 0 60px; }
+  .side h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+             margin: 6px 16px 10px; }
+  .side a { display: block; padding: 8px 16px; text-decoration: none; color: var(--ink);
+            border-left: 3px solid transparent; }
+  .side a:hover { background: #f3f6fb; }
+  .side a.active { background: #eaf1fd; border-left-color: var(--accent); }
+  .side a.clean { border-left-color: #cfe7db; }
+  .side a.dirty { border-left-color: var(--prod); }
+  .side .t { display: block; font-weight: 600; margin-bottom: 2px; }
+  .side .m { display: block; font-size: 11px; color: var(--muted); }
+  .side .n { float: right; font-size: 10px; font-weight: 700; border-radius: 9px; padding: 1px 7px;
+             background: var(--prod); color: #fff; }
+  .side .n.ok { background: #e7efe9; color: var(--stage); }
+
+  /* ---- main ---- */
+  .main { overflow-y: auto; padding: 0 22px 140px; }
+  .top { position: sticky; top: 0; z-index: 8; background: var(--paper); padding: 12px 0;
+         border-bottom: 1px solid var(--line); margin-bottom: 16px; }
+  .top h1 { margin: 0 0 4px; font-size: 15px; }
+  .files { font-size: 12px; color: var(--muted); }
+  .files b { color: var(--ink); }
+  .controls { margin-top: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .btn { border: 1px solid var(--line); background: #fff; border-radius: 6px; padding: 5px 12px;
+         font-size: 12px; cursor: pointer; color: var(--ink); text-decoration: none; }
+  .btn.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .how { font-size: 11px; color: var(--muted); margin: 0 0 16px; max-width: 90ch; line-height: 1.6; }
+
+  .chap { background: #fff; border: 1px solid var(--line); border-radius: 10px; margin-bottom: 20px;
+          scroll-margin-top: 96px; overflow: hidden; }
+  .chap > header { padding: 12px 16px; border-bottom: 1px solid var(--line); display: flex;
+                   gap: 10px; align-items: baseline; flex-wrap: wrap; background: #fbfcfd; }
+  .chap h2 { margin: 0; font-size: 15px; }
+  .pages { font-size: 11px; color: var(--muted); }
+  .chip { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+          border-radius: 3px; padding: 2px 7px; color: #fff; }
+  .chip.content { background: #9a5b06; } .chip.table { background: #14875f; }
+  .chip.image { background: #7c4dcc; } .chip.note { background: #b0761b; }
+  .chip.formatting { background: #c9781f; }
+  .chip.bold, .tag.bold { background: #57534e; }
+  .chip.numbering, .tag.numbering { background: #a31212; }
+  .chip.clean { background: #e7efe9; color: var(--stage); }
+
+  h3.sec { margin: 0; padding: 10px 16px; font-size: 11px; text-transform: uppercase;
+           letter-spacing: .06em; color: var(--muted); background: #fafbfc;
+           border-bottom: 1px solid var(--line); border-top: 1px solid var(--line); }
+
+  /* ---- what differs ---- */
+  .diffs { padding: 4px 16px 12px; }
+  .diff { display: grid; grid-template-columns: 30px 1fr; gap: 10px; padding: 9px 0;
+          border-bottom: 1px dashed var(--line); }
+  .diff:last-child { border-bottom: 0; }
+  .badge { display: inline-block; min-width: 24px; text-align: center; font-weight: 700;
+           font-size: 11px; border-radius: 4px; padding: 2px 5px; background: #d21414; color: #fff; height: fit-content; }
+  .badge.minor { background: #8a94a3; }
+  .diff-head { font-size: 12px; font-weight: 600; }
+  .diff-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .diff-detail { font-size: 11px; color: #3a4757; margin-top: 4px; line-height: 1.55; }
+  .tag { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+         border-radius: 3px; padding: 1px 5px; margin-right: 6px; vertical-align: 1px; color: #fff; }
+  .tag.content { background: #9a5b06; } .tag.table { background: #14875f; }
+  .tag.image { background: #7c4dcc; } .tag.note { background: #b0761b; }
+  .tag.formatting { background: #c9781f; }
+  .tag.minor { background: #8a94a3; }
+  /* Missing and extra content are both red: the column says which side it is. */
+  del { background: #fbdada; color: #7a1414; text-decoration: line-through; text-decoration-thickness: 2px; }
+  ins { background: #fbdada; color: #7a1414; text-decoration: underline; text-decoration-thickness: 2px; }
+
+  /* ---- all issues, every chapter, one table ---- */
+  .overview { background: #fff; border: 1px solid var(--line); border-radius: 10px; margin-bottom: 20px;
+              scroll-margin-top: 96px; overflow: hidden; }
+  .overview > header { padding: 12px 16px; border-bottom: 1px solid var(--line); display: flex;
+                       gap: 10px; align-items: baseline; flex-wrap: wrap; background: #fbfcfd; }
+  .overview h2 { margin: 0; font-size: 15px; }
+  .ov-scroll { overflow-x: auto; }
+  table.ov { width: 100%; border-collapse: collapse; }
+  table.ov th { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; text-align: left;
+                padding: 8px 12px; border-bottom: 1px solid var(--line); background: #fafbfc; white-space: nowrap; }
+  table.ov th .hint { text-transform: none; letter-spacing: 0; font-weight: 400; color: var(--muted); }
+  table.ov td { padding: 8px 12px; vertical-align: top; border-bottom: 1px solid #f1f2f4; font-size: 12px; line-height: 1.5; }
+  table.ov td.num, table.ov th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  table.ov tbody tr:hover { background: #fafbfd; }
+  table.types tr.topic { cursor: pointer; }
+  table.types tr.topic.on { background: #eaf1fd; }
+  table.types td.help { color: #3a4757; }
+  .ov-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--sev);
+            margin-right: 7px; vertical-align: 0; }
+  .ov-type { font-weight: 600; }
+  .ov-group { color: var(--muted); white-space: nowrap; }
+  table.issues { table-layout: fixed; min-width: 1100px; }
+  table.issues col.c-n { width: 48px; } table.issues col.c-type { width: 210px; }
+  table.issues col.c-img { width: 190px; }
+  table.issues td.n a { font-weight: 700; color: var(--ink); text-decoration: none; }
+  table.issues .meta { font-size: 11px; color: var(--muted); margin-top: 3px; }
+  table.issues .meta a { color: var(--muted); }
+  table.issues td.txt { overflow-wrap: anywhere; }
+  mark.red { background: #fbdada; color: #7a1414; font-weight: 600; border-radius: 2px; padding: 0 2px; }
+  .gap { color: #d21414; font-weight: 800; padding: 0 1px; cursor: help; }
+  .none { color: #98a2b3; }
+  .thumbs { display: flex; flex-direction: column; gap: 6px; }
+  .thumbs a.shotlink { display: flex; gap: 6px; align-items: flex-start; text-decoration: none; color: var(--muted); font-size: 10px; }
+  .thumbs img { display: block; max-width: 140px; max-height: 80px; border: 1px solid var(--line); border-radius: 4px; background: #fff; }
+  .thumbs a.shotlink:hover img { border-color: var(--accent); }
+  .who-p, .who-s { font-size: 9px; font-weight: 700; color: #fff; border-radius: 3px; padding: 1px 4px; }
+  .who-p { background: var(--prod); } .who-s { background: var(--stage); }
+  a.goto { font-size: 11px; }
+  .filter-note { font-weight: 400; text-transform: none; letter-spacing: 0; }
+  .filter-note a { cursor: pointer; }
+
+  /* ---- issues, by severity, each a closed dropdown ---- */
+  .sevgroup { margin: 10px 0 14px; }
+  .sevhead { display: flex; gap: 10px; align-items: baseline; margin-bottom: 6px; }
+  .sevchip { font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .05em;
+             color: #fff; border-radius: 3px; padding: 2px 8px; }
+  .sevcount { font-size: 12px; font-weight: 700; }
+  .sevnote { font-size: 11px; color: var(--muted); }
+  .sev1 { --sev: #b91c1c; } .sev2 { --sev: #1d4ed8; } .sev3 { --sev: #0f766e; }
+  .sev4 { --sev: #7c4dcc; } .sev5 { --sev: #c2410c; } .sev6 { --sev: #6b7280; }
+  .sevchip, .badge.sev1, .badge.sev2, .badge.sev3, .badge.sev4, .badge.sev5, .badge.sev6 { background: var(--sev); }
+  details.issue { border: 1px solid var(--line); border-left: 4px solid var(--sev); border-radius: 6px;
+                  margin-bottom: 6px; background: #fff; scroll-margin-top: 130px; }
+  details.issue > summary { list-style: none; cursor: pointer; display: grid;
+                            grid-template-columns: 34px 1fr; gap: 2px 10px; padding: 8px 10px; }
+  details.issue > summary::-webkit-details-marker { display: none; }
+  details.issue > summary::after { content: "▸ show"; grid-column: 2; font-size: 10px; color: var(--muted); }
+  details.issue[open] > summary::after { content: "▾ hide"; }
+  details.issue .what { font-size: 12px; font-weight: 600; }
+  details.issue .where { grid-column: 2; font-size: 11px; color: var(--muted); }
+  details.issue .badge { grid-row: span 3; align-self: start; }
+  .issue-body { padding: 0 10px 12px 54px; }
+  .crops { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .crops figure { margin: 0; }
+  .crops figcaption { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+  .crops img { width: 100%; height: auto; max-height: 460px; object-fit: contain; display: block;
+              border: 1px solid var(--line); border-radius: 5px; background: #fff; }
+  .crops svg { width: 100%; height: auto; max-height: 440px; display: block; border: 1px solid var(--line);
+               border-radius: 5px; background: #fff; }
+  .nocrop { font-size: 11px; color: #98a2b3; font-style: italic; border: 1px dashed var(--line);
+            border-radius: 5px; padding: 18px 10px; text-align: center; }
+  .issue-text { font-size: 12px; line-height: 1.6; margin-top: 8px; color: #2b3440; }
+  @media (max-width: 900px) { .crops { grid-template-columns: 1fr; } .issue-body { padding-left: 10px; } }
+  /* ---- content, left against right ---- */
+  table.cmp { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  table.cmp col.c { width: 128px; }
+  table.cmp th { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; text-align: left;
+                 padding: 8px 12px; border-bottom: 1px solid var(--line); color: var(--ink); }
+  table.cmp td { padding: 7px 12px; vertical-align: top; border-bottom: 1px solid #f1f2f4;
+                 overflow-wrap: anywhere; line-height: 1.55; font-size: 12px; }
+  td.mark { font-size: 10px; color: var(--muted); white-space: normal; }
+  td.mark .tag { display: inline-block; white-space: normal; line-height: 1.3; margin-right: 0; }
+  tr.st-missing td.p { background: #fbdcdc; color: #4a0f0f; }
+  tr.st-missing td.s { background: #f7f8f9; }
+  tr.st-added td.s { background: #fbdcdc; color: #4a0f0f; }
+  tr.st-added td.p { background: #f7f8f9; }
+  tr.st-changed td.p, tr.st-changed td.s { background: #fdf2d8; color: #4a3205; }
+  tr.st-match td { color: #3b4654; }
+  tr.st-layout td { color: #3b4654; background: #f7f8fa; }
+  .tag.layout { background: #8a94a3; }
+  .layout-note { font-size: 11px; color: #55606f; font-style: italic; }
+  .kindtag { display: inline-block; font-size: 9px; font-weight: 700; text-transform: uppercase;
+             letter-spacing: .04em; background: #eef1f5; color: #55606f; border-radius: 3px;
+             padding: 1px 5px; margin-right: 6px; }
+  .rownums .badge { margin-right: 3px; }
+  .absent { color: #98a2b3; font-style: italic; font-size: 11px; }
+  .note-line { font-size: 11px; color: #7a5a12; margin-top: 4px; }
+  body.only-diffs tr.st-match, body.only-diffs tr.st-layout { display: none; }
+  body.only-diffs .chap.clean { display: none; }
+
+  /* ---- the pages themselves ---- */
+  .pagesview { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; padding: 12px 16px 18px; }
+  .col h4 { margin: 0 0 8px; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  .col h4 .who { color: #fff; border-radius: 3px; padding: 2px 7px; }
+  .col.prod h4 .who { background: var(--prod); }
+  .col.stage h4 .who { background: var(--stage); }
+  .shot { margin-bottom: 10px; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: #fff; }
+  .shot .lab { font-size: 10px; color: var(--muted); padding: 4px 8px; border-bottom: 1px solid var(--line); }
+  .shot img { width: 100%; height: auto; display: block; }
+  .legend { font-size: 11px; color: var(--muted); padding: 0 16px 10px; }
+  .legend .sw { display: inline-block; width: 20px; height: 9px; border: 2px solid #d21414;
+                background: #ffeaea; vertical-align: middle; border-radius: 2px; }
+  .legend .sw.minor { border-color: #e68200; background: transparent; }
+  .legend { line-height: 1.7; }
+  .empty { padding: 14px 16px; color: var(--muted); font-style: italic; }
+  .skipnote { background: #f6f7f9; border-top: 1px solid var(--line); padding-top: 8px; }
+  @media (max-width: 1100px) { .pagesview { grid-template-columns: 1fr; } .layout { grid-template-columns: 1fr; } .side { display: none; } }
+</style>
+</head>
+<body>
+{%- macro worddiff(ops, side) -%}
+  {%- for op in ops -%}
+    {%- if op.type == 'equal' -%}{{ op.text }}
+    {%- elif op.type == 'del' and side == 'prod' -%}<del>{{ op.text }}</del>
+    {%- elif op.type == 'ins' and side == 'stage' -%}<ins>{{ op.text }}</ins>
+    {%- endif -%}{{ ' ' }}
+  {%- endfor -%}
+{%- endmacro -%}
+{%- macro side_text(parts, flagged) -%}
+  {#- One side's text for an issue: what differs in red, a red caret where only
+      the other document has words. -#}
+  {%- for p in parts -%}
+    {%- if p.hl -%}<mark class="red" title="{{ flagged }}">{{ p.t }}</mark>
+    {%- elif p.gap -%}<span class="gap" title="The other document has words here">‸</span>
+    {%- else -%}{{ p.t }}{%- endif -%}{{ ' ' }}
+  {%- endfor -%}
+{%- endmacro -%}
+{%- set every = namespace(items=[]) -%}
+{%- for c in chapters %}{% for d in c.diffs %}{% set every.items = every.items + [d] %}{% endfor %}{% endfor -%}
+<div class="layout">
+  <nav class="side">
+    {% if every.items %}
+    <a href="#all-issues" data-id="all-issues" class="dirty">
+      <span class="n">{{ every.items|length }}</span>
+      <span class="t">All issues</span>
+      <span class="m">every chapter, one table</span>
+    </a>
+    {% endif %}
+    <h2>Chapters ({{ chapters|length }})</h2>
+    {% for c in chapters %}
+    <a href="#{{ c.id }}" data-id="{{ c.id }}" class="{{ 'dirty' if c.real_total else 'clean' }}">
+      <span class="n {{ 'ok' if not c.real_total }}">{{ c.total }}</span>
+      <span class="t">{{ c.title }}</span>
+      <span class="m">prod {{ c.prod_range }} · stage {{ c.stage_range }}</span>
+    </a>
+    {% endfor %}
+  </nav>
+
+  <main class="main" id="main">
+    <div class="top">
+      <h1>Chapter comparison — every L1 chapter, Production beside Staging</h1>
+      <div class="files"><b>Production</b>: {{ expected_path }} &nbsp;·&nbsp; <b>Staging</b>: {{ actual_path }}</div>
+      <div class="controls">
+        <button class="btn on" id="btn-all" onclick="setMode('all')">All content</button>
+        <button class="btn" id="btn-diff" onclick="setMode('diffs')">Differences only</button>
+        <button class="btn" id="btn-pages" onclick="togglePages()">Hide page images</button>
+        <button class="btn" id="btn-issues" onclick="toggleIssues()">Collapse all issues</button>
+        <a class="btn" href="report.html">← Validation report</a>
+        <a class="btn" href="sections.html">▤ Section browser</a>
+        <a class="btn" href="toc.html">▤ TOC comparison</a>
+        <a class="btn" href="pdf.html">▤ PDF</a>
+      </div>
+    </div>
+    {#- Outside the sticky bar: read once, then out of the way of the tables. -#}
+    <div class="how">
+        Each chapter runs from its top-level heading to the next one, on both sides at once, however
+        many pages that takes in each document — the two paginate differently, so pages are never
+        compared by number. A paragraph that wraps onto another line, or carries over onto the next
+        page, is put back together before anything is compared, so neither is reported as a difference.
+        Running headers, footers, page numbers and printed “see page N” cross-references are left out
+        for the same reason. Tables of contents and Q&amp;A / FAQ sections are not compared at all — neither
+        as chapters nor inside one — since they are page-number listings, and the embedded outline has
+        its own TOC comparison.
+    </div>
+
+    {% if every.items %}
+    <section class="overview" id="all-issues">
+      <header>
+        <h2>All issues</h2>
+        <span class="pages">{{ every.items|length }} {{ 'issue' if every.items|length == 1 else 'issues' }}
+          in {{ chapters|selectattr('total')|list|length }} of {{ chapters|length }} chapters</span>
+      </header>
+
+      <h3 class="sec">Issue types — click one to list only those issues below</h3>
+      <div class="ov-scroll">
+      <table class="ov types">
+        <thead><tr><th>Issue type</th><th>Group</th><th class="num">Issues</th><th>What it means</th></tr></thead>
+        <tbody>
+        {% for key, items in every.items|groupby('topic_key') %}
+        {%- set first = items|first %}
+        <tr class="topic" data-topic="{{ key }}" onclick="filterTopic(this.dataset.topic)">
+          <td class="ov-type"><span class="ov-dot sev{{ first.severity }}"></span>{{ first.topic }}</td>
+          <td class="ov-group">{{ first.severity_label }}</td>
+          <td class="num">{{ items|length }}</td>
+          <td class="help">{{ first.topic_help }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      </div>
+
+      <h3 class="sec">Every issue <span class="filter-note" id="filter-note"></span></h3>
+      <div class="ov-scroll">
+      <table class="ov issues" id="issue-table">
+        <colgroup><col class="c-n"><col class="c-type"><col><col><col><col class="c-img"></colgroup>
+        <thead><tr>
+          <th>#</th><th>Issue type</th><th>Description</th>
+          <th>Production <span class="hint">· red = missing in Staging</span></th>
+          <th>Staging <span class="hint">· red = extra in Staging</span></th>
+          <th>Images</th>
+        </tr></thead>
+        <tbody>
+        {% set count = namespace(n=0) %}
+        {% for c in chapters %}{% for d in c.diffs %}{% set count.n = count.n + 1 %}
+        <tr data-topic="{{ d.topic_key }}">
+          <td class="n"><a class="goto" href="#{{ c.id }}-i{{ d.n }}" title="Open this issue in its chapter">{{ count.n }}</a></td>
+          <td>
+            <div class="ov-type"><span class="ov-dot sev{{ d.severity }}"></span>{{ d.topic }}</div>
+            <div class="meta"><a href="#{{ c.id }}">{{ c.title }}</a> · box {{ d.n }}</div>
+            <div class="meta">
+              {%- if d.prod_page %}Production p.{{ d.prod_page }}{% endif -%}
+              {%- if d.prod_page and d.stage_page %} · {% endif -%}
+              {%- if d.stage_page %}Staging p.{{ d.stage_page }}{% endif -%}
+              {%- if d.occurrences > 1 %} · {{ d.occurrences }} places{% endif %}</div>
+          </td>
+          {#- The type is in the column beside it; the description is the rest. -#}
+          {%- set rest = d.summary.split(' — ', 1)|last %}
+          <td class="txt">{{ rest[:1]|upper }}{{ rest[1:] }}
+            {%- if d.detail and not d.prod_parts and not d.stage_parts %}<div class="meta">{{ d.detail }}</div>{% endif %}</td>
+          <td class="txt">{% if d.prod_parts %}{{ side_text(d.prod_parts, 'Missing in Staging') }}{% else %}<span class="none">—</span>{% endif %}</td>
+          <td class="txt">{% if d.stage_parts %}{{ side_text(d.stage_parts, 'Extra in Staging') }}{% else %}<span class="none">—</span>{% endif %}</td>
+          <td>
+            <div class="thumbs">
+              {% if d.prod_crop %}<a class="shotlink" href="{{ d.prod_crop }}" target="_blank" rel="noopener" title="Open the Production image"><span class="who-p">P</span><img loading="lazy" src="{{ d.prod_crop }}" alt="Production — issue {{ count.n }}"></a>{% endif %}
+              {% if d.stage_crop %}<a class="shotlink" href="{{ d.stage_crop }}" target="_blank" rel="noopener" title="Open the Staging image"><span class="who-s">S</span><img loading="lazy" src="{{ d.stage_crop }}" alt="Staging — issue {{ count.n }}"></a>{% endif %}
+              <a class="goto" href="#{{ c.id }}-i{{ d.n }}">Open in chapter ↓</a>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}{% endfor %}
+        </tbody>
+      </table>
+      </div>
+    </section>
+    {% endif %}
+
+    {% if not chapters %}
+    <div class="chap"><div class="empty">No chapter could be matched between the two documents —
+      neither has a usable top-level heading list to compare by.</div></div>
+    {% endif %}
+
+    {% for c in chapters %}
+    <section class="chap {{ 'clean' if not c.total }}" id="{{ c.id }}">
+      <header>
+        <h2>{{ c.title }}</h2>
+        <span class="pages">Production {{ c.prod_range }} ({{ c.prod_pages|length }} pages, {{ c.elements.prod }} elements)
+          &nbsp;·&nbsp; Staging {{ c.stage_range }} ({{ c.stage_pages|length }} pages, {{ c.elements.stage }} elements)</span>
+        {% for cat in c.categories %}
+        <span class="chip {{ cat.key }}">{{ cat.icon }} {{ cat.label }} {{ cat.count }}</span>
+        {% endfor %}
+        {% if not c.total %}<span class="chip clean">✓ identical</span>{% endif %}
+      </header>
+
+      {% if c.skipped.prod or c.skipped.stage %}
+      <div class="legend skipnote">
+        <b>Not compared in this chapter</b> — table-of-contents and Q&amp;A content is left out on purpose:
+        {% if c.skipped.prod %}Production: {{ c.skipped.prod|join(', ') }}.{% endif %}
+        {% if c.skipped.stage %}Staging: {{ c.skipped.stage|join(', ') }}.{% endif %}
+      </div>
+      {% endif %}
+      {% if c.only_tops.prod or c.only_tops.stage %}
+      <div class="legend">
+        {% if c.only_tops.prod %}Production also bookmarks
+          {% for t in c.only_tops.prod %}“{{ t }}”{% if not loop.last %}, {% endif %}{% endfor %}
+          as a chapter of its own; Staging keeps that material inside this one, so it is compared here.{% endif %}
+        {% if c.only_tops.stage %}Staging also bookmarks
+          {% for t in c.only_tops.stage %}“{{ t }}”{% if not loop.last %}, {% endif %}{% endfor %}
+          as a chapter of its own; Production keeps that material inside this one, so it is compared here.{% endif %}
+      </div>
+      {% endif %}
+
+      {% if c.diffs %}
+      <h3 class="sec">Issues in this chapter — {{ c.total }}, most serious first</h3>
+      <div class="diffs">
+        {% for g in c.severity_groups %}
+        <div class="sevgroup">
+          <div class="sevhead">
+            <span class="sevchip sev{{ g.level }}">S{{ g.level }} · {{ g.label }}</span>
+            <span class="sevcount">{{ g['items']|length }} {{ 'issue' if g['items']|length == 1 else 'issues' }}</span>
+            <span class="sevnote">{{ 'fails the check' if g.fails else 'for review — does not fail the check' }}</span>
+          </div>
+          {% for d in g['items'] %}
+          <details class="issue sev{{ g.level }}" id="{{ c.id }}-i{{ d.n }}" open>
+            <summary>
+              <span class="badge sev{{ g.level }}">{{ d.n }}</span>
+              <span class="what">{{ d.summary }}</span>
+              <span class="where">{{ d.element }}
+                {%- if d.prod_page %} · Production p.{{ d.prod_page }}{% endif -%}
+                {%- if d.stage_page %} · Staging p.{{ d.stage_page }}{% endif -%}
+                {%- if d.occurrences > 1 %} · {{ d.occurrences }} places{% endif %}</span>
+            </summary>
+            <div class="issue-body">
+              <div class="crops">
+                <figure>
+                  <figcaption><b>Production</b>{% if d.prod_page %} · p.{{ d.prod_page }}{% endif %}</figcaption>
+                  {% if d.prod_crop %}<img loading="lazy" src="{{ d.prod_crop }}" alt="Production — issue {{ d.n }}">
+                  {% else %}<div class="nocrop">{{ 'Not in Production.' if not d.prod_page else 'Page image not rendered.' }}</div>{% endif %}
+                </figure>
+                <figure>
+                  <figcaption><b>Staging</b>{% if d.stage_page %} · p.{{ d.stage_page }}{% endif %}</figcaption>
+                  {% if d.stage_crop %}<img loading="lazy" src="{{ d.stage_crop }}" alt="Staging — issue {{ d.n }}">
+                  {% else %}<div class="nocrop">{{ 'Not in Staging.' if not d.stage_page else 'Page image not rendered.' }}</div>{% endif %}
+                </figure>
+              </div>
+              <div class="issue-text">
+                <div><b>Issue:</b> {{ d.summary }}</div>
+                {% if d.word_diff %}
+                <div><b>Production:</b> {{ worddiff(d.word_diff, 'prod') }}</div>
+                <div><b>Staging:</b> {{ worddiff(d.word_diff, 'stage') }}</div>
+                {% elif d.detail %}
+                <div><b>Details:</b> {{ d.detail }}</div>
+                {% endif %}
+              </div>
+            </div>
+          </details>
+          {% endfor %}
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      <h3 class="sec">The chapter, left against right — every element in printed order</h3>
+      {% if c.rows %}
+      <table class="cmp">
+        <colgroup><col class="c"><col><col></colgroup>
+        <thead><tr><th></th><th>Production</th><th>Staging</th></tr></thead>
+        <tbody>
+        {% for r in c.rows %}
+        <tr class="st-{{ r.status }}">
+          <td class="mark">
+            {%- if r.status == 'missing' %}<span class="tag content">prod only</span>
+            {%- elif r.status == 'added' %}<span class="tag content">stage only</span>
+            {%- elif r.status == 'changed' %}<span class="tag formatting">differs</span>
+            {%- elif r.status == 'layout' %}<span class="tag layout" title="The same content, divided up or laid out differently - not counted as a difference">laid out differently</span>
+            {%- else %}match{% endif -%}
+            {% if r.numbers %}<div class="rownums">{% for n in r.numbers %}<span class="badge">{{ n }}</span>{% endfor %}</div>{% endif %}
+          </td>
+          <td class="p">
+            {%- if r.prod_text or r.prod_label -%}
+              <span class="kindtag">{{ r.prod_label }}{% if r.prod_page %} · p.{{ r.prod_page }}{% endif %}</span>
+              {%- if r.word_diff %}{{ worddiff(r.word_diff, 'prod') }}{% else %}{{ r.prod_text }}{% endif -%}
+            {%- elif r.container_side == 'prod' -%}<span class="layout-note">↳ {{ r.container_note }}</span>
+            {%- else -%}<span class="absent">— nothing here in Production —</span>{%- endif -%}
+          </td>
+          <td class="s">
+            {%- if r.stage_text or r.stage_label -%}
+              <span class="kindtag">{{ r.stage_label }}{% if r.stage_page %} · p.{{ r.stage_page }}{% endif %}</span>
+              {%- if r.word_diff %}{{ worddiff(r.word_diff, 'stage') }}{% else %}{{ r.stage_text }}{% endif -%}
+            {%- elif r.container_side == 'stage' -%}<span class="layout-note">↳ {{ r.container_note }}</span>
+            {%- else -%}<span class="absent">— nothing here in Staging —</span>{%- endif -%}
+          </td>
+        </tr>
+        {% if r.summaries and r.status == 'changed' %}
+        <tr class="st-changed"><td></td><td colspan="2"><div class="note-line">{{ r.summaries|join('  ·  ') }}</div></td></tr>
+        {% endif %}
+        {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <div class="empty">Nothing was extracted for this chapter on either side.</div>
+      {% endif %}
+
+      <h3 class="sec">The pages, as printed — every page of the chapter on both sides</h3>
+      <div class="legend">
+        <span class="sw"></span> <b>red</b> — what the chapter says or shows is different (wording, content only on one side, a replaced figure, a table's content)
+        &nbsp;·&nbsp; <span class="sw minor"></span> <b>orange</b> — the same content, set differently (size, weight, colour, a figure's size or crop, a table's layout)
+        <br>The number on a box is its number in the list above; box <b>3</b> on the left is box <b>3</b> on the right.
+      </div>
+      <div class="pagesview">
+        <div class="col prod">
+          <h4><span class="who">Production</span> {{ c.prod_range }}</h4>
+          {% for s in c.prod_shots %}
+          <div class="shot"><div class="lab">PDF page {{ s.page }}</div><img loading="lazy" src="{{ s.src }}" alt="Production page {{ s.page }}"></div>
+          {% else %}<div class="empty">No pages rendered.</div>{% endfor %}
+        </div>
+        <div class="col stage">
+          <h4><span class="who">Staging</span> {{ c.stage_range }}</h4>
+          {% for s in c.stage_shots %}
+          <div class="shot"><div class="lab">PDF page {{ s.page }}</div><img loading="lazy" src="{{ s.src }}" alt="Staging page {{ s.page }}"></div>
+          {% else %}<div class="empty">No pages rendered.</div>{% endfor %}
+        </div>
+      </div>
+    </section>
+    {% endfor %}
+  </main>
+</div>
+
+<script>
+  function setMode(m) {
+    document.body.classList.toggle('only-diffs', m === 'diffs');
+    document.getElementById('btn-all').classList.toggle('on', m === 'all');
+    document.getElementById('btn-diff').classList.toggle('on', m === 'diffs');
+  }
+  function togglePages() {
+    const btn = document.getElementById('btn-pages');
+    const hide = !document.body.classList.toggle('hide-pages');
+    document.querySelectorAll('.pagesview, .legend').forEach(function (el) {
+      el.style.display = hide ? '' : 'none';
+    });
+    btn.textContent = hide ? 'Hide page images' : 'Show page images';
+  }
+  // Every issue starts open, so its crops are on screen without a click.
+  function toggleIssues() {
+    const btn = document.getElementById('btn-issues');
+    const open = btn.textContent.indexOf('Expand') === 0;
+    document.querySelectorAll('details.issue').forEach(function (d) { d.open = open; });
+    btn.textContent = open ? 'Collapse all issues' : 'Expand all issues';
+  }
+  // The issue-type table filters the issue table; clicking the same type again
+  // shows everything.
+  let activeTopic = null;
+  function filterTopic(key) {
+    activeTopic = activeTopic === key ? null : key;
+    let shown = 0;
+    document.querySelectorAll('#issue-table tbody tr').forEach(function (tr) {
+      tr.hidden = !!activeTopic && tr.dataset.topic !== activeTopic;
+      if (!tr.hidden) shown++;
+    });
+    document.querySelectorAll('table.types tr.topic').forEach(function (tr) {
+      tr.classList.toggle('on', tr.dataset.topic === activeTopic);
+    });
+    const note = document.getElementById('filter-note');
+    if (note) {
+      note.innerHTML = activeTopic
+        ? '— ' + shown + ' shown · <a onclick="filterTopic(activeTopic)">show all</a>'
+        : '';
+    }
+  }
+  // A link to an issue opens it, even after "Collapse all issues".
+  document.addEventListener('click', function (e) {
+    const a = e.target.closest('a.goto');
+    if (!a) return;
+    const target = document.getElementById(a.getAttribute('href').slice(1));
+    if (target && target.tagName === 'DETAILS') target.open = true;
+  });
+  // Mark the chapter the reader is looking at in the list beside it.
+  const links = Array.from(document.querySelectorAll('.side a'));
+  const byId = new Map(links.map(function (a) { return [a.dataset.id, a]; }));
+  const io = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      if (!e.isIntersecting) return;
+      links.forEach(function (a) { a.classList.remove('active'); });
+      const link = byId.get(e.target.id);
+      if (link) { link.classList.add('active'); }
+    });
+  }, { root: document.getElementById('main'), rootMargin: '-20% 0px -70% 0px' });
+  document.querySelectorAll('section.chap, section.overview').forEach(function (s) { io.observe(s); });
+</script>
+</body>
+</html>

@@ -3,6 +3,7 @@
 Findings:
 
 * List marker changed          - 1,2,3 vs a,b,c vs bullets
+* List marker size changed     - same kind of marker (e.g. bullet vs bullet), different size
 * List alignment/indent changed - a list item's indent moved
 * Text alignment changed       - left/center/right/justified changed
 * Paragraph merged with heading - a numbered item's description glued onto the
@@ -185,6 +186,7 @@ class _LineCache:
                                     "text": s["text"],
                                     "bold": bool(s.get("flags", 0) & _BOLD_FLAG),
                                     "bbox": tuple(s.get("bbox", (0, 0, 0, 0))),
+                                    "size": float(s.get("size", 0.0)),
                                 }
                                 for s in spans
                             ],
@@ -321,6 +323,10 @@ def _compare_section(
         result, expected, actual, exp_blocks, act_blocks, exp_lines, act_lines,
         heading, output_dir, counter, counts,
     )
+    _check_marker_size(
+        result, expected, actual, exp_blocks, act_blocks, exp_lines, act_lines,
+        heading, output_dir, counter, counts,
+    )
 
     for exp_b, act_b in pairs:
         _check_indent(
@@ -358,7 +364,7 @@ def _item_key(text: str) -> str:
     return " ".join(text.split()).casefold()
 
 
-def _make_item(page: int, marker: str, text: str, bbox: tuple) -> dict | None:
+def _make_item(page: int, marker: str, text: str, bbox: tuple, marker_size: float = 0.0) -> dict | None:
     marker = marker.strip()
     key = _item_key(text)
     if len(key) < MIN_ITEM_KEY_CHARS or not any(ch.isalnum() for ch in key):
@@ -370,6 +376,7 @@ def _make_item(page: int, marker: str, text: str, bbox: tuple) -> dict | None:
         "text": " ".join(text.split()),
         "key": key,
         "bbox": tuple(bbox),
+        "marker_size": marker_size,
     }
 
 
@@ -432,7 +439,8 @@ def _page_list_items(lines: list[dict], page: int) -> list[dict]:
         found = _text_right_of(marker_line, bodies, claimed)
         if not found:
             continue
-        item = _make_item(page, marker, found[0], found[1])
+        marker_size = marker_line["spans"][0]["size"] if marker_line["spans"] else 0.0
+        item = _make_item(page, marker, found[0], found[1], marker_size)
         if item:
             items.append(item)
     for line in bodies:
@@ -442,7 +450,8 @@ def _page_list_items(lines: list[dict], page: int) -> list[dict]:
         m = _LIST_MARKER_RE.match(text)
         if not m:
             continue
-        item = _make_item(page, m.group(1), text[m.end():], tuple(line["bbox"]))
+        marker_size = line["spans"][0]["size"] if line["spans"] else 0.0
+        item = _make_item(page, m.group(1), text[m.end():], tuple(line["bbox"]), marker_size)
         if item:
             items.append(item)
     return items
@@ -631,6 +640,96 @@ def _check_list_markers(
                 severity="error",
                 page=exp_anchor["page"],
                 message="List marker changed",
+                details=details,
+            )
+        )
+
+
+# Relative marker font-size change big enough to flag - a marker drawn at
+# ~1.15x/0.85x its counterpart's size no longer reads as "the same bullet",
+# even though the item's own text (and body-text font-size noise generally)
+# is deliberately not compared, see content.py's `_check_text_style`.
+_MARKER_SIZE_RATIO = 0.15
+
+
+def _marker_size_changed(exp_it: dict, act_it: dict) -> bool:
+    exp_size, act_size = exp_it.get("marker_size"), act_it.get("marker_size")
+    if not exp_size or not act_size:
+        return False
+    return abs(act_size - exp_size) / exp_size >= _MARKER_SIZE_RATIO
+
+
+def _size_runs(pairs: list[tuple[dict, dict]]) -> list[list[tuple[dict, dict]]]:
+    """Group changed items back into the list they came from, same rule as
+    `_marker_runs` but for a size change rather than a kind change."""
+    runs: list[list[tuple[dict, dict]]] = []
+    for exp_it, act_it in pairs:
+        run = runs[-1] if runs else None
+        gap = exp_it["bbox"][1] - run[-1][0]["bbox"][3] if run else None
+        if (
+            run
+            and run[-1][0]["page"] == exp_it["page"]
+            and run[-1][0]["kind"] == exp_it["kind"]
+            and -LINE_OVERLAP_SLACK <= gap <= LIST_RUN_MAX_GAP
+            and not _restarts_numbering(exp_it["marker"], exp_it["kind"])
+        ):
+            run.append((exp_it, act_it))
+        else:
+            runs.append([(exp_it, act_it)])
+    return runs
+
+
+def _check_marker_size(
+    result: CheckResult,
+    expected: fitz.Document,
+    actual: fitz.Document,
+    exp_blocks: list[dict],
+    act_blocks: list[dict],
+    exp_lines: _LineCache,
+    act_lines: _LineCache,
+    heading: str | None,
+    output_dir: str | None,
+    counter: "itertools.count",
+    counts: dict[str, int],
+) -> None:
+    """The same list item's marker (bullet, number, letter) prints at a
+    different size in Staging than in Production - e.g. a bullet drawn much
+    larger or smaller than its Production counterpart, most often from a
+    mismatched list style rather than a body-text-wide font change (that shows
+    up, if at all, as a font-size difference on the matched item text, which
+    is deliberately not reported - see content.py). Only pairs whose marker
+    KIND still matches are considered here; a kind change is
+    `_check_list_markers`'s finding, not this one.
+    """
+    pairs = [
+        (exp_it, act_it)
+        for exp_it, act_it in _pair_list_items(
+            _list_items(exp_lines, exp_blocks), _list_items(act_lines, act_blocks)
+        )
+        if exp_it["kind"] == act_it["kind"] and _marker_size_changed(exp_it, act_it)
+    ]
+    for run in _size_runs(pairs):
+        if not _budget(counts, "marker_size"):
+            return
+        exp_items = [e for e, _ in run]
+        act_items = [a for _, a in run]
+        exp_anchor = _run_anchor(exp_items)
+        act_anchor = _run_anchor(act_items)
+        details = _details(exp_anchor, act_anchor, heading)
+        details["expected_marker"] = _marker_summary(exp_items)
+        details["actual_marker"] = _marker_summary(act_items)
+        details["items"] = len(run)
+        details["changed"] = (
+            f"Production's {_MARKER_KIND_ADJ[exp_items[0]['kind']]} marker prints at "
+            f"{exp_items[0]['marker_size']:.1f}pt; Staging's prints at {act_items[0]['marker_size']:.1f}pt"
+        )
+        details["text"] = [it["text"] for it in exp_items[:5]]
+        _attach(details, expected, actual, output_dir, counter, exp_anchor, act_anchor)
+        result.issues.append(
+            Issue(
+                severity="warning",
+                page=exp_anchor["page"],
+                message="List marker size changed",
                 details=details,
             )
         )

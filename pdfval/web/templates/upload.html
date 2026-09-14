@@ -41,6 +41,12 @@
       <label for="actual">Staging PDF (candidate)</label>
       <input type="file" id="actual" name="actual" accept="application/pdf,.pdf" required>
 
+      <label style="display:flex; align-items:center; gap:0.5rem; font-weight:normal;">
+        <input type="checkbox" name="ai_review" style="width:auto;">
+        Also run free local AI visual review (experimental - uses a local, open-source
+        Ollama model; adds time, does not replace the checks above)
+      </label>
+
       <button type="submit" id="run-btn">Run Comparison</button>
     </form>
   </div>

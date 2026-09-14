@@ -16,6 +16,13 @@ Each fixture isolates ONE behaviour so a test failure says what broke:
                                               object beside the step
   list_stage_lettered.pdf                   - that procedure relettered a,b,c
   list_stage_bulleted.pdf                   - that procedure reduced to bullets
+  chapters_prod.pdf                         - a contents page, two L1 chapters, a Q&A
+                                              section and a footer on every page
+  chapters_stage_reflowed.pdf               - the same words, narrower column, one
+                                              paragraph cut by a page break, a
+                                              reworded Q&A: nothing to report
+  chapters_stage_edited.pdf                 - Production's layout, typo fixed, one
+                                              paragraph removed
 """
 from __future__ import annotations
 
@@ -306,6 +313,96 @@ def _list_document(variant: str) -> pymupdf.Document:
     return doc
 
 
+_GUIDE_FOOTER = "User guide"
+_P_INTRO = (
+    "The display supports a wide range of input sources and can be mounted in either "
+    "orientation. Before installing it, check that the mounting surface can carry at "
+    "least four times the weight of the display."
+)
+# One sentence, split where Staging's page break falls: the first half ends
+# mid-sentence and the second half opens in lower case.
+_P_INPUT_A = (
+    "To change the input source, open the System Settings menu, select Input, and "
+    "choose the source you want to use. The display remembers the last source"
+)
+_P_INPUT_B = "that was selected and returns to it the next time it is powered on."
+_P_STEP_TYPO = "4. Nevigate to the bottom of the page and choose the desired action."
+_P_STEP_FIXED = "4. Navigate to the bottom of the page and choose the desired action."
+_P_CARE = (
+    "Clean the screen with a soft, dry cloth. Never spray liquid directly onto the "
+    "display surface, and never use cleaning products that contain alcohol."
+)
+_QA_TEXT = {
+    "prod": "Why is there no picture? Check that the cable is connected. See page 3.",
+    "reflowed": "Why is there no image on the screen? Check the HDMI cable. See page 4.",
+}
+
+
+def _chapter_document(variant: str) -> pymupdf.Document:
+    """A small manual for Chapter Validation: a printed contents page, then
+    two L1 chapters, the second ending in a Q&A section.
+
+    variant "prod"     - 3 pages, 470pt text column
+            "reflowed" - 4 pages, 360pt column (every paragraph wraps
+                         differently), the input paragraph cut by a page break,
+                         and the Q&A reworded - all of which must go unreported
+            "edited"   - Production's layout with the typo fixed and the
+                         cleaning paragraph removed - both must be reported
+    """
+    doc = pymupdf.open()
+    pages = 4 if variant == "reflowed" else 3
+    for _ in range(pages):
+        doc.new_page(width=PAGE_W, height=PAGE_H)
+    width = 360 if variant == "reflowed" else 470
+
+    contents = doc[0]
+    contents.insert_text((72, 80), "Table of contents", fontsize=18)
+    for n, (title, page_no) in enumerate(
+        (("Getting started", 2), ("Changing the input", 2), ("Care and cleaning", pages))
+    ):
+        contents.insert_text((72, 120 + 20 * n), f"{title} {'.' * 40} {page_no}", fontsize=10)
+
+    first = doc[1]
+    first.insert_text((72, 70), "Getting started", fontsize=18)
+    first.insert_textbox(pymupdf.Rect(72, 90, 72 + width, 200), _P_INTRO, fontsize=10)
+    first.insert_text((72, 240), "Changing the input", fontsize=14)
+    if variant == "reflowed":
+        first.insert_textbox(pymupdf.Rect(72, 690, 72 + width, 760), _P_INPUT_A, fontsize=10)
+        carry = doc[2]
+        carry.insert_textbox(pymupdf.Rect(72, 64, 72 + width, 110), _P_INPUT_B, fontsize=10)
+        carry.insert_text((72, 150), _P_STEP_TYPO, fontsize=10)
+        care = doc[3]
+    else:
+        first.insert_textbox(
+            pymupdf.Rect(72, 255, 72 + width, 360), _P_INPUT_A + " " + _P_INPUT_B, fontsize=10
+        )
+        first.insert_text((72, 400), _P_STEP_FIXED if variant == "edited" else _P_STEP_TYPO, fontsize=10)
+        care = doc[2]
+
+    care.insert_text((72, 70), "Care and cleaning", fontsize=18)
+    if variant != "edited":
+        care.insert_textbox(pymupdf.Rect(72, 90, 72 + width, 200), _P_CARE, fontsize=10)
+    care.insert_text((72, 240), "Q&A", fontsize=14)
+    care.insert_textbox(
+        pymupdf.Rect(72, 255, 72 + width, 320),
+        _QA_TEXT["reflowed" if variant == "reflowed" else "prod"],
+        fontsize=10,
+    )
+
+    for index in range(pages):
+        doc[index].insert_text((72, 772), f"{_GUIDE_FOOTER}   {index + 1}", fontsize=8)
+
+    care_page = pages
+    doc.set_toc([
+        [1, "Table of contents", 1],
+        [1, "Getting started", 2],
+        [2, "Changing the input", 2],
+        [1, "Care and cleaning", care_page],
+        [2, "Q&A", care_page],
+    ])
+    return doc
+
+
 def main() -> None:
     os.makedirs(FIXTURES, exist_ok=True)
     written = []
@@ -327,6 +424,9 @@ def main() -> None:
         ("list_stage_detached.pdf", _list_document("detached")),
         ("list_stage_lettered.pdf", _list_document("lettered")),
         ("list_stage_bulleted.pdf", _list_document("bulleted")),
+        ("chapters_prod.pdf", _chapter_document("prod")),
+        ("chapters_stage_reflowed.pdf", _chapter_document("reflowed")),
+        ("chapters_stage_edited.pdf", _chapter_document("edited")),
     ):
         path = os.path.join(FIXTURES, name)
         doc.save(path)
