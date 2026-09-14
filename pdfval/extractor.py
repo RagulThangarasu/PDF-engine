@@ -130,38 +130,6 @@ def _cluster_rects(rects: list[tuple], gap: float) -> list[tuple[tuple, int]]:
     return [(tuple(bbox), count) for bbox, count in clusters]
 
 
-_SPLIT_GAP = 2.0           # points: shapes this close are one symbol when splitting a cluster
-_SPLIT_MIN_SIDE = 12.0     # a split-out symbol this small is still a figure (a 5pt-type document's WEEE mark)
-_SPLIT_MIN_SHAPES = 2      # a symbol split out of a cluster that passed the shape minimum (the bin: 2 shapes)
-def _split_symbols(cluster: tuple, rects: list[tuple], into: set | None = None) -> list[tuple]:
-    """Side-by-side symbols drawn a few points apart - Production's WEEE bin
-    and battery mark, 3.8pt apart - join into one cluster at the figure gap,
-    and that one "figure" hides a mark the other document dropped. Re-cluster
-    at a tight gap: two to four pieces of comparable size standing in one row
-    are separate figures."""
-    bbox, count = cluster
-    if count < _PRINT_VECTOR_MIN_PRIMITIVES:
-        return [cluster]
-    inside = [r for r in rects if r[0] >= bbox[0] - 0.5 and r[1] >= bbox[1] - 0.5
-              and r[2] <= bbox[2] + 0.5 and r[3] <= bbox[3] + 0.5]
-    pieces = _cluster_rects(inside, _SPLIT_GAP)
-    if not 2 <= len(pieces) <= 4:
-        return [cluster]
-    areas = [(p[2] - p[0]) * (p[3] - p[1]) for p, _ in pieces]
-    if min(areas) < 0.5 * max(areas):
-        return [cluster]  # a symbol and its bits, not symbols side by side
-    tops = [p[1] for p, _ in pieces]
-    bottoms = [p[3] for p, _ in pieces]
-    if max(tops) - min(tops) > 0.3 * (max(bottoms) - min(tops)):
-        return [cluster]  # not one row
-    if into is not None:
-        # Recorded per call: a module-wide set kept every document's pieces for
-        # the life of the process, so a later page with a cluster at the same
-        # coordinates was treated as split.
-        into.update(p for p, _ in pieces)
-    return pieces
-
-
 def get_vector_figures(doc: fitz.Document, page_index: int, print_ready: bool = False) -> list[ImageInfo]:
     """Illustrations drawn with vector primitives rather than embedded as a
     raster image - on-screen-display mockups, panel/port diagrams, connection
@@ -206,17 +174,8 @@ def get_vector_figures(doc: fitz.Document, page_index: int, print_ready: bool = 
     min_side = _PRINT_VECTOR_MIN_SIDE if print_ready else _VECTOR_MIN_SIDE
     min_area = _PRINT_VECTOR_MIN_AREA if print_ready else _VECTOR_MIN_AREA
     min_shapes = _PRINT_VECTOR_MIN_PRIMITIVES if print_ready else _VECTOR_MIN_PRIMITIVES
-    clusters = _cluster_rects(rects, _VECTOR_CLUSTER_GAP)
-    split_pieces: set = set()
-    if print_ready:
-        clusters = [piece for cluster in clusters for piece in _split_symbols(cluster, rects, split_pieces)]
     figures: list[ImageInfo] = []
-    for bbox, count in clusters:
-        if print_ready and count >= _SPLIT_MIN_SHAPES and bbox in split_pieces:
-            w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            if min(w, h) >= _SPLIT_MIN_SIDE:
-                figures.append(ImageInfo(xref=-1, bbox=bbox, width=int(w), height=int(h), kind="vector"))
-            continue
+    for bbox, count in _cluster_rects(rects, _VECTOR_CLUSTER_GAP):
         w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
         if count < min_shapes:
             continue
@@ -481,25 +440,10 @@ _MOCKUP_MAX_LUMINANCE = 0.35
 _MOCKUP_MIN_COVERAGE = 0.4
 
 _mockup_cache: dict[tuple, bool] = {}
-_DOC_KEYS = __import__("itertools").count(1_000_000)
-
-
-def _doc_key(doc) -> int:
-    """A stable identity for a document, for per-document caches (see
-    chapter._doc_key: id(doc) is reused once a document is freed). Stored on the
-    document, so both modules agree on one key per document."""
-    key = getattr(doc, "_pdfval_key", None)
-    if key is None:
-        key = next(_DOC_KEYS)
-        try:
-            setattr(doc, "_pdfval_key", key)
-        except Exception:
-            return id(doc)
-    return key
 
 
 def _looks_like_ui_mockup(doc: "fitz.Document", page_index: int, bbox: tuple) -> bool:
-    key = (_doc_key(doc), page_index, _round_bbox(bbox, 1))
+    key = (id(doc), page_index, _round_bbox(bbox, 1))
     if key not in _mockup_cache:
         _mockup_cache[key] = _measure_dark_coverage(doc, page_index, bbox) >= _MOCKUP_MIN_COVERAGE
     return _mockup_cache[key]

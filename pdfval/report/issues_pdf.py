@@ -25,10 +25,10 @@ FILENAME = "issues.pdf"
 
 PAGE_W, PAGE_H = 595.0, 842.0          # A4
 MARGIN = 36.0
-CROP_DPI = 96                           # sharp enough to read at half an A4 page's width
+CROP_DPI = 110
 CROP_PAD = 40.0                         # points of page around the boxes
 CROP_MAX_H = 360.0                      # points of page shown at most
-JPEG_QUALITY = 70
+JPEG_QUALITY = 80
 
 RED = (0.86, 0.15, 0.15)
 ORANGE = (0.90, 0.51, 0.0)
@@ -174,14 +174,6 @@ def write_issues_pdf(view: dict, expected: fitz.Document, actual: fitz.Document,
             w.text(f"Topic: {where}", size=9, color=MUTED, gap=2)
         w.text(it.get("title") or "", size=12, bold=True, gap=3)
         w.text(it.get("description") or "", size=10, gap=4)
-        # Content one side prints and the other does not: say WHAT it is.
-        if it.get("type") in ("missing", "added"):
-            side = "prod" if it["type"] == "missing" else "stage"
-            words = " ".join(p.get("t", "") for p in (it.get(f"{side}_parts") or []) if p.get("t")).strip()
-            if words:
-                label = "Production prints" if side == "prod" else "Staging prints"
-                shown = words if len(words) <= 400 else words[:399] + "…"
-                w.text(f"{label}: “{shown}”", size=9.5, indent=10, gap=3)
         # What differs, one line each - only what the title and description do
         # not already say, each side labelled.
         said = f"{it.get('title') or ''} {it.get('description') or ''}".casefold()
@@ -191,8 +183,7 @@ def write_issues_pdf(view: dict, expected: fitz.Document, actual: fitz.Document,
             lines = []
             for label, text in (("Production", it.get("comment_prod")), ("Staging", it.get("comment_stage"))):
                 core = (text or "").split(": ", 1)[-1].rstrip(".").casefold()
-                generic = core in ("not in staging", "not in production")  # the title says it already
-                if text and core and core not in said and not generic:
+                if text and core and core not in said:
                     lines.append(f"{label}: {text}")
         for k, line in enumerate(lines, 1):
             w.text(f"{k}. {line}", size=9.5, indent=10, gap=1)
@@ -205,13 +196,6 @@ def write_issues_pdf(view: dict, expected: fitz.Document, actual: fitz.Document,
         w.rule()
 
     path = os.path.join(output_dir, FILENAME)
-    # The fallback font that renders every script is several MB and was embedded
-    # whole with each text box: a 7-page report came to 24 MB with 1.3 MB of
-    # pictures. Keep only the glyphs used, once.
-    try:
-        w.doc.subset_fonts()
-    except Exception:
-        pass
-    w.doc.save(path, garbage=4, deflate=True, deflate_fonts=True)
+    w.doc.save(path, garbage=3, deflate=True)
     w.doc.close()
     return path

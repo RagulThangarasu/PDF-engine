@@ -50,7 +50,7 @@ _BOXES_BEFORE_LIST = 3         # more word boxes than this on a side: one box, c
 ORANGE_TYPES = {
     "list-indent", "table-merge", "table-columns", "figure-alignment", "figure-size",
     "bold-missing", "bold-added", "shading", "marker-size", "text-space", "icon-changed",
-    "underline-missing", "underline-added", "figure-pixelated",
+    "underline-missing", "underline-added",
 }
 
 
@@ -360,132 +360,6 @@ def _anchors(expected: fitz.Document, actual: fitz.Document, exp_entries, act_en
     return kept
 
 
-# Every difference found inside one table is one issue: the table boxed whole,
-# each change listed in its comment.
-TABLE_TYPES = {
-    "table-cell", "table-row-missing", "table-row-added", "table-merge", "table-columns",
-    "table-fill-missing", "table-shape", "table-header-repeat", "table-as-text",
-}
-_TABLE_NEAR = 40.0   # points: boxes this close on the same page belong to one table
-_TABLE_LINES_SHOWN = 6
-_TABLE_KIND_NAMES = {
-    "table-cell": ("cell changed", "cells changed"),
-    "table-row-missing": ("row missing in Staging", "rows missing in Staging"),
-    "table-row-added": ("row added in Staging", "rows added in Staging"),
-    "table-merge": ("merge change", "merge changes"),
-    "table-columns": ("column count changed", "column counts changed"),
-    "table-fill-missing": ("background missing", "backgrounds missing"),
-    "table-as-text": ("table printed as text", "tables printed as text"),
-}
-
-
-def _table_line(kind: str, ch: dict) -> str:
-    """One table change as a reader says it: where (row, column, as printed)
-    and what (Production's text → Staging's)."""
-    row, column = (ch.get("row_label") or "").strip(), (ch.get("column") or "").strip()
-    before, after = (ch.get("before") or "").strip(), (ch.get("after") or "").strip()
-    where = ", ".join(p for p in ((f"Row “{_clip(row, 40)}”" if row else ""),
-                                  (f"column “{_clip(column, 30)}”" if column else "")) if p)
-    if kind == "table-row-missing":
-        what = f"missing in Staging{f' (“{_clip(before, 60)}”)' if before else ''}"
-    elif kind == "table-row-added":
-        what = f"added in Staging{f' (“{_clip(after, 60)}”)' if after else ''}"
-    elif before and not after:
-        what = f"“{_clip(before, 50)}” missing in Staging"
-    elif after and not before:
-        what = f"“{_clip(after, 50)}” added in Staging"
-    elif before or after:
-        what = f"“{_clip(before, 50)}” → “{_clip(after, 50)}”"
-    else:
-        what = _TABLE_KIND_NAMES.get(kind, ("changed", "changed"))[0]
-    return f"{where}: {what}" if where else what
-
-
-def _union_by_page(boxes: list[dict]) -> list[dict]:
-    """One box per page: the union of every box on it - the whole table."""
-    pages: dict[int, list[float]] = {}
-    for b in boxes:
-        x0, y0, x1, y1 = b["bbox"]
-        u = pages.get(b["page"])
-        pages[b["page"]] = [x0, y0, x1, y1] if u is None else [min(u[0], x0), min(u[1], y0),
-                                                                max(u[2], x1), max(u[3], y1)]
-    return [{"page": p, "bbox": [round(v, 2) for v in u]} for p, u in sorted(pages.items())]
-
-
-def _one_issue_per_table(issues: list[dict]) -> list[dict]:
-    """Fold the table issues of one table - cells changed, rows missing, cells
-    merged, a background gone - into one issue boxed on the whole table, with
-    every change numbered in its comment. Red when any change is something
-    missing or wrong; orange only when all of them are."""
-    def anchor(it: dict) -> tuple[str, dict] | None:
-        for side in ("prod", "stage"):
-            if it[f"{side}_boxes"]:
-                return side, it[f"{side}_boxes"][0]
-        return None
-
-    def near(a: dict, b: dict) -> bool:
-        if a["page"] != b["page"]:
-            return False
-        ax0, ay0, ax1, ay1 = a["bbox"]
-        bx0, by0, bx1, by1 = b["bbox"]
-        return not (bx1 < ax0 - _TABLE_NEAR or bx0 > ax1 + _TABLE_NEAR
-                    or by1 < ay0 - _TABLE_NEAR or by0 > ay1 + _TABLE_NEAR)
-
-    groups: list[list[dict]] = []
-    out: list[dict] = []
-    for it in issues:
-        if it["type"] in TABLE_TYPES and it.get("table_changes"):
-            # Even a table with one difference says where and what, as printed.
-            lines = [_table_line(it["type"], ch) for ch in it["table_changes"]]
-            it["changes"] = lines
-            it["comment_prod"] = it["comment_stage"] = _clip("; ".join(lines[:2]), 120)
-        spot = anchor(it) if it["type"] in TABLE_TYPES else None
-        if spot is None:
-            out.append(it)
-            continue
-        side, box = spot
-        for group in groups:
-            first = group[0]
-            if first["chapter_id"] != it["chapter_id"] or first.get("section") != it.get("section"):
-                continue
-            region = _union_by_page(sum((g[f"{side}_boxes"] for g in group), []))
-            if any(near(r, box) for r in region):
-                group.append(it)
-                break
-        else:
-            groups.append([it])
-            out.append(it)      # the group's place in the list
-    for group in groups:
-        if len(group) == 1:
-            continue
-        head = group[0]
-        head["prod_boxes"] = _union_by_page(sum((g["prod_boxes"] for g in group), []))
-        head["stage_boxes"] = _union_by_page(sum((g["stage_boxes"] for g in group), []))
-        lines: list[str] = []
-        kinds: dict[str, int] = {}
-        for g in group:
-            found = g.get("table_changes") or []
-            kinds[g["type"]] = kinds.get(g["type"], 0) + max(1, len(found))
-            lines += [_table_line(g["type"], ch) for ch in found] or [f"{g['title']}: {g['description']}"]
-        head["changes"] = lines
-        head["title"] = "Table: " + ", ".join(
-            f"{n} {_TABLE_KIND_NAMES.get(k, ('change', 'changes'))[n != 1]}" for k, n in kinds.items())
-        shown = lines[:_TABLE_LINES_SHOWN]
-        more = len(lines) - len(shown)
-        head["description"] = " ".join(f"{i}. {line}" for i, line in enumerate(shown, 1)) + (
-            f" + {more} more" if more else "")
-        head["minor"] = all(g["minor"] for g in group)
-        head["critical"] = any(g.get("critical") for g in group)
-        head["type"] = "table-cell" if any(g["type"] not in ("table-merge", "table-columns") for g in group) \
-            else head["type"]
-        head["comment_prod"] = head["comment_stage"] = _clip("; ".join(lines[:2]), 120) + (
-            f" (+{len(lines) - 2} more)" if len(lines) > 2 else "")
-        head["occurrences"] = sum(g.get("occurrences", 1) for g in group)
-        head["prod_page"] = head["prod_boxes"][0]["page"] if head["prod_boxes"] else None
-        head["stage_page"] = head["stage_boxes"][0]["page"] if head["stage_boxes"] else None
-    return out
-
-
 def build_issue_report(chapters: list, expected: fitz.Document, actual: fitz.Document,
                        output_dir: str | None) -> dict:
     """The data behind pdf.html."""
@@ -559,11 +433,6 @@ def build_issue_report(chapters: list, expected: fitz.Document, actual: fitz.Doc
                 "prod_parts": prod_parts,
                 "stage_parts": stage_parts,
                 "changes": changes,
-                # Where and what, as printed, for a table difference.
-                "table_changes": list(diff.get("changes") or []) or (
-                    [{k: diff.get(k, "") for k in ("row_label", "column", "before", "after")}]
-                    if diff.get("row_label") is not None or diff.get("column") else []
-                ),
                 # Red: something missing or wrong in Staging. Orange: an expected
                 # kind of difference to confirm - indent, merge, alignment, style.
                 "minor": diff.get("type") in ORANGE_TYPES,
@@ -576,8 +445,6 @@ def build_issue_report(chapters: list, expected: fitz.Document, actual: fitz.Doc
             "id": f"ch{ci}", "title": chapter.title, "count": len(issues) - before,
             "prod_range": _range(chapter.exp_pages), "stage_range": _range(chapter.act_pages),
         })
-
-    issues = _one_issue_per_table(issues)
 
     # Numbered in the order the nav lists them - by category, then as printed -
     # so issue #12 is the twelfth line in the nav and the "#12" on the page.
