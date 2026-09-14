@@ -195,4 +195,5 @@ def test_cells_merged_in_a_row_are_reported():
     stage = _table([("Model", "43", "55"), ("Speaker", "2 W 2 W", "")], spans=[0, 1])
     diffs = C.table_row_changes(prod, stage, Counter(), Counter())
     assert [d["type"] for d in diffs] == ["table-merge"]
-    assert "merged" in diffs[0]["summary"] and "row 2" in diffs[0]["summary"]
+    # The row is named by what it prints, not by its index.
+    assert "merged" in diffs[0]["summary"] and "speaker" in diffs[0]["summary"].lower()
