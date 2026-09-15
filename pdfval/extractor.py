@@ -15,6 +15,8 @@ class ImageInfo:
     width: int
     height: int
     kind: str = "raster"  # "raster" (embedded image XObject) or "vector" (drawn figure)
+    primitives: int = 1   # vector only: merged path/rect count - a cell's own
+                           # border traces as a handful, a drawn illustration as many
 
     @property
     def display_width(self) -> float:
@@ -87,6 +89,9 @@ _PRINT_VECTOR_MIN_SIDE = 20.0
 _PRINT_VECTOR_MIN_AREA = 500.0
 _PRINT_VECTOR_MIN_PRIMITIVES = 3
 _PRINT_RASTER_COVER = 0.3   # a drawn cluster this covered by embedded images is their backgrounds
+_TABLE_TRACE_MAX_PRIMITIVES = 10  # a cell's own border/ruling traces as a handful of shapes; more
+                                   # than this is real artwork (an illustration that happens to carry
+                                   # a small embedded badge), not a bordered table cell
 # Printer's marks - crop marks, registration targets, colour bars - sit in the
 # outer band of a print-ready page. Left in, they sit within the cluster gap of
 # each other and chain every shape on the page into one page-sized "figure",
@@ -98,6 +103,7 @@ _VECTOR_PANEL_MIN_HEIGHT = 40.0    # points: a filled half-page-wide rect this t
 _VECTOR_MIN_PRIMITIVES = 4  # a lone rectangle is a box/tint, not an illustration
 _VECTOR_CLUSTER_GAP = 12.0  # points - primitives at most this far apart are one figure
 _VECTOR_MAX_PAGE_FRACTION = 0.85  # a "figure" covering the whole page is a background
+_TABLE_TRACE_SHARE = 0.5   # a vector cluster must fill this much of the table(s) it sits in to BE the table
 
 
 def _rects_touch(a: tuple, b: tuple, gap: float) -> bool:
@@ -108,9 +114,27 @@ def _union(a: tuple, b: tuple) -> tuple:
     return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
 
 
-def _cluster_rects(rects: list[tuple], gap: float) -> list[tuple[tuple, int]]:
+def _spans_row_barrier(bbox: tuple, barriers: tuple[tuple[float, float, float], ...]) -> bool:
+    """True when `bbox` straddles a table row divider - the line between one
+    checklist row's picture and the next's - in the same column the divider
+    actually separates. Checked on the WOULD-BE merged box, not the pair being
+    merged, so a chain of smaller merges can't creep across the line one
+    touching step at a time. Scoped to the divider's own column (see
+    `_table_row_barriers`): a picture in a MERGED cell spanning several rows
+    (one "OSD icon" shared by four function rows of a 5-way controller table)
+    is not fragmented by dividers that belong to its neighbouring columns'
+    own, unspanned cells."""
+    x0, y0, x1, y1 = bbox
+    return any(y0 < y - 0.5 and y1 > y + 0.5 and x0 < bx1 and x1 > bx0 for y, bx0, bx1 in barriers)
+
+
+def _cluster_rects(
+    rects: list[tuple], gap: float, row_barriers: tuple[tuple[float, float, float], ...] = ()
+) -> list[tuple[tuple, int]]:
     """Greedily merge overlapping/nearby rectangles into clusters, repeating
     until nothing merges further. Returns (bbox, primitive_count) per cluster.
+    `row_barriers` (a real data table's row dividers) are never crossed, so a
+    picture in one table row never fuses with the picture in the row below.
     """
     clusters: list[list] = [[r, 1] for r in rects]
     merged = True
@@ -119,8 +143,9 @@ def _cluster_rects(rects: list[tuple], gap: float) -> list[tuple[tuple, int]]:
         out: list[list] = []
         for bbox, count in clusters:
             for other in out:
-                if _rects_touch(bbox, other[0], gap):
-                    other[0] = _union(other[0], bbox)
+                candidate = _union(other[0], bbox)
+                if _rects_touch(bbox, other[0], gap) and not _spans_row_barrier(candidate, row_barriers):
+                    other[0] = candidate
                     other[1] += count
                     merged = True
                     break
@@ -174,8 +199,33 @@ def get_vector_figures(doc: fitz.Document, page_index: int, print_ready: bool = 
     min_side = _PRINT_VECTOR_MIN_SIDE if print_ready else _VECTOR_MIN_SIDE
     min_area = _PRINT_VECTOR_MIN_AREA if print_ready else _VECTOR_MIN_AREA
     min_shapes = _PRINT_VECTOR_MIN_PRIMITIVES if print_ready else _VECTOR_MIN_PRIMITIVES
+    row_barriers = _table_row_barriers(doc, page_index) if print_ready else ()
+    clusters = _cluster_rects(rects, _VECTOR_CLUSTER_GAP, row_barriers)
+    if print_ready:
+        # A gap this side of the merge threshold sits BETWEEN two separate
+        # step illustrations about as often as it sits within one drawing's
+        # own shapes - two unrelated illustrations only 6pt apart still fuse
+        # into one 599pt "figure" spanning half the page, because the PDF's
+        # own path gaps don't reliably tell "two pictures" from "one picture's
+        # own spacing" apart. What DOES tell them apart is what the page
+        # actually renders as: a real blank band, running the full width of
+        # the cluster, is what a reader's eye reads as the gap between two
+        # pictures - the whitespace inside a single drawing never runs edge to
+        # edge like that. Only reconsidered once a cluster is already
+        # implausibly tall for one picture, and a candidate split is only
+        # taken when no shape's own bounding box straddles the blank band (so
+        # the two halves can never end up with overlapping boxes) and each
+        # half would still pass every ordinary figure threshold on its own.
+        split: list[tuple[tuple, int]] = []
+        for bbox, count in clusters:
+            if bbox[3] - bbox[1] <= _OVERSIZED_CLUSTER_HEIGHT:
+                split.append((bbox, count))
+                continue
+            members = [r for r in rects if _inside_bbox(r, bbox)]
+            split.extend(_split_oversized_cluster(doc, page_index, bbox, members, min_side, min_area, min_shapes))
+        clusters = split
     figures: list[ImageInfo] = []
-    for bbox, count in _cluster_rects(rects, _VECTOR_CLUSTER_GAP):
+    for bbox, count in clusters:
         w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
         if count < min_shapes:
             continue
@@ -184,9 +234,100 @@ def get_vector_figures(doc: fitz.Document, page_index: int, print_ready: bool = 
         if (w * h) / page_area > _VECTOR_MAX_PAGE_FRACTION:
             continue
         figures.append(
-            ImageInfo(xref=-1, bbox=bbox, width=int(w), height=int(h), kind="vector")
+            ImageInfo(xref=-1, bbox=bbox, width=int(w), height=int(h), kind="vector", primitives=count)
         )
     return figures
+
+
+_OVERSIZED_CLUSTER_HEIGHT = 320.0  # pt: taller than this, a vector cluster is probably several
+                                    # step illustrations merged through a narrow gap, not one drawing
+_BLANK_BAND_MIN_HEIGHT = 8.0    # pt: a full-width blank row-band at least this tall is real
+                                 # whitespace between two pictures, not gaps inside one drawing's ink
+_BLANK_BAND_MARGIN = 4.0        # pt: ignore a blank band touching the cluster's own top/bottom edge
+_BLANK_BAND_WHITE = 250         # 0-255: a pixel this light counts as blank background
+_BLANK_BAND_DPI = 150
+
+
+def _inside_bbox(r: tuple, bbox: tuple) -> bool:
+    return bbox[0] - 0.5 <= r[0] and bbox[1] - 0.5 <= r[1] and r[2] <= bbox[2] + 0.5 and r[3] <= bbox[3] + 0.5
+
+
+def _blank_row_bands(doc: fitz.Document, page_index: int, bbox: tuple) -> list[tuple[float, float]]:
+    """(y0, y1) in page points of each full-width blank strip strictly inside
+    `bbox`, as actually rendered - not inferred from vector path geometry,
+    which a curve's bounding box can overstate well past its visible ink.
+    """
+    x0, y0, x1, y1 = bbox
+    if x1 - x0 < 1 or y1 - y0 < 1:
+        return []
+    zoom = _BLANK_BAND_DPI / 72.0
+    try:
+        pix = doc[page_index].get_pixmap(clip=fitz.Rect(x0, y0, x1, y1), matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    except Exception:
+        return []
+    w, h, n = pix.width, pix.height, pix.n
+    samples = pix.samples
+    min_rows = max(1, int(_BLANK_BAND_MIN_HEIGHT * zoom))
+    margin_rows = int(_BLANK_BAND_MARGIN * zoom)
+    bands: list[tuple[float, float]] = []
+    start = None
+    for row in range(h):
+        offset = row * w * n
+        blank = min(samples[offset: offset + w * n]) >= _BLANK_BAND_WHITE if w else True
+        if blank and start is None:
+            start = row
+        elif not blank and start is not None:
+            if row - start >= min_rows and start >= margin_rows and h - row >= margin_rows:
+                bands.append((y0 + start / zoom, y0 + row / zoom))
+            start = None
+    return bands
+
+
+def _split_oversized_cluster(
+    doc: fitz.Document, page_index: int, bbox: tuple, members: list[tuple],
+    min_side: float, min_area: float, min_shapes: int,
+) -> list[tuple[tuple, int]]:
+    """Try to split one implausibly tall vector cluster at a real rendered
+    blank band inside it - members sorted to whichever side of the band's
+    MIDLINE their own centre falls on (a shape's bounding box, a large hollow
+    frame's especially, can reach past the band's edge without a stroke of
+    ink actually inside it - the render already proved that, so the box
+    alone does not disqualify a split). Only taken when the two halves come
+    out as a clean, non-overlapping partition AND both would still pass
+    every ordinary figure threshold entirely on their own - a genuinely
+    large single illustration (a full exploded assembly diagram) is never
+    chopped on a guess.
+    """
+    for band_y0, band_y1 in _blank_row_bands(doc, page_index, bbox):
+        mid = (band_y0 + band_y1) / 2
+        above = [r for r in members if (r[1] + r[3]) / 2 < mid]
+        below = [r for r in members if (r[1] + r[3]) / 2 >= mid]
+        if not above or not below:
+            continue
+        a_bbox = (min(r[0] for r in above), min(r[1] for r in above),
+                  max(r[2] for r in above), max(r[3] for r in above))
+        b_bbox = (min(r[0] for r in below), min(r[1] for r in below),
+                  max(r[2] for r in below), max(r[3] for r in below))
+        # The render already proved (band_y0, band_y1) is blank, so a member's
+        # own box reaching into it is the box lying, not real ink - a rotated
+        # or diagonal shape's axis-aligned box routinely overstates its true
+        # footprint this way. Clipped to the verified-blank edges rather than
+        # rejected, so a genuine split is not thrown out on a box artifact.
+        a_bbox = (a_bbox[0], a_bbox[1], a_bbox[2], min(a_bbox[3], band_y0))
+        b_bbox = (b_bbox[0], max(b_bbox[1], band_y1), b_bbox[2], b_bbox[3])
+        aw, ah = a_bbox[2] - a_bbox[0], a_bbox[3] - a_bbox[1]
+        bw, bh = b_bbox[2] - b_bbox[0], b_bbox[3] - b_bbox[1]
+        if (len(above) >= min_shapes and aw >= min_side and ah >= min_side and aw * ah >= min_area
+                and len(below) >= min_shapes and bw >= min_side and bh >= min_side and bw * bh >= min_area):
+            out: list[tuple[tuple, int]] = []
+            for sub_bbox, sub_members in ((a_bbox, above), (b_bbox, below)):
+                if sub_bbox[3] - sub_bbox[1] > _OVERSIZED_CLUSTER_HEIGHT:
+                    out.extend(_split_oversized_cluster(doc, page_index, sub_bbox, sub_members,
+                                                          min_side, min_area, min_shapes))
+                else:
+                    out.append((sub_bbox, len(sub_members)))
+            return out
+    return [(bbox, len(members))]
 
 
 def get_figures(doc: fitz.Document, page_index: int, print_ready: bool = False) -> list[ImageInfo]:
@@ -210,19 +351,40 @@ def get_figures(doc: fitz.Document, page_index: int, print_ready: bool = False) 
         if any(_overlap_fraction(fig.bbox, r.bbox) > 0.6 for r in rasters):
             continue
         # The coloured tiles behind a column of embedded app icons chain into
-        # one tall drawn "figure" that is really those images' backgrounds.
-        if print_ready and (
+        # one tall drawn "figure" that is really those images' backgrounds. But
+        # a cell's own border/ruling traces as only a handful of primitives; a
+        # richly-drawn illustration that happens to carry a small embedded
+        # badge or two (a numbered callout circle) does not, and must not be
+        # mistaken for a coloured-tile background just because a raster sits
+        # inside it.
+        nested = sum(1 for r in rasters if _overlap_fraction(r.bbox, fig.bbox) > 0.8)
+        nested_cover = _covered_fraction(fig.bbox, [r.bbox for r in rasters if _overlap_fraction(r.bbox, fig.bbox) > 0.8])
+        if print_ready and nested and (
             _covered_fraction(fig.bbox, [r.bbox for r in rasters]) > _PRINT_RASTER_COVER
-            or sum(1 for r in rasters if _overlap_fraction(r.bbox, fig.bbox) > 0.8) >= 2
+            or (fig.primitives <= _TABLE_TRACE_MAX_PRIMITIVES and nested >= 2)
+            # A lone last row of a page-split table (no full table detected to
+            # catch it below) traces its own label cell and picture cell as a
+            # handful of border/divider primitives, with the one real picture
+            # - a raster - filling only a small share of that combined frame.
+            # A genuinely single-bordered photo fills most of its own frame.
+            or (fig.primitives <= _TABLE_TRACE_MAX_PRIMITIVES and nested == 1 and nested_cover < 0.3)
         ):
             continue
         # Covered by the tables on the page - one table, or (as with a stacked
         # pair of spec tables sharing a border) several that together fill the
         # cluster. A single-table test misses the stacked case: neither table
         # alone covers half the combined bbox, but between them they cover all
-        # of it.
+        # of it. But a checklist/spec table also legitimately PRINTS a picture
+        # inside one of its own cells (an "item name | item picture" unboxing
+        # table) - that picture is a small fraction of the table's own area, not
+        # a vector tracing of the table's ruling, so it is only dropped here
+        # when the figure itself accounts for most of the table(s) it sits in.
         if _covered_fraction(fig.bbox, table_bboxes) > 0.6:
-            continue
+            covering = [b for b in table_bboxes if _overlap_fraction(fig.bbox, b) > 0.05]
+            table_area = sum((b[2] - b[0]) * (b[3] - b[1]) for b in covering)
+            fig_area = (fig.bbox[2] - fig.bbox[0]) * (fig.bbox[3] - fig.bbox[1])
+            if fig_area > _TABLE_TRACE_SHARE * max(table_area, 1e-6):
+                continue
         vectors.append(fig)
     return rasters + vectors
 
@@ -253,6 +415,43 @@ def _page_table_bboxes(doc: fitz.Document, page_index: int) -> list[tuple]:
         return [t["bbox"] for t in get_tables(path, page_index, doc)]
     except Exception:
         return []
+
+
+def _table_row_barriers(doc: fitz.Document, page_index: int) -> tuple[tuple[float, float, float], ...]:
+    """(y, x0, x1) for the divider between each pair of consecutive rows of a
+    genuine data table on this page, scoped to the column it actually
+    separates. An "item name | item picture" checklist row's own picture,
+    drawn as vectors, sits close enough to the row above and below that
+    gap-based clustering alone would fuse several rows' pictures into one tall
+    figure; a cluster never crosses one of these lines within that column.
+
+    A cell a rowspan covers reads back as `None` for every row after the
+    first (see `get_tables`), so that column's own divider is left out for
+    exactly those rows: a single icon spanning several rows - a 5-way
+    controller table's "OSD icon" column, one picture shared by four function
+    rows - is not fragmented at row lines that belong only to its
+    neighbouring columns' own, unspanned cells.
+    """
+    path = getattr(doc, "name", "") or ""
+    if not path or not os.path.isfile(path):
+        return ()
+    try:
+        tables = get_tables(path, page_index, doc)
+    except Exception:
+        return ()
+    barriers: list[tuple[float, float, float]] = []
+    for t in tables:
+        rows = t.get("cells") or []
+        for row, next_row in zip(rows, rows[1:]):
+            for k in range(max(len(row), len(next_row))):
+                cell = row[k] if k < len(row) else None
+                next_cell = next_row[k] if k < len(next_row) else None
+                if not cell or not next_cell:
+                    continue  # a rowspan continues through here - no divider for THIS column
+                bottom, top = cell[3], next_cell[1]
+                if bottom <= top:
+                    barriers.append(((bottom + top) / 2, min(cell[0], next_cell[0]), max(cell[2], next_cell[2])))
+    return tuple(barriers)
 
 
 def _overlap_fraction(a: tuple, b: tuple) -> float:

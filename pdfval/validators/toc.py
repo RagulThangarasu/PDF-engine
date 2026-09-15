@@ -29,6 +29,13 @@ _EXCLUDED_HEADING_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A per-country RoHS hazardous-substance declaration ("China RoHS", "Turkey
+# RoHS", "India RoHS"...): a standardised legal table whose X/O cells the two
+# documents can genuinely differ on model to model, not a content difference
+# this validation is meant to catch. Skipped the same way a Q&A/TOC page is -
+# not compared at all, in whichever country's copy either document carries.
+_REGULATORY_HEADING_RE = re.compile(r"\brohs\b", re.IGNORECASE)
+
 # A printed "Table of Contents" listing page (dot-leader "Title .... N" lines)
 # isn't itself bookmarked, so it would otherwise get swallowed into whichever
 # heading happens to precede it. Its content is meta/pagination, not prose, and
@@ -37,7 +44,7 @@ _TOC_DOT_LEADER_RE = re.compile(r"\.{4,}")
 
 
 def is_excluded_heading(title: str) -> bool:
-    return bool(_EXCLUDED_HEADING_RE.search(title))
+    return bool(_EXCLUDED_HEADING_RE.search(title) or _REGULATORY_HEADING_RE.search(title))
 
 
 def looks_like_toc_listing(text: str) -> bool:
