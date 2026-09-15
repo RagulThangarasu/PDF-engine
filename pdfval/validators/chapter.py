@@ -5826,7 +5826,10 @@ def settle_tables(diffs: list[dict], exp_el: Element | None, act_el: Element | N
                 el = d.get("exp")
                 if el is not None:
                     row_units = _text_units(_row_text(el.cells[0]) if el.cells else "")
-                    if row_units and (row_units <= act_units or row_units - (act_units - row_units)):
+                    # A Counter has no ordering (`<=` between two Counters raises
+                    # TypeError) - subset is "nothing left over once act_units'
+                    # own counts are subtracted out", the same idiom used above.
+                    if row_units and not (row_units - act_units):
                         # Row's content found in Staging's tables, skip this false positive
                         continue
             else:  # dtype == "table-row-added"
@@ -5834,7 +5837,7 @@ def settle_tables(diffs: list[dict], exp_el: Element | None, act_el: Element | N
                 el = d.get("act")
                 if el is not None:
                     row_units = _text_units(_row_text(el.cells[0]) if el.cells else "")
-                    if row_units and (row_units <= exp_units or row_units - (exp_units - row_units)):
+                    if row_units and not (row_units - exp_units):
                         # Row's content found in Production's tables, skip this false positive
                         continue
         
