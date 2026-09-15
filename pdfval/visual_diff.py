@@ -50,6 +50,13 @@ def reset_cache() -> None:
     _PAGE_CACHE.clear()
 
 
+def _area(r: "fitz.Rect") -> float:
+    """A rect's area without `Rect.get_area()` - not on every PyMuPDF release
+    a bare `PyMuPDF>=X` floor in requirements.txt still installs; `width`/
+    `height` are on every version there has ever been."""
+    return r.width * r.height
+
+
 def _gray(doc: fitz.Document, page_index: int, clip, zoom: float):
     import numpy as np
 
@@ -171,7 +178,7 @@ def find_artwork(src_doc: fitz.Document, src_page: int, src_rect: tuple,
 
     tried: list[tuple[int, fitz.Rect]] = []
     for _, page_index, rect in sorted(candidates, key=lambda c: -c[0]):
-        if any(p == page_index and (r & rect).get_area() >= 0.5 * rect.get_area() for p, r in tried):
+        if any(p == page_index and _area(r & rect) >= 0.5 * _area(rect) for p, r in tried):
             continue
         tried.append((page_index, rect))
         if len(tried) > _CANDIDATES:

@@ -403,6 +403,49 @@ def _chapter_document(variant: str) -> pymupdf.Document:
     return doc
 
 
+def _draw_gear_icon(page, rect: pymupdf.Rect, color=(0, 0, 0)) -> None:
+    """A small inline icon - a ring, a hub, and a spoke - three primitives so
+    the vector-figure detector reads it as artwork, not a stray rule. The
+    spoke is drawn as a thin filled rect, not a zero-width line: a bare line
+    has no area in one dimension and the vector detector reads that as a
+    rule/underline, not artwork, and drops it - two primitives short of a
+    figure at all."""
+    page.draw_rect(rect, color=color, width=1.0)
+    centre = pymupdf.Point((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2)
+    page.draw_circle(centre, rect.width * 0.3, color=color, width=1.0)
+    page.draw_rect(
+        pymupdf.Rect(centre.x - 1, rect.y0 + 2, centre.x + 1, rect.y1 - 2), color=color, fill=color, width=0
+    )
+
+
+_ICON_RECT = pymupdf.Rect(188, 94, 212, 118)
+
+
+def _icon_document(variant: str) -> pymupdf.Document:
+    """One page, one heading, and a line of text reading "Press the Settings
+    [[icon]] option to continue." (Courier, so word widths are exact and the
+    icon can be placed precisely beside "Settings" without overlapping it).
+
+    variant "prod"    - the icon is drawn
+            "missing" - the icon is not drawn at all
+            "colour"  - the same icon, drawn in a different colour
+    """
+    doc = pymupdf.open()
+    doc.new_page(width=PAGE_W, height=PAGE_H)
+    page = doc[0]
+    page.insert_text((72, 60), "Icons", fontsize=16)
+    page.insert_text((72, 110), "Press the Settings", fontsize=10, fontname="courier")
+    page.insert_text((220, 110), "option to continue.", fontsize=10, fontname="courier")
+    if variant == "prod":
+        _draw_gear_icon(page, _ICON_RECT)
+    elif variant == "colour":
+        _draw_gear_icon(page, _ICON_RECT, color=(0.7, 0, 0))
+    # "missing": nothing drawn at all
+
+    doc.set_toc([[1, "Icons", 1]])
+    return doc
+
+
 def main() -> None:
     os.makedirs(FIXTURES, exist_ok=True)
     written = []
@@ -427,6 +470,9 @@ def main() -> None:
         ("chapters_prod.pdf", _chapter_document("prod")),
         ("chapters_stage_reflowed.pdf", _chapter_document("reflowed")),
         ("chapters_stage_edited.pdf", _chapter_document("edited")),
+        ("icons_prod.pdf", _icon_document("prod")),
+        ("icons_stage_missing.pdf", _icon_document("missing")),
+        ("icons_stage_colour.pdf", _icon_document("colour")),
     ):
         path = os.path.join(FIXTURES, name)
         doc.save(path)
