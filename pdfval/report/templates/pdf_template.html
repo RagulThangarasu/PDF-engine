@@ -189,7 +189,7 @@
       <label><input type="checkbox" id="onlyActive"> Selected issue only</label>
       <select id="heading" onchange="jumpHeading(this.value)">
         <option value="">Go to heading…</option>
-        {% for h in view.anchors %}<option value="{{ loop.index0 }}">{{ '— ' * (h.level - 1) }}{{ h.title }}</option>{% endfor %}
+        {% for h in view.anchors %}<option value="{{ loop.index0 }}">{{ '— ' * (h.level - 1) }}{{ h.title }}{{ '' if h.stage else ' (not in Staging)' }}</option>{% endfor %}
       </select>
       <button onclick="zoom(-0.1)" title="Zoom out">−</button><span class="zoomval" id="zoomval">100%</span><button onclick="zoom(0.1)" title="Zoom in">+</button><button onclick="zoom(0)" title="Show pages at the PDF's actual size">Actual size</button>
     </div>
@@ -245,7 +245,11 @@ const other = side => side === 'prod' ? 'stage' : 'prod';
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const LINKS = []; // {box, note, line, wrap} - redrawn on every relayout
 const CROSS = []; // {box, id} - the other document's boxes, lined to the comment across the panes
-const homeOf = it => (it.prod_boxes.length ? 'prod' : 'stage');
+// A synthetic marker (no element there at all - see `_marker_box` in
+// issues.py) never outranks a real box for where the comment lives: a
+// "missing"/"added" finding's real content decides home, its marker is just
+// a pin on the other side, tied to that same comment by a line.
+const homeOf = it => (it.prod_boxes.some(b => !b.marker) ? 'prod' : 'stage');
 function pagesOf(it, side) { return [...new Set(boxesOf(it, side).map(b => b.page))]; }
 // What the comment says: the issue, each spot that differs on this page, and
 // where it is on both documents.
@@ -478,10 +482,17 @@ function scrollPane(side, top) {
   quietUntil[side] = performance.now() + 150;
   panes[side].scrollTo({ top: Math.max(0, top), behavior: 'auto' });
 }
+// Production always has a waypoint (the nav is Production's own TOC); Staging
+// only where a heading actually matched, so a Production-only heading's
+// `stage` is null here and must not be dereferenced.
+function anchorTop(side, h) {
+  const p = h[side];
+  return p ? pageTop(side, p.page, p.y) : null;
+}
 function follow(side, force) {
   const to = other(side);
-  const a = ANCHORS.map(h => pageTop(side, h[side].page, h[side].y));
-  const b = ANCHORS.map(h => pageTop(to, h[to].page, h[to].y));
+  const a = ANCHORS.map(h => anchorTop(side, h));
+  const b = ANCHORS.map(h => anchorTop(to, h));
   const usable = k => a[k] != null && b[k] != null;
   const line = panes[side].scrollTop + READ_LINE;
   let at = -1;
@@ -526,7 +537,17 @@ SIDES.forEach(side => {
 function jumpHeading(value) {
   if (value === '') return;
   const h = ANCHORS[+value];
-  SIDES.forEach(side => { const top = pageTop(side, h[side].page, h[side].y); if (top != null) scrollPane(side, top - READ_LINE + 20); });
+  const prodTop = anchorTop('prod', h);
+  if (prodTop != null) scrollPane('prod', prodTop - READ_LINE + 20);
+  if (h.stage) {
+    const stageTop = anchorTop('stage', h);
+    if (stageTop != null) scrollPane('stage', stageTop - READ_LINE + 20);
+  } else if (document.getElementById('sync').checked) {
+    // Production-only heading - Staging has no waypoint of its own here, so
+    // interpolate its position from the nearest headings both sides share,
+    // the same way scrolling Production by hand brings Staging along.
+    follow('prod', true);
+  }
   showNow(+value);
 }
 
@@ -540,7 +561,7 @@ function findAnchor(title, side, pageHint) {
   const key = title.trim().toLowerCase();
   let best = -1, bestDist = Infinity;
   ANCHORS.forEach((h, i) => {
-    if (h.title.trim().toLowerCase() !== key) return;
+    if (h.title.trim().toLowerCase() !== key || !h[side]) return;
     const dist = pageHint == null ? 0 : Math.abs(h[side].page - pageHint);
     if (dist < bestDist) { best = i; bestDist = dist; }
   });
@@ -576,7 +597,7 @@ function select(id, from) {
     if (!placed[other(side)]) return;
     const b = boxesOf(it, other(side))[0];
     const idx = findAnchor(it.section || it.chapter, other(side), b ? b.page : null);
-    if (idx >= 0) {
+    if (idx >= 0 && ANCHORS[idx][side]) {
       const h = ANCHORS[idx];
       const top = pageTop(side, h[side].page, h[side].y);
       if (top != null) { scrollPane(side, top - panes[side].clientHeight / 3); return; }

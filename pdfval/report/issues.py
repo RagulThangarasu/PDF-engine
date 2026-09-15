@@ -48,9 +48,9 @@ _BOXES_BEFORE_LIST = 3         # more word boxes than this on a side: one box, c
 # Drawn orange. Everything else - missing or wrong content, a missing table or
 # row, a/b/c instead of 1/2/3, a lost bullet, a missing picture or link - is red.
 ORANGE_TYPES = {
-    "list-indent", "table-merge", "table-columns", "figure-alignment", "figure-size",
+    "list-indent", "table-merge", "table-columns", "table-cell-layout", "figure-alignment", "figure-size",
     "bold-missing", "bold-added", "shading", "marker-size", "text-space", "icon-changed",
-    "underline-missing", "underline-added",
+    "underline-missing", "underline-added", "line-spacing",
 }
 
 
@@ -106,12 +106,21 @@ def _comments(diff: dict, title: str, description: str) -> tuple[str, str]:
         prod = f"Missing in Staging: {_quoted(gone)}" if gone else "Staging adds words here"
         stage = f"Extra in Staging: {_quoted(extra)}" if extra else f"Missing here: {_quoted(gone)}"
         return _clip(prod), _clip(stage)
+    if kind in ("missing", "added", "table-row-missing", "table-row-added"):
+        # No counterpart element exists on the other side to box, so there is
+        # nothing to write a DIFFERENT comment about there - both sides get
+        # the exact same detailed line: what is missing/extra, quoted, so a
+        # reviewer sees the same explanation whichever document is on screen.
+        lost = kind in ("missing", "table-row-missing")
+        src = diff.get("exp") if lost else diff.get("act")
+        el_text = getattr(src, "text", "") if src is not None else ""
+        quoted = _quoted([el_text or diff.get("detail") or ""])
+        label = "Missing in Staging" if lost else "Extra in Staging"
+        msg = _clip(f"{label}: {quoted}") if quoted else _clip(title)
+        return msg, msg
     fixed = {
-        "missing": ("Not in Staging", ""),
-        "added": ("", "Not in Production"),
         "figure-missing": ("Picture missing in Staging", ""),
         "figure-added": ("", "Picture not in Production"),
-        "figure-spots": ("", "Black spot in Staging's picture"),
         "bold-missing": ("Bold in Production", "Not bold in Staging"),
         "bold-added": ("Regular in Production", "Bold added in Staging"),
         "link-missing": ("Link in Production", "Link missing in Staging"),
@@ -119,13 +128,11 @@ def _comments(diff: dict, title: str, description: str) -> tuple[str, str]:
         "link-broken": ("", "Link does not work in Staging"),
         "list-marker-missing": ("List item in Production", "Bullet / number missing in Staging"),
         "list-marker-added": ("Plain text in Production", "Bullet / number added in Staging"),
-        "table-row-missing": ("Row missing in Staging", "This row is missing from the table"),
         "table-as-text": ("Table in Production", "Table missing in Staging — rows printed as plain text"),
         "table-fill-missing": ("Background in Production", "Background missing in Staging"),
         "icon-missing": ("Icon in Production", "Icon missing in Staging"),
         "icon-added": ("No icon in Production", "Icon added in Staging"),
         "icon-colour": ("Icon colour in Production", "Icon colour changed in Staging"),
-        "table-row-added": ("Row not in Production's table", "Row added in Staging"),
     }
     if kind in fixed:
         return fixed[kind]
@@ -133,12 +140,19 @@ def _comments(diff: dict, title: str, description: str) -> tuple[str, str]:
         return (("Plain page in Production", "Shaded box added in Staging") if "added" in title
                 else ("Shaded box in Production", "Shading missing in Staging"))
     if kind == "link-target":
-        # detail reads "Production: section: X · Staging: section: Y"
+        # detail reads "Production: section: X · Staging: section: Y" - or, for
+        # a link to an outside address, "Production: https://... · Staging: ...".
+        # A URL is the one piece of a comment that must never be clipped short:
+        # a path cut off mid-way ("…/software/display-pilot-2/spec.h…") reads as
+        # a whole different, unreadable address rather than the real one, and
+        # is exactly the detail a reviewer opened this comment to check. Each
+        # side is clipped on its own, generously, instead of the assembled
+        # sentence at a fixed length that a long URL alone can blow past.
         sides = (diff.get("detail") or "").split(" · ")
         if len(sides) == 2:
-            where = [re.sub(r"^\s*section\s*:\s*", "", s.split(":", 1)[-1]).strip() for s in sides]
+            where = [_clip(re.sub(r"^\s*section\s*:\s*", "", s.split(":", 1)[-1]).strip(), 200) for s in sides]
             both = f"Production links to “{where[0]}”; Staging links to “{where[1]}”"
-            return _clip(both, 120), _clip(both, 120)
+            return both, both
     # "The figure beside “LCD monitor”: 24×87pt in Production, 30×105pt in
     # Staging." - what differs is the part after the figure's name.
     tail = description.split("”: ", 1)[-1] if "”: " in description else description
@@ -164,6 +178,29 @@ def _mark(page_index: int, rect, note: str) -> dict:
     r = fitz.Rect(rect)
     return {"page": page_index + 1, "bbox": [round(r.x0, 2), round(r.y0, 2), round(r.x1, 2), round(r.y1, 2)],
             "note": note}
+
+
+# A "missing"/"added" finding has no element on one side to box - nothing was
+# printed there. Left with no box at all, that side showed nothing when a
+# reviewer had it open on its own: no pin, no comment, no way to tell the
+# issue exists without switching to the other document first.
+_MARKER_TYPES = {"missing", "added", "table-row-missing", "table-row-added", "figure-missing", "figure-added"}
+
+
+def _marker_box(doc: fitz.Document, point: tuple, note: str) -> dict | None:
+    """A small pin at roughly where the missing/extra content would sit on
+    this side, carrying the SAME comment as the side that has it - so the
+    issue is visible, and reads the same, whichever document is on screen."""
+    page_index, y = point
+    try:
+        rect = doc[page_index].rect
+    except Exception:
+        return None
+    x0 = rect.x0 + 36
+    x1 = min(rect.x1 - 8, x0 + 90)
+    y0 = min(max(rect.y0, y), max(rect.y0, rect.y1 - 14))
+    return {"page": page_index + 1, "bbox": [round(x0, 2), round(y0, 2), round(x1, 2), round(y0 + 14, 2)],
+            "note": note, "marker": True}
 
 
 def _hits_in(doc: fitz.Document, el, phrase: str) -> list[tuple[int, "fitz.Rect"]]:
@@ -335,29 +372,41 @@ def _y_share(doc: fitz.Document, page_index: int, y: float) -> float:
 
 
 def _anchors(expected: fitz.Document, actual: fitz.Document, exp_entries, act_entries) -> list[dict]:
-    """The headings both documents have, with where each prints on each side -
-    what the viewer scrolls the two documents together by. Kept in reading order
-    on BOTH sides: a heading Staging moved elsewhere cannot be a waypoint, or
-    scrolling forward in one document would jump the other one back."""
+    """Production's own table of contents, whole - the nav lists every heading
+    the baseline has, not just the ones Staging also has, and clicking one
+    always moves Production there. `stage` is filled in only where Staging
+    has a usable match for it, in step with the matches before it (a heading
+    Staging prints earlier than one already placed cannot be a waypoint, or
+    scrolling forward in Production would jump Staging back): the JS side
+    interpolates Staging's position from its neighbours when a heading is
+    Production-only, the same way it already does for a one-sided issue."""
     out: list[dict] = []
     for m in match_toc_entries(exp_entries, act_entries):
-        if m.expected_index is None or m.actual_index is None:
+        if m.expected_index is None:
             continue
-        e, a = exp_entries[m.expected_index], act_entries[m.actual_index]
-        if not (0 <= e.page < expected.page_count and 0 <= a.page < actual.page_count):
+        e = exp_entries[m.expected_index]
+        if not (0 <= e.page < expected.page_count):
             continue
+        stage = None
+        if m.actual_index is not None:
+            a = act_entries[m.actual_index]
+            if 0 <= a.page < actual.page_count:
+                stage = {"page": a.page + 1, "y": _y_share(actual, a.page, a.y)}
         out.append({
             "title": e.title, "level": e.level,
             "prod": {"page": e.page + 1, "y": _y_share(expected, e.page, e.y)},
-            "stage": {"page": a.page + 1, "y": _y_share(actual, a.page, a.y)},
+            "stage": stage,
         })
     out.sort(key=lambda h: (h["prod"]["page"], h["prod"]["y"]))
-    kept: list[dict] = []
+    last_stage = (0, 0.0)
     for h in out:
-        if kept and (h["stage"]["page"], h["stage"]["y"]) <= (kept[-1]["stage"]["page"], kept[-1]["stage"]["y"]):
-            continue
-        kept.append(h)
-    return kept
+        if h["stage"] is not None:
+            here = (h["stage"]["page"], h["stage"]["y"])
+            if here <= last_stage:
+                h["stage"] = None  # out of order - a Production-only waypoint instead of a wrong one
+            else:
+                last_stage = here
+    return out
 
 
 def build_issue_report(chapters: list, expected: fitz.Document, actual: fitz.Document,
@@ -399,16 +448,41 @@ def build_issue_report(chapters: list, expected: fitz.Document, actual: fitz.Doc
             # at the same topic even when one side has nothing to box.
             topic = (getattr(chapter, "topics", None) or {}).get(diff.get("section"))
             section = topic["title"] if topic else ""
+            # A figure only one side prints still often has its caption text on
+            # both - closer to the reader's actual place than the top of the
+            # whole heading the figure falls under.
+            exp_near, act_near = diff.get("exp_anchor"), diff.get("act_anchor")
             prod_anchor = (
+                {"page": exp_near[0] + 1, "y": _y_share(expected, exp_near[0], exp_near[1])}
+                if exp_near and 0 <= exp_near[0] < expected.page_count else
                 {"page": topic["prod"][0] + 1, "y": _y_share(expected, topic["prod"][0], topic["prod"][1])}
                 if topic and 0 <= topic["prod"][0] < expected.page_count else None
             )
             stage_anchor = (
+                {"page": act_near[0] + 1, "y": _y_share(actual, act_near[0], act_near[1])}
+                if act_near and 0 <= act_near[0] < actual.page_count else
                 {"page": topic["stage"][0] + 1, "y": _y_share(actual, topic["stage"][0], topic["stage"][1])}
                 if topic and 0 <= topic["stage"][0] < actual.page_count else None
             )
             title, description = _title(diff["summary"]), _description(diff["summary"])
             comment_prod, comment_stage = _comments(diff, title, description)
+            if diff.get("type") in _MARKER_TYPES:
+                def _pick_point(near, topic_key, doc):
+                    if near and 0 <= near[0] < doc.page_count:
+                        return near
+                    if topic and 0 <= topic[topic_key][0] < doc.page_count:
+                        return topic[topic_key]
+                    return None
+                if not prod_boxes:
+                    point = _pick_point(exp_near, "prod", expected)
+                    marker = _marker_box(expected, point, comment_prod) if point else None
+                    if marker:
+                        prod_boxes = [marker]
+                if not stage_boxes:
+                    point = _pick_point(act_near, "stage", actual)
+                    marker = _marker_box(actual, point, comment_stage) if point else None
+                    if marker:
+                        stage_boxes = [marker]
             prod_parts, stage_parts = _side_content(diff, a, b)
             issues.append({
                 "id": len(issues),
@@ -434,12 +508,20 @@ def build_issue_report(chapters: list, expected: fitz.Document, actual: fitz.Doc
                 "stage_parts": stage_parts,
                 "changes": changes,
                 # Red: something missing or wrong in Staging. Orange: an expected
-                # kind of difference to confirm - indent, merge, alignment, style.
-                "minor": diff.get("type") in ORANGE_TYPES,
+                # kind of difference to confirm - indent, merge, alignment, style
+                # - or a "missing"/"added" text the OCR-softening pass could not
+                # confirm either way (a spec caption baked into the other side's
+                # artwork as pixels). `chapter.py` already computed this from the
+                # diff's real severity (which factors in `review_only`); reading
+                # only `type in ORANGE_TYPES` here duplicated that logic and fell
+                # out of step with it, so a softened finding still rendered as an
+                # urgent red failure.
+                "minor": diff.get("type") in ORANGE_TYPES or diff.get("minor", False),
                 # Level 1 is what the document actually says or lacks outright -
                 # the one kind of finding a reader must not miss among the rest
                 # that also fail the run, so it is marked to draw darker.
-                "critical": diff.get("severity") == 1 and diff.get("type") not in ORANGE_TYPES,
+                "critical": (diff.get("severity") == 1 and diff.get("type") not in ORANGE_TYPES
+                             and not diff.get("review_only")),
             })
         chapter_rows.append({
             "id": f"ch{ci}", "title": chapter.title, "count": len(issues) - before,

@@ -89,8 +89,10 @@ def run(
         reset_heading_cache()
         reset_furniture_cache()
         from pdfval.ocr import reset_ocr_cache
+        from pdfval.visual_diff import reset_cache as reset_visual_cache
 
         reset_ocr_cache()
+        reset_visual_cache()
     return report
 
 
