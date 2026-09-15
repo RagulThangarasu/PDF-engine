@@ -131,6 +131,31 @@ def test_same_numbering_drawn_as_detached_markers_is_not_reported():
     assert [d for d in chapter.differences if d["type"] == "numbering"] == []
 
 
+# --- inline icons ------------------------------------------------------------
+# An icon beside a word in running text ("Settings [gear icon]") is its own
+# check: the word-level text diff never sees it (it is a picture, not a
+# character), and the whole-figure check never sees it either (too small to
+# be a figure of its own) - so a missing or recoloured inline icon has no
+# other check that would catch it.
+
+
+def test_inline_icon_removed_is_reported_as_missing():
+    [chapter] = _chapters("icons_prod.pdf", "icons_stage_missing.pdf")
+    [change] = [d for d in _real(chapter) if d["type"] == "icon-missing"]
+    assert "the icon beside “Settings”" in change["summary"]
+
+
+def test_inline_icon_recoloured_is_reported():
+    [chapter] = _chapters("icons_prod.pdf", "icons_stage_colour.pdf")
+    [change] = [d for d in _real(chapter) if d["type"] == "icon-colour"]
+    assert "grey in Production and red in Staging" in change["summary"]
+
+
+def test_identical_icon_is_not_reported():
+    [chapter] = _chapters("icons_prod.pdf", "icons_prod.pdf")
+    assert [d for d in chapter.differences if d["type"].startswith("icon-")] == []
+
+
 if __name__ == "__main__":
     import pytest
 

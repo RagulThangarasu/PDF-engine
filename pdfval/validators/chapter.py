@@ -1090,6 +1090,13 @@ def _intersection(a: tuple, b: tuple) -> float:
     return w * h if w > 0 and h > 0 else 0.0
 
 
+def _rect_area(r: "fitz.Rect") -> float:
+    """A `fitz.Rect`'s area without `Rect.get_area()` - not on every PyMuPDF
+    release a bare `PyMuPDF>=X` floor in requirements.txt still installs;
+    `width`/`height` are on every version there has ever been."""
+    return r.width * r.height
+
+
 _TABLE_FIGURE_OVERLAP = 0.4  # a "figure" this much inside a table is the table's rules
 _TABLE_FIGURE_SHARE = 0.5    # ... but only counted when it also fills this much of the table
                              # itself - a picture in one cell of a much bigger table is not
@@ -2375,8 +2382,8 @@ def marker_changes(exp_group: list[Element], act_group: list[Element],
         a = next((e for e in texts_a if phrase and phrase in e.key), None)
         if a is None:
             continue
-        stage_marker = _marker_before(actual, b.pages, b.key)
-        prod_marker = _marker_before(expected, a.pages, b.key)
+        stage_marker = _marker_before(actual, b.pages, b.key, near=(b.page, b.bbox[1]))
+        prod_marker = _marker_before(expected, a.pages, b.key, near=(a.page, a.bbox[1]))
         if stage_marker is None or prod_marker is None or stage_marker == prod_marker:
             continue
         item = (prod_marker, stage_marker, b.key, a, b)
@@ -2429,7 +2436,7 @@ def _page_fills(doc: fitz.Document, page_index: int) -> list["fitz.Rect"]:
                 fill = d.get("fill")
                 r = fitz.Rect(d["rect"])
                 if (fill and min(fill) < _SHADE_WHITE and r.width >= 30 and r.height >= 12
-                        and r.get_area() < 0.6 * page.rect.get_area()):
+                        and _rect_area(r) < 0.6 * _rect_area(page.rect)):
                     fills.append(r)
         except Exception:
             pass
@@ -2442,8 +2449,8 @@ def _on_shading(doc: fitz.Document, el: Element) -> bool:
         return False
     page_index, bbox = el.boxes[0]
     r = fitz.Rect(bbox)
-    area = max(1.0, r.get_area())
-    return any((f & r).get_area() >= _SHADE_COVER * area for f in _page_fills(doc, page_index))
+    area = max(1.0, _rect_area(r))
+    return any(_rect_area(f & r) >= _SHADE_COVER * area for f in _page_fills(doc, page_index))
 
 
 _LOCAL_LEADING_MIN_SAMPLES = 3   # nearby paragraphs needed to know what "normal" leading looks like here
@@ -2764,7 +2771,8 @@ def table_header_repeats(actual: fitz.Document, actual_path: str | None, pages: 
 _LIST_ITEM_MIN_KEY = 12
 _MARKER_REACH = 30.0          # points left of an item's first word its marker may sit
 _MARKER_TAIL_RE = re.compile(
-    r"(\d{1,2}[.)]|[a-z][.)]|[\u2022\u25e6\u25aa\u25b8\u2023\u2043\u00b7\u2219\u25cf\u25a0\u2013\u2014-])\s*$",
+    r"(\d{1,2}[.)]|(?:ii|iii|iv|vi|vii|viii|ix|xi|xii)[.)]|[a-z][.)]"
+    r"|[\u2022\u25e6\u25aa\u25b8\u2023\u2043\u00b7\u2219\u25cf\u25a0\u2013\u2014-])\s*$",
     re.IGNORECASE,
 )
 _CHAR_CACHE: dict[tuple, list] = {}
@@ -2786,7 +2794,9 @@ def _page_chars(doc: fitz.Document, page_index: int) -> list[tuple]:
     return _CHAR_CACHE[key]
 
 
-def _marker_before(doc: fitz.Document, pages: list[int], key: str) -> str | None:
+def _marker_before(
+    doc: fitz.Document, pages: list[int], key: str, near: tuple[int, float] | None = None
+) -> str | None:
     """What is printed just left of this item's first words on the page: a
     marker ("1.", "a)", "•", or a small drawn dot), "" when the words are found
     with nothing before them, None when they cannot be found at all.
@@ -2804,6 +2814,12 @@ def _marker_before(doc: fitz.Document, pages: list[int], key: str) -> str | None
     item's own words as the page actually prints together, so a hit that stops
     short - the heading ends after "cover.", the item's words keep going - is
     never mistaken for the item's own line.
+
+    Widening the phrase cannot separate two lines that print the EXACT same
+    sentence twice, word for word - two assembly methods on one page both
+    ending "Turn the handle counterclockwise to fix it to the desk.". `near`
+    (the item's own known page and y-position, when the caller has it) breaks
+    that tie by proximity instead of always taking whichever prints first.
     """
     words = key.split()
 
@@ -2829,53 +2845,69 @@ def _marker_before(doc: fitz.Document, pages: list[int], key: str) -> str | None
             out.append(r)
         return out
 
-    for page_index in pages:
-        for r in hits_for(page_index):
-            # On the item's own line only: tightly set lines overlap their glyph
-            # boxes, and the line above's "4." glued onto this "5." read "45..".
-            left = sorted(
-                ((bbox, c) for bbox, c in _page_chars(doc, page_index)
-                 if r.x0 - _MARKER_REACH <= bbox[2] <= r.x0 + 1 and r.y0 <= (bbox[1] + bbox[3]) / 2 <= r.y1),
-                key=lambda bc: bc[0][0],
-            )
-            joined = "".join(c for _, c in left)
-            m = _MARKER_TAIL_RE.search(joined)
-            if m:
-                # A marker starts its printed line. "10°C - 60°C" has a dash right
-                # before its next word as well, and that is no list: say it cannot
-                # be told, rather than calling it a marker or no marker.
-                return None if joined[: m.start()].strip() else m.group(1)
-            if any(ch.isalnum() for ch in joined):
-                # A word right before them: the phrase runs on mid-sentence here
-                # ("clamp and grommet mounting"), not on the item's own line.
-                continue
-            if _icon_leads_line(doc, page_index, r):
-                # A callout icon (Production's own lightbulb TIP mark, with no
-                # separate "TIP:" word at all) sits right where a bullet would -
-                # its own internal strokes (the flame, the rays) are small drawn
-                # shapes too, and the check below would otherwise read one of
-                # them as a bullet dot. The icon itself, not a list marker.
-                return ""
-            # A drawn dot is a bullet only when nothing printed ("*:") sits
-            # between it and the words, and it is not a stroke of an icon image.
-            printed_x1 = max((bbox[2] for bbox, c in left if c.strip()), default=None)
-            try:
-                icons = [fitz.Rect(i["bbox"]) for i in doc[page_index].get_image_info() if i.get("bbox")]
-                for d in doc[page_index].get_drawings():
-                    dr = d.get("rect")
-                    if dr is None or dr.width > 9 or dr.height > 9:
-                        continue
-                    if not (r.x0 - _MARKER_REACH <= dr.x1 <= r.x0 + 1 and dr.y0 < r.y1 and dr.y1 > r.y0):
-                        continue
-                    if printed_x1 is not None and dr.x1 <= printed_x1:
-                        continue
-                    centre = fitz.Point((dr.x0 + dr.x1) / 2, (dr.y0 + dr.y1) / 2)
-                    if any(icon.contains(centre) for icon in icons):
-                        continue
-                    return "•"
-            except Exception:
-                pass
+    def read_at(page_index: int, r: "fitz.Rect") -> str | None:
+        """The marker (or "" / None) this one hit's own line carries -
+        None here means "this hit is mid-sentence, not a candidate at all",
+        distinct from the function's own None (nothing found anywhere)."""
+        # On the item's own line only: tightly set lines overlap their glyph
+        # boxes, and the line above's "4." glued onto this "5." read "45..".
+        left = sorted(
+            ((bbox, c) for bbox, c in _page_chars(doc, page_index)
+             if r.x0 - _MARKER_REACH <= bbox[2] <= r.x0 + 1 and r.y0 <= (bbox[1] + bbox[3]) / 2 <= r.y1),
+            key=lambda bc: bc[0][0],
+        )
+        joined = "".join(c for _, c in left)
+        m = _MARKER_TAIL_RE.search(joined)
+        if m:
+            # A marker starts its printed line. "10°C - 60°C" has a dash right
+            # before its next word as well, and that is no list: say it cannot
+            # be told, rather than calling it a marker or no marker.
+            return "\x00" if joined[: m.start()].strip() else m.group(1)  # \x00: caller maps to None
+        if any(ch.isalnum() for ch in joined):
+            # A word right before them: the phrase runs on mid-sentence here
+            # ("clamp and grommet mounting"), not on the item's own line - not
+            # a candidate for this hit at all.
+            return None
+        if _icon_leads_line(doc, page_index, r):
+            # A callout icon (Production's own lightbulb TIP mark, with no
+            # separate "TIP:" word at all) sits right where a bullet would -
+            # its own internal strokes (the flame, the rays) are small drawn
+            # shapes too, and the check below would otherwise read one of
+            # them as a bullet dot. The icon itself, not a list marker.
             return ""
+        # A drawn dot is a bullet only when nothing printed ("*:") sits
+        # between it and the words, and it is not a stroke of an icon image.
+        printed_x1 = max((bbox[2] for bbox, c in left if c.strip()), default=None)
+        try:
+            icons = [fitz.Rect(i["bbox"]) for i in doc[page_index].get_image_info() if i.get("bbox")]
+            for d in doc[page_index].get_drawings():
+                dr = d.get("rect")
+                if dr is None or dr.width > 9 or dr.height > 9:
+                    continue
+                if not (r.x0 - _MARKER_REACH <= dr.x1 <= r.x0 + 1 and dr.y0 < r.y1 and dr.y1 > r.y0):
+                    continue
+                if printed_x1 is not None and dr.x1 <= printed_x1:
+                    continue
+                centre = fitz.Point((dr.x0 + dr.x1) / 2, (dr.y0 + dr.y1) / 2)
+                if any(icon.contains(centre) for icon in icons):
+                    continue
+                return "•"
+        except Exception:
+            pass
+        return ""
+
+    for page_index in pages:
+        candidates = []
+        for r in hits_for(page_index):
+            result = read_at(page_index, r)
+            if result is not None:
+                candidates.append((r, None if result == "\x00" else result))
+        if not candidates:
+            continue
+        if len(candidates) == 1 or near is None or near[0] != page_index:
+            return candidates[0][1]
+        r, result = min(candidates, key=lambda rc: abs((rc[0].y0 + rc[0].y1) / 2 - near[1]))
+        return result
     return None
 
 
@@ -2933,6 +2965,18 @@ def list_structure_changes(exp: list[Element], act: list[Element],
             # ("proxy settings" inside "Configuring proxy settings").
             candidates = [e for e in other if e.kind not in (KIND_FIGURE, KIND_HEADING) and e.section == section]
             holder = next((e for e in candidates if key in e.key), None)
+            if holder is None:
+                # The item's own wrapped sentence can be split, on the OTHER
+                # side, into its own element apart from its later lines (a
+                # figure sitting between them, a page-template artefact) - the
+                # full 80-char key is then never contained whole in any one
+                # element, even though that element's own (shorter) text is a
+                # clean, unbroken prefix of it. Matched the other way round for
+                # exactly that case, floored so a short fragment can't match
+                # everything.
+                holder = next(
+                    (e for e in candidates if e.key and len(e.key) >= _ITEM_MIN_KEY and e.key in key), None
+                )
             if own_doc is None or other_doc is None:
                 continue
             # A sentence split by extraction into several small fragments - a
@@ -2948,11 +2992,16 @@ def list_structure_changes(exp: list[Element], act: list[Element],
             if not pages:
                 continue
             # Confirmed on the pages: a marker printed before the item on this
-            # side, and the same words found on the other side with none.
-            own_marker = _marker_before(own_doc, item[3].pages, key)
+            # side, and the same words found on the other side with none. Each
+            # search is anchored to where that side's own element already sits
+            # (`near`) - two assembly methods on one page can both end "Turn
+            # the handle counterclockwise to fix it to the desk.", and only
+            # the item's own known position tells the two apart.
+            own_marker = _marker_before(own_doc, item[3].pages, key, near=(item[3].page, item[3].bbox[1]))
             if not own_marker:
                 continue
-            other_marker = _marker_before(other_doc, pages, key)
+            other_near = (holder.page, holder.bbox[1]) if holder is not None else None
+            other_marker = _marker_before(other_doc, pages, key, near=other_near)
             if other_marker is None:
                 continue
             if holder is None:
@@ -4050,7 +4099,7 @@ def _printed_in_band(fig: Element, doc: fitz.Document, bands: list[tuple[int, fl
         for r in _artwork_boxes(doc, page_index, top, bottom):
             if abs(r.width / max(1.0, r.height) - shape) / shape > _ART_SHAPE_GAP:
                 continue
-            if any(p == page_index and (fitz.Rect(t) & r).get_area() >= 0.5 * r.get_area() for p, t in taken):
+            if any(p == page_index and _rect_area(fitz.Rect(t) & r) >= 0.5 * _rect_area(r) for p, t in taken):
                 continue
             if section_at is not None and fig.section and section_at(page_index, r.y0) != fig.section:
                 continue  # printed under another topic: not this figure's counterpart
@@ -4122,10 +4171,11 @@ def _printed_elsewhere(fig: Element, doc: fitz.Document, taken: list[tuple[int, 
                 continue
             # An icon-sized box, or one far off this figure's size, is another
             # kind of artwork that only happens to share a shape.
+            r_area = _rect_area(r)
             if min(r.width, r.height) <= _ICON_MAX_SIDE or \
-                    max(area, r.get_area()) / max(1.0, min(area, r.get_area())) > _ELSEWHERE_AREA_RATIO:
+                    max(area, r_area) / max(1.0, min(area, r_area)) > _ELSEWHERE_AREA_RATIO:
                 continue
-            if any(p == page_index and (fitz.Rect(t) & r).get_area() >= 0.5 * r.get_area() for p, t in taken):
+            if any(p == page_index and _rect_area(fitz.Rect(t) & r) >= 0.5 * r_area for p, t in taken):
                 continue
             fp = _cached_fingerprint(doc, page_index, tuple(r))
             if fp is None:
