@@ -11,7 +11,12 @@ Two questions the figure checks cannot answer from detected boxes alone:
   resolution on grey levels and edges both, so a small shape that merely
   resembles something on the page is not taken for it.
 * Where inside a matched figure do the two render differently?
-  `differing_regions` aligns the two renders and boxes the spots that differ.
+  `differing_regions` aligns the two renders and boxes the spots that differ -
+  on grey level (shape, edges, brightness) AND, separately, on hue, so a
+  figure recoloured but otherwise pixel-for-pixel identical - a brand colour
+  swapped, a warning icon's red turned orange - is still caught. A grey-level
+  diff alone is blind to that: luminance does not change when only the colour
+  does.
 """
 from __future__ import annotations
 
@@ -22,6 +27,18 @@ DIFF_LEVEL = 60              # grey-level difference (0-255) that counts at a pi
 MIN_REGION_SHARE = 0.004     # a region smaller than this share of the figure is anti-aliasing noise
 MAX_CHANGED_SHARE = 0.35     # more than this differs: another picture or crop, not local spots
 MAX_REGIONS = 6
+# A pair can match perfectly in shape, edges and brightness and still be a
+# different colour outright - a brand blue recoloured green, a warning icon's
+# red swapped for orange - which a grey-level diff is blind to by definition.
+# Compared separately, in colour, at the same registration the grey pass
+# already solved: OpenCV hue runs 0-179 for 0-360 degrees, so 18 is a 36-degree
+# swing - plainly a different colour, not the same hue rendered a shade off by
+# two documents' different colour profiles. Saturation is compared too, and
+# only the lower of the pair's two values decides whether a pixel counts:
+# near-grey/white/black in EITHER render carries no reliable hue in the first
+# place, on either side, and is never flagged as a colour change there.
+COLOUR_HUE_LEVEL = 18
+COLOUR_MIN_CHROMA = 40
 
 _SOURCE_ZOOM = 4.0           # the artwork being looked for is rendered this sharp
 _SEARCH_PX = 160             # ... and searched for at about this many pixels on its long edge
@@ -209,6 +226,45 @@ def _render(doc: fitz.Document, page_index: int, bbox: tuple):
     return arr.copy(), rect
 
 
+def _render_color(doc: fitz.Document, page_index: int, bbox: tuple):
+    import numpy as np
+
+    try:
+        page = doc[page_index]
+        rect = fitz.Rect(*bbox) & page.rect
+        if rect.is_empty or rect.width < 8 or rect.height < 8:
+            return None
+        zoom = RENDER_EDGE / max(rect.width, rect.height)
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=rect, alpha=False)
+    except Exception:
+        return None
+    if pix.width < 8 or pix.height < 8:
+        return None
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)
+    return arr[:, : pix.width * pix.n].reshape(pix.height, pix.width, pix.n)[:, :, :3].copy()
+
+
+def _colour_mask(colour_a, colour_b, shift, size):
+    """Where the two match in structure but not in hue - see COLOUR_HUE_LEVEL -
+    at the SAME alignment the grey pass already solved. None of this ever
+    fires on its own: a figure whose colour rendering could not be read (a
+    vector drawing with no fill, say) simply contributes nothing, and the
+    ordinary grey-level pass still runs regardless."""
+    import cv2
+    import numpy as np
+
+    if colour_a is None or colour_b is None:
+        return None
+    colour_b = cv2.resize(colour_b, size, interpolation=cv2.INTER_AREA)
+    colour_b = cv2.warpAffine(colour_b, shift, size, borderMode=cv2.BORDER_REPLICATE)
+    hsv_a = cv2.cvtColor(cv2.GaussianBlur(colour_a, (5, 5), 0), cv2.COLOR_RGB2HSV)
+    hsv_b = cv2.cvtColor(cv2.GaussianBlur(colour_b, (5, 5), 0), cv2.COLOR_RGB2HSV)
+    chroma = np.minimum(hsv_a[:, :, 1], hsv_b[:, :, 1])
+    hue_gap = np.abs(hsv_a[:, :, 0].astype(np.int16) - hsv_b[:, :, 0].astype(np.int16))
+    hue_gap = np.minimum(hue_gap, 180 - hue_gap)
+    return np.where((chroma >= COLOUR_MIN_CHROMA) & (hue_gap >= COLOUR_HUE_LEVEL), 255, 0).astype(np.uint8)
+
+
 def differing_regions(expected: fitz.Document, exp_box: tuple[int, tuple],
                       actual: fitz.Document, act_box: tuple[int, tuple]) -> dict | None:
     """{"exp_marks": [(page, bbox)], "act_marks": [(page, bbox)]} for every
@@ -237,6 +293,9 @@ def differing_regions(expected: fitz.Document, exp_box: tuple[int, tuple],
 
     diff = cv2.absdiff(fa, fb).astype(np.uint8)
     _, mask = cv2.threshold(diff, DIFF_LEVEL, 255, cv2.THRESH_BINARY)
+    colour_mask = _colour_mask(_render_color(expected, *exp_box), _render_color(actual, *act_box), shift, (w, h))
+    if colour_mask is not None:
+        mask = cv2.bitwise_or(mask, colour_mask)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     if cv2.countNonZero(mask) > MAX_CHANGED_SHARE * w * h:
         return None

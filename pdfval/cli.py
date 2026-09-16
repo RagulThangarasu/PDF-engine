@@ -67,7 +67,7 @@ def run(
         # Data for pdf.html: both documents rendered whole, every issue boxed on
         # them and listed in the nav - drawn while both documents are still open.
         _p(82, "Rendering both documents")
-        report.issue_report = build_issue_report(chapters, expected, actual, output_dir)
+        report.issue_report = build_issue_report(chapters, expected, actual, output_dir, expected_path, actual_path)
         # issues.pdf: every issue with its topic, description and both documents'
         # screenshots boxed - to download and share. A failure here must not
         # lose the run, so it is written best-effort.

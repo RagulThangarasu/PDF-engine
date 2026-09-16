@@ -18,16 +18,27 @@ from pdfval.models import CheckResult, Issue
 
 TITLE_MATCH_THRESHOLD = 0.6  # minimum similarity to pair up two non-identical headings
 
-# Sections that are a printed NAVIGATION listing - a table of contents, an
-# index, a Q&A/FAQ topic-jump page - not prose. Their whole body is
-# "heading ... page-number" entries; the embedded outline is compared directly
-# by validate_toc / toc.html, so comparing this text line-by-line in the
-# section browser just floods it with red. Matched by title in English and CJK.
-_EXCLUDED_HEADING_RE = re.compile(
-    r"\bq\s*&\s*a\b|\bfaq\b|\btable of contents?\b|\bq\s*&\s*a\s*index\b"
-    r"|目\s*录|索\s*引|问\s*答|常见问题",
-    re.IGNORECASE,
-)
+# A table of contents or index page: a printed NAVIGATION listing, not prose.
+# Its whole body is "heading ... page-number" entries; the embedded outline is
+# compared directly by validate_toc / toc.html, so comparing this text
+# line-by-line in the section browser just floods it with red. Matched by
+# title in English and CJK.
+_TOC_INDEX_HEADING_RE = re.compile(r"\btable of contents?\b|目\s*录|索\s*引", re.IGNORECASE)
+
+# A "Q&A"/"FAQ" TITLE alone is not enough to tell a topic-jump index (a bare
+# list of questions, each pointing elsewhere, the way `_looks_like_qa_index_page`
+# already recognises by content) from a real, substantial FAQ/Troubleshooting
+# CHAPTER with its own genuine step-by-step answers - a heading a manual just
+# as often gives its most-referenced content section, not only its directory.
+# Title match alone still excludes it when the section is short (the common
+# case this was written for: one trailing question-and-answer at the end of a
+# chapter, never meant to be compared line by line); `skip_spans` additionally
+# requires the section to run only a page or so before it trusts title alone,
+# so a real multi-page Troubleshooting/FAQ section - genuine content a reader
+# needs right - is not silently dropped from Content Validation altogether.
+_QA_FAQ_HEADING_RE = re.compile(r"\bq\s*&\s*a\b|\bfaq\b|问\s*答|常见问题", re.IGNORECASE)
+
+_EXCLUDED_HEADING_RE = re.compile(_TOC_INDEX_HEADING_RE.pattern + "|" + _QA_FAQ_HEADING_RE.pattern, re.IGNORECASE)
 
 # A per-country RoHS hazardous-substance declaration ("China RoHS", "Turkey
 # RoHS", "India RoHS"...): a standardised legal table whose X/O cells the two
@@ -45,6 +56,13 @@ _TOC_DOT_LEADER_RE = re.compile(r"\.{4,}")
 
 def is_excluded_heading(title: str) -> bool:
     return bool(_EXCLUDED_HEADING_RE.search(title) or _REGULATORY_HEADING_RE.search(title))
+
+
+def is_qa_faq_heading(title: str) -> bool:
+    """Whether `title` is matched as excluded specifically by the Q&A/FAQ
+    pattern - as opposed to a table of contents/index or a regulatory
+    declaration - the one category `skip_spans` also gates by length."""
+    return bool(_QA_FAQ_HEADING_RE.search(title))
 
 
 def looks_like_toc_listing(text: str) -> bool:

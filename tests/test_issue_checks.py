@@ -49,6 +49,34 @@ def test_text_that_prints_just_as_dark_is_not_a_bold_issue():
     assert C.confirm_bold([_bold_candidate()], prod_el, stage_el, prod_doc, stage_doc) == []
 
 
+# --- an extra/missing heading is never settled by its words appearing loose ---
+
+def test_heading_with_scattered_common_words_elsewhere_is_not_settled():
+    # "Copyright and Disclaimer" as a whole section heading only one side has:
+    # the other side's body prose happens to use "copyright" in one sentence
+    # and "disclaimer" in another, unrelated one - that must not read as "this
+    # heading is printed elsewhere, just divided differently" the way a short
+    # caption legitimately can.
+    heading = C.Element(kind=C.KIND_HEADING, text="Copyright and Disclaimer",
+                        key=C._normalise("Copyright and Disclaimer"), boxes=[])
+    other_words = " this page carries a copyright notice and a separate disclaimer statement elsewhere "
+    assert C._printed_in(heading, other_words) is False
+
+
+def test_heading_with_the_exact_phrase_present_is_still_settled():
+    heading = C.Element(kind=C.KIND_HEADING, text="Copyright and Disclaimer",
+                        key=C._normalise("Copyright and Disclaimer"), boxes=[])
+    other_words = " see the copyright and disclaimer section for details "
+    assert C._printed_in(heading, other_words) is True
+
+
+def test_short_caption_is_still_settled_by_scattered_words():
+    # The short-label fallback this fix narrowed still applies to non-heading
+    # elements - a caption legitimately folded into running text elsewhere.
+    label = C.Element(kind=C.KIND_TEXT, text="Deutsch", key=C._normalise("Deutsch"), boxes=[])
+    assert C._printed_in(label, " a label set in deutsch somewhere on the page ") is True
+
+
 # --- list indent, within the list --------------------------------------------
 
 def _list(first_x: float, second_x: float) -> tuple[fitz.Document, C.Element]:
@@ -148,6 +176,36 @@ def test_spot_inside_a_matched_figure_is_boxed_where_it_is():
 
 def test_identical_figures_have_no_visual_differences():
     assert visual_diff.differing_regions(_drawing(), _FIG_BOX, _drawing(), _FIG_BOX) is None
+
+
+def _drawing_with_badge(badge_color: tuple[float, float, float]) -> fitz.Document:
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=400)
+    page.draw_rect(fitz.Rect(50, 50, 350, 300), color=(0, 0, 0), width=2)
+    page.draw_line((60, 110), (340, 110), color=(0, 0, 0), width=1)
+    page.draw_circle((200, 200), 45, color=(0.2, 0.2, 0.2), width=1.5)
+    page.draw_circle((320, 65), 12, color=(0, 0, 0), fill=badge_color, width=1)
+    return doc
+
+
+def test_recoloured_spot_is_caught_even_with_no_shape_or_brightness_change():
+    # Same drawing, same brightness and shape throughout - only a small status
+    # badge's own colour changes (red to green). A grey-level diff alone is
+    # blind to this: luminance does not move when only hue does.
+    found = visual_diff.differing_regions(
+        _drawing_with_badge((0.85, 0.1, 0.1)), _FIG_BOX,
+        _drawing_with_badge((0.1, 0.75, 0.2)), _FIG_BOX,
+    )
+    assert found is not None
+    page, (x0, y0, x1, y1) = found["act_marks"][0]
+    assert page == 0 and x0 <= 320 <= x1 and y0 <= 65 <= y1
+
+
+def test_same_coloured_badge_is_not_a_visual_difference():
+    assert visual_diff.differing_regions(
+        _drawing_with_badge((0.85, 0.1, 0.1)), _FIG_BOX,
+        _drawing_with_badge((0.85, 0.1, 0.1)), _FIG_BOX,
+    ) is None
 
 
 def _diagram() -> fitz.Document:

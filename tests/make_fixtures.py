@@ -16,6 +16,7 @@ Each fixture isolates ONE behaviour so a test failure says what broke:
                                               object beside the step
   list_stage_lettered.pdf                   - that procedure relettered a,b,c
   list_stage_parenlettered.pdf              - that procedure relettered (a),(b),(c)
+  list_stage_spacedletters.pdf              - that procedure relettered a ., b ., c .
   list_stage_bulleted.pdf                   - that procedure reduced to bullets
   chapters_prod.pdf                         - a contents page, two L1 chapters, a Q&A
                                               section and a footer on every page
@@ -292,6 +293,8 @@ def _list_document(variant: str) -> pymupdf.Document:
             "parenlettered" - detached markers relettered (a) ... (e), the
                          fully-parenthesised style some documents use for
                          sub-items instead of a trailing period or bracket
+            "spacedletters" - detached markers relettered a . ... e ., a space
+                         printed before the period some documents leave in
             "bulleted" - detached markers replaced by bullets
     """
     doc = pymupdf.open()
@@ -304,6 +307,7 @@ def _list_document(variant: str) -> pymupdf.Document:
         "detached": [f"{i}." for i in range(1, 6)],
         "lettered": ["a.", "b.", "c.", "d.", "e."],
         "parenlettered": ["(a)", "(b)", "(c)", "(d)", "(e)"],
+        "spacedletters": ["a .", "b .", "c .", "d .", "e ."],
         "bulleted": ["\u2022"] * 5,
     }[variant]
     y = 150.0
@@ -472,6 +476,7 @@ def main() -> None:
         ("list_stage_detached.pdf", _list_document("detached")),
         ("list_stage_lettered.pdf", _list_document("lettered")),
         ("list_stage_parenlettered.pdf", _list_document("parenlettered")),
+        ("list_stage_spacedletters.pdf", _list_document("spacedletters")),
         ("list_stage_bulleted.pdf", _list_document("bulleted")),
         ("chapters_prod.pdf", _chapter_document("prod")),
         ("chapters_stage_reflowed.pdf", _chapter_document("reflowed")),

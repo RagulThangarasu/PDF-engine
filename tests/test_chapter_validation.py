@@ -25,6 +25,7 @@ from pdfval.ocr import reset_ocr_cache  # noqa: E402
 from pdfval.validators.chapter import compare_chapters, reset_furniture_cache  # noqa: E402
 from pdfval.validators.headings import reset_heading_cache  # noqa: E402
 from pdfval.validators.toc import reset_paragraph_cache  # noqa: E402
+from pdfval.visual_diff import reset_cache as reset_visual_cache  # noqa: E402
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
@@ -57,6 +58,7 @@ def _chapters(prod: str, stage: str):
         reset_heading_cache()
         reset_furniture_cache()
         reset_ocr_cache()
+        reset_visual_cache()
 
 
 def _real(chapter) -> list[dict]:
@@ -130,6 +132,16 @@ def test_list_renumbered_to_parenthesised_letters_is_reported():
     assert "(and 4 more like it)" in change["summary"]
 
 
+def test_list_renumbered_to_letters_with_a_space_before_the_period_is_reported():
+    # "a ." - a space printed before the marker's own period - is still a
+    # complete letter marker, not a stray "a" with unrelated punctuation
+    # tacked on somewhere after it.
+    [chapter] = _chapters("list_prod.pdf", "list_stage_spacedletters.pdf")
+    [change] = [d for d in _real(chapter) if d["type"] == "numbering"]
+    assert "is step 1 in Production but item a in Staging" in change["summary"]
+    assert "(and 4 more like it)" in change["summary"]
+
+
 def test_list_reduced_to_bullets_is_reported():
     [chapter] = _chapters("list_prod.pdf", "list_stage_bulleted.pdf")
     [change] = [d for d in _real(chapter) if d["type"] == "numbering"]
@@ -164,6 +176,71 @@ def test_inline_icon_recoloured_is_reported():
 def test_identical_icon_is_not_reported():
     [chapter] = _chapters("icons_prod.pdf", "icons_prod.pdf")
     assert [d for d in chapter.differences if d["type"].startswith("icon-")] == []
+
+
+# --- a wrapper heading only one side has is reported, not silently swallowed --
+
+def _copyright_disclaimer_expected() -> fitz.Document:
+    doc = fitz.open()
+    p0 = doc.new_page(width=612, height=792)
+    p0.insert_text((72, 60), "Copyright", fontsize=16)
+    p0.insert_textbox(fitz.Rect(72, 90, 540, 200),
+                      "Copyright (c) 2025 by BenQ Corporation. All rights reserved.", fontsize=10)
+    p1 = doc.new_page(width=612, height=792)
+    p1.insert_text((72, 60), "Disclaimer", fontsize=16)
+    p1.insert_textbox(fitz.Rect(72, 90, 540, 200),
+                      "BenQ Corporation makes no representations or warranties of any kind.", fontsize=10)
+    p2 = doc.new_page(width=612, height=792)
+    p2.insert_text((72, 60), "Getting Started", fontsize=16)
+    p2.insert_textbox(fitz.Rect(72, 90, 540, 200),
+                      "Unpack the monitor and place it on a stable, flat surface near an outlet.", fontsize=10)
+    doc.set_toc([[1, "Copyright", 1], [1, "Disclaimer", 2], [1, "Getting Started", 3]])
+    return doc
+
+
+def _copyright_disclaimer_actual() -> fitz.Document:
+    doc = fitz.open()
+    p0 = doc.new_page(width=612, height=792)
+    p0.insert_text((72, 40), "Copyright & Disclaimer", fontsize=18)
+    p0.insert_text((72, 70), "Copyright", fontsize=14)
+    p0.insert_textbox(fitz.Rect(72, 90, 540, 140),
+                      "Copyright (c) 2025 by BenQ Corporation. All rights reserved.", fontsize=10)
+    p0.insert_text((72, 160), "Disclaimer", fontsize=14)
+    p0.insert_textbox(fitz.Rect(72, 180, 540, 260),
+                      "BenQ Corporation makes no representations or warranties of any kind.", fontsize=10)
+    p1 = doc.new_page(width=612, height=792)
+    p1.insert_text((72, 60), "Getting Started", fontsize=16)
+    p1.insert_textbox(fitz.Rect(72, 90, 540, 200),
+                      "Unpack the monitor and place it on a stable, flat surface near an outlet.", fontsize=10)
+    doc.set_toc([[1, "Copyright & Disclaimer", 1], [2, "Copyright", 1], [2, "Disclaimer", 1],
+                 [1, "Getting Started", 2]])
+    return doc
+
+
+def test_wrapper_heading_only_in_staging_is_reported():
+    # Staging wraps "Copyright" and "Disclaimer" (Production's own top-level
+    # headings, same content) inside one new "Copyright & Disclaimer" heading.
+    # That wrapper sits right before its own first child heading - which is
+    # also the first heading Production and Staging share - so
+    # `_mark_front_matter` marks it `.excluded` for an unrelated reason (front
+    # matter position), not because it is a TOC/Q&A/RoHS title. It must still
+    # be reported as its own section-added finding, not silently dropped.
+    expected, actual = _copyright_disclaimer_expected(), _copyright_disclaimer_actual()
+    try:
+        chapters = compare_chapters(expected, actual)
+    finally:
+        expected.close()
+        actual.close()
+        reset_table_cache()
+        reset_paragraph_cache()
+        reset_heading_cache()
+        reset_furniture_cache()
+        reset_ocr_cache()
+        reset_visual_cache()
+    matches = [d for ch in chapters for d in ch.differences
+               if d["type"] == "section-added" and "Copyright & Disclaimer" in d["summary"]]
+    assert len(matches) == 1
+    assert "not printed anywhere in Production" in matches[0]["summary"]
 
 
 if __name__ == "__main__":
