@@ -120,6 +120,16 @@ def test_list_renumbered_to_letters_is_reported():
     assert "(and 4 more like it)" in change["summary"]
 
 
+def test_list_renumbered_to_parenthesised_letters_is_reported():
+    # "(a)", "(b)", "(c)" - not just "a.", "a)" - is a marker style its own
+    # right, and must be read as a complete marker rather than as a stray
+    # leading "(" in front of one, or every list set this way goes unreported.
+    [chapter] = _chapters("list_prod.pdf", "list_stage_parenlettered.pdf")
+    [change] = [d for d in _real(chapter) if d["type"] == "numbering"]
+    assert "is step 1 in Production but item a in Staging" in change["summary"]
+    assert "(and 4 more like it)" in change["summary"]
+
+
 def test_list_reduced_to_bullets_is_reported():
     [chapter] = _chapters("list_prod.pdf", "list_stage_bulleted.pdf")
     [change] = [d for d in _real(chapter) if d["type"] == "numbering"]

@@ -46,12 +46,48 @@ BODY_TEXT_MAX_LUMINANCE = 0.35  # near-black
 LINK_COLOR_MIN_DISTANCE = 0.2  # how far from black a colour must be to read as a link
 
 
+def _uri_authority(uri: str) -> str:
+    """A URI with any scheme it carries taken off, so "https://www.x.com" and
+    the bare "www.x.com" some PDF authoring tools write compare as the same
+    address rather than as one usable link and one not."""
+    stripped = (uri or "").strip().rstrip("/")
+    low = stripped.lower()
+    for scheme in USABLE_SCHEMES:
+        if low.startswith(scheme):
+            return stripped[len(scheme):].casefold()
+    return stripped.casefold()
+
+
+def _uris_in(doc: fitz.Document) -> set[str]:
+    """Every external address this document links to anywhere, scheme taken
+    off - built once per document, not once per link checked."""
+    out: set[str] = set()
+    for page_index in range(doc.page_count):
+        try:
+            links = doc[page_index].get_links()
+        except Exception:
+            continue
+        for link in links:
+            if link.get("kind") == fitz.LINK_URI:
+                uri = (link.get("uri") or "").strip()
+                if uri:
+                    out.add(_uri_authority(uri))
+    return out
+
+
 def validate_links(
     expected: fitz.Document, actual: fitz.Document, output_dir: str | None = None
 ) -> CheckResult:
     result = CheckResult(name="Hyperlink Validation")
     counter = itertools.count(1)
     _, entries = resolve_entries(expected, actual)
+    # A bare-domain URI ("www.benq.com" with no "http://") is what some PDF
+    # authoring tools write for every web address, and some viewers ask which
+    # application to open it with rather than just opening a browser - but
+    # that is how Production carries the SAME address too, not something
+    # Staging broke. Only a scheme problem Staging alone has - the address in
+    # Staging is not one Production ever linked to at all - is a real defect.
+    expected_uris = _uris_in(expected)
 
     for page_index in range(actual.page_count):
         try:
@@ -59,7 +95,7 @@ def validate_links(
         except Exception:
             continue
         for link in links:
-            _check_link(result, actual, page_index, link, entries, output_dir, counter)
+            _check_link(result, actual, page_index, link, entries, output_dir, counter, expected_uris)
 
     return result
 
@@ -72,6 +108,7 @@ def _check_link(
     entries,
     output_dir: str | None,
     counter: "itertools.count",
+    expected_uris: set[str] = frozenset(),
 ) -> None:
     rect = link.get("from")
     bbox = (rect.x0, rect.y0, rect.x1, rect.y1) if rect is not None else None
@@ -105,7 +142,7 @@ def _check_link(
 
     if kind == fitz.LINK_URI:
         uri = (link.get("uri") or "").strip()
-        if not uri or not uri.lower().startswith(USABLE_SCHEMES):
+        if (not uri or not uri.lower().startswith(USABLE_SCHEMES)) and _uri_authority(uri) not in expected_uris:
             report(
                 "Hyperlink has no usable scheme",
                 uri=uri or "(empty)",
