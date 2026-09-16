@@ -2027,7 +2027,7 @@ def _short_label_mismatch(a: "Element", b: "Element") -> bool:
 _ITEM_MARKER_RE = re.compile(
     r"(?:(?<=\s)|^)((?:\d{1,2}|[a-z]|ii|iii|iv|vi|vii|viii|ix|xi|xii) ?[.)]"
     r"|\((?:\d{1,2}|[a-z]|ii|iii|iv|vi|vii|viii|ix|xi|xii)\)"
-    r"|[\u2022\u25e6\u25aa\u25b8\u2023\u2043\u00b7\u2219])(?=\s)",
+    r"|[\u2022\u25e6\u25aa\u25b8\u2023\u2043\u00b7\u2219\u25cf\u25cb])(?=\s)",
     re.IGNORECASE,
 )
 _ITEM_MIN_KEY = 6          # an item's own words must identify it
@@ -2293,7 +2293,30 @@ def icon_changes(exp_group: list[Element], act_group: list[Element],
                     # the icon's own position, not by anchoring it to a word:
                     # a wrapped callout's icon often sits beside a later
                     # wrapped line, not the first word.
-                    if ix1 <= x0 + 2 and cy <= y0 + max(20.0, (y1 - y0) * 0.35):
+                    #
+                    # The "near the top of its own block" half of that check
+                    # only holds when the block IS one callout's own element -
+                    # two separate callouts that print close enough together
+                    # to merge into one Element (Production's "For BenQ IFP…"
+                    # note immediately above its own "Do not keep the device
+                    # powered…" tip) puts the SECOND callout's icon well past
+                    # that merged element's own top, so it read as a genuine
+                    # content icon needing a match - one Staging correctly
+                    # excludes for its OWN, separately-kept element, so
+                    # nothing on that side is ever offered to pair against
+                    # it. `_is_leading_icon` (independent of how the two
+                    # paragraphs happened to merge - it asks only whether the
+                    # icon sits right before the actual PRINTED LINE next to
+                    # it) is accepted as an ALTERNATIVE to the top-of-block
+                    # test, but never instead of the margin one: an inline
+                    # icon ("Settings [icon] menu") can also happen to sit
+                    # right before a line's own start when it wraps to open
+                    # one, and only living in the margin - outside the text
+                    # column altogether - tells a callout's icon apart from it.
+                    if ix1 <= x0 + 2 and (
+                        cy <= y0 + max(20.0, (y1 - y0) * 0.35)
+                        or _is_leading_icon(doc, page_index, (ix0, iy0, ix1, iy1))
+                    ):
                         continue
                     side, word = _icon_anchor(doc, page_index, icon[1])
                     # A callout's own icon (Note / Warning / TIP) is callout
@@ -2587,8 +2610,51 @@ def line_spacing_changes(exp_group: list[Element], act_group: list[Element],
     }]
 
 
+def _has_note_icon(doc: fitz.Document, el: Element) -> bool:
+    """A small icon (Production's usual pencil icon marking a NOTE it never
+    spells out in words - see `_is_leading_icon`) sits immediately before this
+    element's own printed line."""
+    if not el.boxes:
+        return False
+    page_index, bbox = el.boxes[0]
+    x0, y0, x1, y1 = bbox
+    for _, (ix0, iy0, ix1, iy1) in _page_icons(doc, page_index):
+        overlap = min(y1, iy1) - max(y0, iy0)
+        if overlap >= 0.5 * min(y1 - y0, iy1 - iy0) and 0 <= x0 - ix1 <= _LEADING_ICON_GAP:
+            return True
+    return False
+
+
+def _previous_element(topic_elements: list[Element], el: Element) -> Element | None:
+    """Whatever comes right before `el` in this topic's own reading order."""
+    for i, e in enumerate(topic_elements):
+        if e is el:
+            return topic_elements[i - 1] if i > 0 else None
+    return None
+
+
+def _same_shaded_region(doc: fitz.Document, el_a: Element, el_b: Element) -> bool:
+    """Whether these two elements sit inside the SAME shaded panel, not just
+    each somewhere-shaded on their own - a note's own box is one thing;
+    another paragraph shaded elsewhere on the same page is not evidence of
+    anything shared with it."""
+    if not el_a.boxes or not el_b.boxes:
+        return False
+    page_a, bbox_a = el_a.boxes[0]
+    page_b, bbox_b = el_b.boxes[0]
+    if page_a != page_b:
+        return False
+    rect_a, rect_b = fitz.Rect(bbox_a), fitz.Rect(bbox_b)
+    area_a, area_b = max(1.0, _rect_area(rect_a)), max(1.0, _rect_area(rect_b))
+    return any(
+        _rect_area(fill & rect_a) >= _SHADE_COVER * area_a and _rect_area(fill & rect_b) >= _SHADE_COVER * area_b
+        for fill in _page_fills(doc, page_a)
+    )
+
+
 def shading_changes(exp_group: list[Element], act_group: list[Element],
-                    expected: fitz.Document, actual: fitz.Document) -> list[dict]:
+                    expected: fitz.Document, actual: fitz.Document,
+                    exp_topic: list[Element] | None = None, act_topic: list[Element] | None = None) -> list[dict]:
     """The same text printed on a shaded box in one document only - Staging sets
     every "Important" note on a green panel Production does not have."""
     texts_a = [e for e in exp_group if e.kind != KIND_FIGURE and e.kind != KIND_TABLE]
@@ -2597,18 +2663,57 @@ def shading_changes(exp_group: list[Element], act_group: list[Element],
         return []
     shaded_a = any(_on_shading(expected, e) for e in texts_a)
     shaded_b = any(_on_shading(actual, e) for e in texts_b)
-    # Staging's shaded panels are its design: shading it ADDS is expected and
-    # never reported. Only shading it lacks is.
-    if not shaded_a or shaded_b:
+    if shaded_a and not shaded_b:
+        return [{
+            "type": "shading", "kind": texts_b[0].kind,
+            "summary": ("Background shading missing in Staging — Production prints the text on a shaded box, "
+                        "Staging on the plain page."),
+            "detail": "",
+        }]
+    # Staging's shaded panels are its design: shading it ADDS where Production
+    # has none of its own is expected and never reported. But Production
+    # marking this same spot as a note the WORDLESS way - a small pencil icon
+    # beside the line, no "NOTE:" label and no shading of its own - still
+    # needs Staging to set it apart SOMEHOW, the way Staging's redesign
+    # already does for every note that does carry a printed label. Losing the
+    # icon with nothing (no shading, no label) taking its place drops the
+    # reader's only sign this line is a note and not just another sentence.
+    if shaded_a and shaded_b:
         return []
-    return [{
-        "type": "shading", "kind": texts_b[0].kind,
-        "summary": ("Background shading added in Staging — the text is printed on a shaded box "
-                    "that Production does not have." if shaded_b else
-                    "Background shading missing in Staging — Production prints the text on a shaded box, "
-                    "Staging on the plain page."),
-        "detail": "",
-    }]
+    if shaded_b and not shaded_a:
+        if any(_has_note_icon(expected, e) for e in texts_a):
+            return []  # Production's icon-only note, Staging upgrades it to a full panel - expected.
+        # Production treats this paragraph as ordinary text of its own -
+        # no icon, no shading. Staging shading it anyway is only ever this
+        # document's own design UNLESS it is really the tail of the PREVIOUS
+        # paragraph's note box, grown to also cover a paragraph Production
+        # keeps separate and plain: the box gets its content from Production's
+        # actual note, then swallows the next, unrelated sentence too, so a
+        # reader sees ordinary instructions dressed up as part of the note.
+        if exp_topic is not None and act_topic is not None:
+            prev_exp = _previous_element(exp_topic, texts_a[0])
+            prev_act = _previous_element(act_topic, texts_b[0])
+            if (prev_exp is not None and prev_act is not None
+                    and _has_note_icon(expected, prev_exp)
+                    and _same_shaded_region(actual, prev_act, texts_b[0])):
+                return [{
+                    "type": "shading", "kind": texts_b[0].kind,
+                    "summary": ("Extra content pulled into Staging's note box — Production keeps this text "
+                                "as its own separate paragraph right after the note, but Staging's shaded "
+                                "note box has grown to cover it too."),
+                    "detail": "",
+                }]
+        return []
+    if any(_has_note_icon(expected, e) for e in texts_a):
+        return [{
+            "type": "shading", "kind": texts_b[0].kind,
+            "summary": ("Note styling missing in Staging — Production marks this as a note with a small "
+                        "icon beside the text, Staging prints it as plain text with no shading or other "
+                        "note styling to replace it."),
+            "detail": "",
+            "minor": True,
+        }]
+    return []
 
 
 def _marker_kind(marker: str) -> str:
@@ -2708,6 +2813,53 @@ def numbering_changes(exp: list[Element], act: list[Element]) -> list[dict]:
             "items": [(p[0][1], p[1][1], p[0][2], p[0][3], p[1][3]) for p in run],
         })
     return out
+
+
+def bullet_glyph_changes(exp: list[Element], act: list[Element]) -> list[dict]:
+    """A bulleted list drawn with a DIFFERENT bullet character - Production's
+    small round "•" against Staging's larger "●", say - both classify as the
+    same "bullet" kind, so `numbering_changes` (which only catches switching
+    BETWEEN kinds: number, letter, roman, bullet) never sees it. Still a real,
+    visible style change across a whole list, one glyph swapped for another
+    throughout - not just a numbering-style change."""
+    def by_key(items: list[tuple]) -> dict[tuple, list[tuple]]:
+        grouped: dict[tuple, list[tuple]] = {}
+        for item in items:
+            grouped.setdefault((item[3].section, item[2]), []).append(item)
+        return grouped
+
+    exp_items, act_items = by_key(_list_items_in(exp)), by_key(_list_items_in(act))
+    pairs = [pair for k in exp_items.keys() & act_items.keys()
+             if len(exp_items[k]) == len(act_items[k])
+             for pair in zip(exp_items[k], act_items[k])]
+    changed = [
+        pair for pair in pairs
+        if _marker_kind(pair[0][1]) == "bullet" and _marker_kind(pair[1][1]) == "bullet"
+        and pair[0][1].strip() != pair[1][1].strip()
+    ]
+    groups: dict[tuple[str, str], list[tuple]] = {}
+    for pair in changed:
+        groups.setdefault((pair[0][1].strip(), pair[1][1].strip()), []).append(pair)
+
+    out: list[dict] = []
+    for (exp_glyph, act_glyph), group in groups.items():
+        group.sort(key=lambda pair: (pair[0][3].order, pair[0][4]))
+        exp_els = list({id(p[0][3]): p[0][3] for p in group}.values())
+        act_els = list({id(p[1][3]): p[1][3] for p in group}.values())
+        count = len(group)
+        out.append({
+            "type": "list-marker-glyph", "kind": KIND_TEXT,
+            "summary": (
+                f"Bullet style changed in Staging — Production marks list items with “{exp_glyph}”, "
+                f"Staging with “{act_glyph}”."
+                + (f" Same change on {count} items in this chapter." if count > 1 else "")
+            ),
+            "detail": f"First item: “{group[0][0][2][:70]}”.",
+            "exp": merge_elements(exp_els),
+            "act": merge_elements(act_els),
+        })
+    return out
+
 
 
 # Relative marker font-size change big enough to flag - a bullet/number drawn
@@ -3621,6 +3773,74 @@ def page_ref_dropped_changes(exp_group: list[Element], act_group: list[Element])
         "type": "link-page-ref-dropped", "kind": KIND_TEXT,
         "summary": (f"Hyperlink cross-reference drops “on page” in Staging — Production says "
                     f"“{a_ref.group(0).strip()}”, Staging does not name a page there."),
+        "detail": "",
+    }]
+
+
+_LABEL_LINE_TOLERANCE = 2  # extra words (a list number, a bullet) still read as "the label's own line"
+
+
+def _label_layout(doc: fitz.Document, group: list[Element]) -> str | None:
+    """"inline" when a list item's own leading bold label ("Reset", "USB-C
+    connector") shares its printed line with the description that follows it,
+    "own_line" when the label prints alone and the description starts on the
+    NEXT line down - the two house styles a "**Label** description" list item
+    can use. None when this is not that kind of list item at all.
+
+    The label and its description are sometimes ONE element (a bold prefix
+    run followed by plain continuation, when they wrap close enough to merge)
+    and sometimes TWO (the label's own short line, kept separate from the
+    paragraph after it) - `group` is whichever `pair_elements` produced, and
+    both shapes are read the same way."""
+    if len(group) >= 2:
+        first = group[0]
+        words = [w for w in _TOKEN_RE.findall((first.text or "").casefold()) if w.isalpha()]
+        if words and first.bold_words and all(w in first.bold_words for w in words):
+            return "own_line"
+        return None
+    if len(group) != 1:
+        return None
+    el = group[0]
+    if not el.bold_words or not el.text or not el.boxes:
+        return None
+    words = [w for w in _TOKEN_RE.findall(el.text.casefold()) if w.isalpha()]
+    label_words: list[str] = []
+    for w in words:
+        if w not in el.bold_words:
+            break
+        label_words.append(w)
+    if not label_words or len(label_words) >= len(words):
+        return None  # no bold prefix, or the whole element is bold - not this kind of item
+    hits = _phrase_hits(doc, el, " ".join(label_words))
+    if not hits:
+        return None
+    page_index, rect = hits[0]
+    line_words = _line_words(doc, page_index, rect)
+    return "inline" if len(line_words) > len(label_words) + _LABEL_LINE_TOLERANCE else "own_line"
+
+
+def list_label_layout_changes(exp_group: list[Element], act_group: list[Element],
+                              expected: fitz.Document, actual: fitz.Document) -> list[dict]:
+    """A list item's own bold label running inline with its description in one
+    document ("**Reset** Poke the reset hole...") but printing on its own line
+    in the other ("**Reset**", then the description starts on the next line) -
+    the same words, only laid out differently, still a real style change a
+    reader notices across the whole list, not just the one item happening to
+    also carry an unrelated wording difference."""
+    if not exp_group or not act_group or any(e.kind != KIND_TEXT for e in exp_group + act_group):
+        return []
+    a_layout, b_layout = _label_layout(expected, exp_group), _label_layout(actual, act_group)
+    if not a_layout or not b_layout or a_layout == b_layout:
+        return []
+    return [{
+        "type": "list-label-layout", "kind": KIND_TEXT,
+        "summary": (
+            "List item label runs inline with its description in Staging — Production prints the "
+            "label on its own line, with the description starting on the next line down."
+            if b_layout == "inline" else
+            "List item label prints on its own line in Staging — Production runs it inline with its "
+            "description on the same line."
+        ),
         "detail": "",
     }]
 
@@ -4770,10 +4990,24 @@ def reconcile_layout(
 
     Returns `(exp_group, act_group, note, container)` for every pair.
     """
-    exp_flats = [_flat(e.text) if e.kind != KIND_FIGURE else "" for e in exp]
-    act_flats = [_flat(e.text) if e.kind != KIND_FIGURE else "" for e in act]
-    exp_blob, act_blob = " ".join(f for f in exp_flats if f), " ".join(f for f in act_flats if f)
-    exp_tokens, act_tokens = _tokens(exp_blob), _tokens(act_blob)
+    # Only content with NOTHING of its own to answer to may excuse a one-sided
+    # element - a legitimate "same content, divided up differently" case (a
+    # table's rows against the paragraph they were read from, both otherwise
+    # unmatched). Content a normal, both-sided pair ALREADY accounts for is
+    # spoken for: crediting it a second time is what let an entire numbered
+    # procedure Staging printed TWICE - once as the real, matching copy, once
+    # as a genuinely extra duplicate - excuse its own duplicate by pointing at
+    # the very same Production text its legitimate twin was already paired
+    # with, so the duplicate silently vanished instead of being reported.
+    matched_exp_ids = {id(e) for eg, ag, _ in pairs if eg and ag for e in eg}
+    matched_act_ids = {id(e) for eg, ag, _ in pairs if eg and ag for e in ag}
+    exp_spare = [e for e in exp if id(e) not in matched_exp_ids]
+    act_spare = [e for e in act if id(e) not in matched_act_ids]
+    exp_spare_flats = [_flat(e.text) if e.kind != KIND_FIGURE else "" for e in exp_spare]
+    act_spare_flats = [_flat(e.text) if e.kind != KIND_FIGURE else "" for e in act_spare]
+    exp_spare_blob = " ".join(f for f in exp_spare_flats if f)
+    act_spare_blob = " ".join(f for f in act_spare_flats if f)
+    exp_spare_tokens, act_spare_tokens = _tokens(exp_spare_blob), _tokens(act_spare_blob)
     # `exp`/`act` here are the topic's TEXT elements only (figures are matched
     # separately, by `figure_changes`) - a caption's own figure is passed in
     # from there so a one-sided caption can still be told from ordinary text.
@@ -4798,12 +5032,12 @@ def reconcile_layout(
         container = None
         if exp_group and not act_group and len(exp_group) == 1:
             if not is_figure_caption(exp_group[0], exp_figures):
-                found, container = _present_elsewhere(exp_group[0], act, act_flats, act_blob, act_tokens)
+                found, container = _present_elsewhere(exp_group[0], act_spare, act_spare_flats, act_spare_blob, act_spare_tokens)
                 if found:
                     note = "layout"
         elif act_group and not exp_group and len(act_group) == 1:
             if not is_figure_caption(act_group[0], act_figures):
-                found, container = _present_elsewhere(act_group[0], exp, exp_flats, exp_blob, exp_tokens)
+                found, container = _present_elsewhere(act_group[0], exp_spare, exp_spare_flats, exp_spare_blob, exp_spare_tokens)
                 if found:
                     note = "layout"
         out.append((exp_group, act_group, note, container))
@@ -6156,7 +6390,9 @@ def settle_content(diffs: list[dict], exp_words: str, act_words: str,
                    exp_units: Counter | None = None, act_units: Counter | None = None,
                    exp_keys: set[str] | None = None, act_keys: set[str] | None = None,
                    exp_figures: list[Element] | None = None, act_figures: list[Element] | None = None,
-                   exp_tables: list[Element] | None = None, act_tables: list[Element] | None = None) -> list[dict]:
+                   exp_tables: list[Element] | None = None, act_tables: list[Element] | None = None,
+                   exp_spare_words: str | None = None, act_spare_words: str | None = None,
+                   exp_spare_units: Counter | None = None, act_spare_units: Counter | None = None) -> list[dict]:
     """Drop missing/extra content the other document prints elsewhere in the SAME
     heading's own topic - never a neighbouring or wider chapter's content.
 
@@ -6178,8 +6414,19 @@ def settle_content(diffs: list[dict], exp_words: str, act_words: str,
         kind = d.get("type")
         if kind in ("missing", "added") and d.get("kind") != KIND_FIGURE:
             el = exp_el if kind == "missing" else act_el
-            words = act_words if kind == "missing" else exp_words
-            units = act_units if kind == "missing" else exp_units
+            # Content a normal, both-sided pair already accounts for is spoken
+            # for: settling THIS finding with it too is what let a genuine
+            # duplicate (Staging printing an entire numbered procedure twice)
+            # excuse itself by pointing at the very Production text its
+            # legitimately-matched twin was already paired with. Falls back to
+            # the full topic words when the caller has not computed the
+            # spare-only ones (keeps this callable exactly as before).
+            if kind == "missing":
+                words = act_spare_words if act_spare_words is not None else act_words
+                units = act_spare_units if act_spare_units is not None else act_units
+            else:
+                words = exp_spare_words if exp_spare_words is not None else exp_words
+                units = exp_spare_units if exp_spare_units is not None else exp_units
             own_figures = (exp_figures if kind == "missing" else act_figures) or []
             other_tables = (act_tables if kind == "missing" else exp_tables) or []
             # A short label captioning a nearby icon ("WEEE", "Battery") is
@@ -6368,6 +6615,8 @@ _BOLD_SIMILAR = 0.90
 
 
 _BOLD_MATCH_OVERLAP = 0.5  # a Staging line must share this much of the Production line's words
+_BOLD_SHORT_LINE_RATIO = 0.6  # the shorter line's words, as a share of the longer's, below which
+                              # the shorter line is judged on ITS OWN coverage instead
 
 
 def _phrase_hits(doc: fitz.Document, el: Element, phrase: str) -> list[tuple[int, "fitz.Rect"]]:
@@ -6426,6 +6675,15 @@ def _bold_places(expected: fitz.Document, exp_el: Element, actual: fitz.Document
         best, best_score = None, 0.0
         for b_at, b_words in stage:
             score = len(a_words & b_words) / max(1, len(a_words | b_words))
+            shorter, longer = sorted((len(a_words), len(b_words)))
+            if shorter and shorter / max(1, longer) <= _BOLD_SHORT_LINE_RATIO:
+                # Staging's line-wrap reflowed the phrase onto a line with far
+                # fewer words of its own (a heading-length line split down to
+                # "...and press Connect." on Production's side, "press Connect"
+                # on Staging's) - the extra words only the LONGER line has must
+                # not count against it, so it is judged on how much of the
+                # SHORTER line's own words are shared, not the union of both.
+                score = max(score, len(a_words & b_words) / shorter)
             if score > best_score:
                 best, best_score = b_at, score
         if best is not None and best_score >= _BOLD_MATCH_OVERLAP:
@@ -6481,8 +6739,23 @@ def confirm_bold(diffs: list[dict], exp_el: Element | None, act_el: Element | No
             lightest = None
             for bold_at, plain_at in _bold_places(bold_doc, bold_el, plain_doc, plain_el, phrase):
                 wb, wp = stroke_weight(bold_doc, *bold_at), stroke_weight(plain_doc, *plain_at)
-                if not wb or not wp or wp / wb >= _BOLD_SIMILAR:
-                    continue  # unmeasurable, or prints just as dark - not an issue either way
+                if not wb or not wp:
+                    continue  # unmeasurable - not an issue either way
+                # A pixel-measured ratio right at `_BOLD_SIMILAR`'s edge is not
+                # trustworthy on its own when the two documents also set body
+                # text at different point sizes overall (Production 12pt,
+                # Staging 11pt, say) - a smaller size measures a few percent
+                # heavier as a share of its own line height from anti-aliasing
+                # alone, nothing to do with weight, and can mask a genuine bold
+                # difference the printed page shows plainly. Staging's own
+                # font simply not being the bold one Production's copy is is
+                # already a definite answer in that case, not a rendering
+                # nuance - trusted just as much as a clearly lighter pixel
+                # measurement, never on its own when the pixels agree it
+                # prints just as dark (a "Bold"-named font with no real bold
+                # weight of its own must not be reported either).
+                if wp / wb >= _BOLD_SIMILAR and _set_bold(plain_doc, *plain_at):
+                    continue
                 lightest = wp / wb if lightest is None else min(lightest, wp / wb)
                 bold_marks.append((bold_at[0], tuple(bold_at[1])))
                 plain_marks.append((plain_at[0], tuple(plain_at[1])))
@@ -7671,16 +7944,30 @@ def compare_chapters(
         act_figs_by_topic: dict[str, list[Element]] = {}
         exp_tables_by_topic: dict[str, list[Element]] = {}
         act_tables_by_topic: dict[str, list[Element]] = {}
+        spare_words: dict[str, tuple] = {}
         for topic in dict.fromkeys(e.section for e in exp_texts + act_texts):
             exp_topic = [e for e in exp_texts if e.section == topic]
             act_topic = [e for e in act_texts if e.section == topic]
             exp_topic_figs = [e for e in exp_figs if e.section == topic]
             act_topic_figs = [e for e in act_figs if e.section == topic]
-            chapter.pairs += reconcile_layout(
-                pair_elements(exp_topic, act_topic), exp_topic, act_topic,
-                exp_topic_figs, act_topic_figs,
-            )
+            topic_pairs = pair_elements(exp_topic, act_topic)
+            chapter.pairs += reconcile_layout(topic_pairs, exp_topic, act_topic, exp_topic_figs, act_topic_figs)
             words[topic] = _topic_words(exp_topic, act_topic, expected, actual, exp_topic_figs, act_topic_figs)
+            # Content already accounted for by a normal, both-sided pair is
+            # spoken for - settling a missing/added finding by finding those
+            # same words is what let Staging's OWN genuine duplicate of an
+            # entire numbered procedure excuse itself by pointing at the very
+            # Production text its legitimate, correctly-matched twin was
+            # already paired with (see `reconcile_layout`'s own fix for the
+            # same class of bug). Built from only the SPARE (still one-sided)
+            # elements of this topic, so a real duplicate has nothing left,
+            # once-matched, to settle against.
+            matched_exp_ids = {id(e) for eg, ag, _ in topic_pairs if eg and ag for e in eg}
+            matched_act_ids = {id(e) for eg, ag, _ in topic_pairs if eg and ag for e in ag}
+            exp_spare_topic = [e for e in exp_topic if id(e) not in matched_exp_ids]
+            act_spare_topic = [e for e in act_topic if id(e) not in matched_act_ids]
+            spare_words[topic] = _topic_words(
+                exp_spare_topic, act_spare_topic, expected, actual, exp_topic_figs, act_topic_figs)
             act_by_topic[topic] = act_topic
             exp_by_topic[topic] = exp_topic
             exp_figs_by_topic[topic] = exp_topic_figs
@@ -7691,6 +7978,7 @@ def compare_chapters(
         for exp_group, act_group, note, container in chapter.pairs:
             group_topic = (exp_group or act_group)[0].section
             exp_words, act_words, exp_units, act_units, exp_keys, act_keys = words[group_topic]
+            spare_exp_words, spare_act_words, spare_exp_units, spare_act_units, _, _ = spare_words[group_topic]
             diffs = (
                 [] if note == "layout"
                 else settle_content(
@@ -7699,6 +7987,7 @@ def compare_chapters(
                     exp_units, act_units, exp_keys, act_keys,
                     exp_figs_by_topic.get(group_topic, []), act_figs_by_topic.get(group_topic, []),
                     exp_tables_by_topic.get(group_topic, []), act_tables_by_topic.get(group_topic, []),
+                    spare_exp_words, spare_act_words, spare_exp_units, spare_act_units,
                 )
             )
             diffs = settle_tables(diffs, merge_elements(exp_group), merge_elements(act_group), exp_units, act_units)
@@ -7734,8 +8023,10 @@ def compare_chapters(
             ]
             if exp_group and act_group:
                 diffs += marker_changes(exp_group, act_group, expected, actual)
-                diffs += shading_changes(exp_group, act_group, expected, actual)
+                diffs += shading_changes(exp_group, act_group, expected, actual,
+                                         exp_by_topic.get(topic, []), act_by_topic.get(topic, []))
                 diffs += page_ref_dropped_changes(exp_group, act_group)
+                diffs += list_label_layout_changes(exp_group, act_group, expected, actual)
                 diffs += stray_space_changes(exp_group, act_group)
                 diffs += line_spacing_changes(exp_group, act_group, expected, actual,
                                               exp_by_topic.get(topic, []), act_by_topic.get(topic, []))
@@ -7839,7 +8130,7 @@ def compare_chapters(
             exp_elements, act_elements, expected, actual
         ) + list_indent_changes(
             exp_elements, act_elements, expected, actual, scale=size_scale
-        ):
+        ) + bullet_glyph_changes(exp_elements, act_elements):
             if len(chapter.differences) < MAX_ISSUES_PER_CHAPTER:
                 chapter.differences.append(diff)
         for diff in table_header_repeats(actual, actual_path, act_pages) + list_structure_changes(exp_elements, act_elements, expected, actual):
@@ -7929,6 +8220,7 @@ SEVERITY_OF = {
     "icon-missing": 4, "icon-added": 4, "icon-colour": 4, "icon-changed": 4,
     # 6 - how it is laid out, not what it says - shown, never fails the run
     "list-indent": 6, "figure-alignment": 6, "text-space": 6, "moved": 6, "figure-wrong-section": 6,
+    "list-label-layout": 6, "list-marker-glyph": 6,
     # (table-header-fill is not reported: Staging's header colour is its design.
     # A background gone altogether is: table-fill-missing.)
     "table-fill-missing": 3,
@@ -8001,7 +8293,7 @@ _TYPE_CATEGORY = {
     "link-missing": "links", "link-added": "links", "link-target": "links", "link-broken": "links",
     "link-page-ref-inconsistent": "links", "link-page-ref-dropped": "links",
     "numbering": "lists", "list-marker-missing": "lists", "list-marker-added": "lists", "list-indent": "lists",
-    "marker-size": "lists",
+    "marker-size": "lists", "list-label-layout": "lists", "list-marker-glyph": "lists",
     "bold-missing": "bold", "bold-added": "bold", "shading": "formatting",
     "underline-missing": "formatting", "underline-added": "formatting", "line-spacing": "formatting",
     "icon-missing": "images", "icon-added": "images", "icon-colour": "images", "icon-changed": "images",
@@ -8038,7 +8330,8 @@ def category_of(diff: dict) -> str:
 # Formatting changes that are one styling decision when they repeat.
 _REPEATABLE = {"size", "colour", "emphasis", "capitalisation", "punctuation", "word-order",
                "table-header-fill", "shading", "list-marker-added", "list-marker-missing",
-               "icon-colour", "icon-changed", "icon-missing", "icon-added"}
+               "icon-colour", "icon-changed", "icon-missing", "icon-added", "list-label-layout",
+               "list-marker-glyph"}
 
 _MINOR_TYPES = {
     "emphasis", "size", "colour", "figure-size", "figure-review", "moved", "table-extract",
