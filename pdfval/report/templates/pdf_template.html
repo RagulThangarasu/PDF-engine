@@ -7,11 +7,17 @@
 <style>
   :root { --line: #e3e6eb; --muted: #667085; --ink: #16181d; --accent: #2d6cdf;
           --box: rgba(239, 68, 68, .75); --box-on: #dc2626;
-          --box-critical: rgba(153, 27, 27, .9); --box-critical-on: #7f1d1d;
-          --box-minor: rgba(230, 130, 0, .85); --box-minor-on: #e68200;
-          --c-content: #b45309; --c-images: #7c3aed; --c-links: #2563eb;
-          --c-lists: #0f766e; --c-bold: #475467; --c-tables: #15803d;
-          --c-formatting: #be185d; }
+          /* Colour is by CATEGORY, not by severity: red for what the document
+             says or lacks (content, including a moved/reordered passage -
+             still content, just out of sequence), blue for pictures, brown
+             for lists and links, violet for everything else (bold, tables,
+             formatting). Severity is still shown - a critical finding's box
+             is simply thicker and more opaque, never a different hue, so the
+             category is always readable at a glance regardless of how
+             serious the finding is. */
+          --c-content: #dc2626; --c-images: #2563eb; --c-links: #92400e;
+          --c-lists: #92400e; --c-bold: #7c3aed; --c-tables: #7c3aed;
+          --c-formatting: #7c3aed; }
   * { box-sizing: border-box; }
   [hidden] { display: none !important; }
   html, body { height: 100%; margin: 0; }
@@ -64,6 +70,7 @@
   .it { padding: 8px 10px 9px 12px; border-bottom: 1px solid #f0f1f4; cursor: pointer; border-left: 3px solid transparent; }
   .it:hover { background: #fafbfc; }
   .it.on { background: #fff5f5; border-left-color: var(--box-on); }
+  .it.critical { --c: var(--c-content); }
   .it .m { font-weight: 600; }
   .it .n { color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 5px; }
   .it .h, .it .pg { color: var(--muted); font-size: 12px; margin-top: 2px; }
@@ -90,12 +97,9 @@
      an A4 one. A page wider than its pane scrolls sideways. */
   .pagewrap { position: relative; display: flex; gap: 10px; align-items: flex-start; margin: 0 auto 26px; width: max-content; }
   .lines { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
-  .link { stroke: var(--box); stroke-width: 1.25; }
-  .link.hover, .link.on { stroke: var(--box-on); stroke-width: 2; }
-  .link.minor { stroke: var(--box-minor); }
-  .link.minor.hover, .link.minor.on { stroke: var(--box-minor-on); }
-  .link.critical { stroke: var(--box-critical); stroke-width: 1.75; }
-  .link.critical.hover, .link.critical.on { stroke: var(--box-critical-on); }
+  .link { stroke: var(--c, var(--box-on)); stroke-width: 1.25; opacity: .75; }
+  .link.hover, .link.on { stroke-width: 2; opacity: 1; }
+  .link.critical { stroke-width: 1.75; opacity: 1; --c: var(--c-content); }
   /* --pscale: Production is scaled up to Staging's page size when the two
      were set on different paper sizes (an A5 baseline against an A4 rebuild),
      so the same paragraph lines up at roughly the same screen position and
@@ -123,37 +127,29 @@
   .page img { display: block; width: 100%; height: 100%; }
   .page .no { position: absolute; top: 4px; right: 6px; font-size: 11px; color: var(--muted);
               background: rgba(255,255,255,.85); padding: 0 4px; border-radius: 3px; }
-  /* An issue on the page: a light red outline - never a fill, the text under it
-     stays exactly as printed - with a black comment saying what is wrong there.
-     Orange (never failing the run) for how something is laid out - a list's
-     indent, a figure's alignment - never for what the document says or lacks. */
-  .box { position: absolute; border: 2px solid var(--box); border-radius: 3px; cursor: pointer; }
-  .box:hover { border-color: var(--box-on); }
-  .box.on { border: 3px solid var(--box-on); box-shadow: 0 0 0 3px rgba(239, 68, 68, .2); z-index: 3; }
-  .box.minor { border-color: var(--box-minor); }
-  .box.minor:hover { border-color: var(--box-minor-on); }
-  .box.minor.on { border-color: var(--box-minor-on); box-shadow: 0 0 0 3px rgba(230, 130, 0, .2); }
-  /* Critical (level 1 - what the document says or lacks outright) draws a
-     darker, thicker red than every other failing finding, so it is the one a
-     reader's eye lands on first among the rest. */
-  .box.critical { border-color: var(--box-critical); border-width: 3px; }
-  .box.critical:hover { border-color: var(--box-critical-on); }
-  .box.critical.on { border-color: var(--box-critical-on); box-shadow: 0 0 0 3px rgba(153, 27, 27, .25); }
+  /* An issue on the page: an outline in its CATEGORY's colour - never a fill,
+     the text under it stays exactly as printed - with a black comment saying
+     what is wrong there. Severity is mostly weight, not hue: a "minor" (never
+     failing the run) finding draws at the normal 2px, a "critical" one
+     (level 1 - what the document says or lacks outright, including a
+     passage that moved out of sequence, or an image/icon genuinely gone from
+     one side) draws thicker, fully opaque, AND in red regardless of its own
+     category's colour - content missing outright is the one kind of finding
+     a reader must never mistake for a routine same-category difference
+     (an Images-blue "figure oversized" beside an Images-blue "figure
+     missing" reads as the same severity; it is not). */
+  .box { position: absolute; border: 2px solid var(--c, var(--box-on)); border-radius: 3px; cursor: pointer;
+         opacity: .8; }
+  .box:hover, .box.hover { opacity: 1; box-shadow: 0 0 0 3px color-mix(in srgb, var(--c, var(--box-on)) 20%, transparent); }
+  .box.on { border-width: 3px; opacity: 1; box-shadow: 0 0 0 3px color-mix(in srgb, var(--c, var(--box-on)) 20%, transparent); z-index: 3; }
+  .box.critical { border-width: 3px; opacity: 1; --c: var(--c-content); }
   /* No number badge — the box is tied to its comment by the line drawn between them. */
   .note { position: absolute; left: 0; right: 0; font-size: 12px; line-height: 1.35; color: #111; background: #fff;
-          border: 1px solid #f1b4b4; border-left: 3px solid var(--box); border-radius: 4px; padding: 4px 6px;
-          cursor: pointer; overflow-wrap: anywhere; box-shadow: 0 1px 2px rgba(0,0,0,.06); }
-  .note:hover, .note.hover { border-color: var(--box-on); }
-  .note.on { border-color: var(--box-on); border-left-width: 4px; background: #fff5f5; font-weight: 600; z-index: 2; }
-  .box.hover { border-color: var(--box-on); box-shadow: 0 0 0 3px rgba(239, 68, 68, .2); }
-  .note.minor { border: 1px solid #f5d7a8; border-left: 3px solid var(--box-minor); }
-  .note.minor:hover, .note.minor.hover { border-color: var(--box-minor-on); }
-  .note.minor.on { border-color: var(--box-minor-on); background: #fff8ec; }
-  .note.critical { border-left: 4px solid var(--box-critical); font-weight: 600; }
-  .note.critical:hover, .note.critical.hover { border-color: var(--box-critical-on); }
-  .note.critical.on { border-color: var(--box-critical-on); background: #fdf0f0; }
-  .box.minor.hover { border-color: var(--box-minor-on); box-shadow: 0 0 0 3px rgba(230, 130, 0, .2); }
-  .box.critical.hover { border-color: var(--box-critical-on); box-shadow: 0 0 0 3px rgba(153, 27, 27, .25); }
+          border: 1px solid var(--c, var(--box-on)); border-left-width: 3px; border-radius: 4px; padding: 4px 6px;
+          cursor: pointer; overflow-wrap: anywhere; box-shadow: 0 1px 2px rgba(0,0,0,.06); opacity: .85; }
+  .note:hover, .note.hover { opacity: 1; }
+  .note.on { border-left-width: 4px; background: #fafbff; font-weight: 600; z-index: 2; opacity: 1; }
+  .note.critical { border-left-width: 4px; font-weight: 600; opacity: 1; --c: var(--c-content); }
   .no-notes .note, .no-notes .lines { display: none; }
   .hide-others .box:not(.on), .hide-others .note:not(.on), .hide-others .link:not(.on) { display: none; }
   body[data-cat="content"] .box:not(.cat-content), body[data-cat="images"] .box:not(.cat-images),
@@ -442,7 +438,7 @@ function buildNav() {
     det.append(sum, el('div', 'help', g.help));
     g.ids.forEach(id => {
       const it = issues[id];
-      const row = el('div', 'it cat-' + it.category); row.dataset.id = id;
+      const row = el('div', 'it cat-' + it.category + (it.critical ? ' critical' : '')); row.dataset.id = id;
       const head = el('div', 'm');
       head.append(el('span', 'dot'), document.createTextNode(it.title));
       row.append(head, el('div', 'h', it.chapter + (it.section ? ' › ' + it.section : '')), el('div', 'd', it.description));

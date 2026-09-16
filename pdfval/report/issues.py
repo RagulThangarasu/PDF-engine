@@ -46,12 +46,26 @@ _CATEGORY_KEYS = [c["key"] for c in CATEGORIES]
 _BOXES_BEFORE_LIST = 3         # more word boxes than this on a side: one box, changes listed
 
 # Drawn orange. Everything else - missing or wrong content, a missing table or
-# row, a/b/c instead of 1/2/3, a lost bullet, a missing picture or link - is red.
+# row, a/b/c instead of 1/2/3, a lost bullet, a missing picture or link - is
+# red. Bold is red too, not orange: `confirm_bold` only ever keeps a
+# "bold-missing"/"bold-added" candidate once it has measured the two sides'
+# printed stroke weight and confirmed Staging's copy genuinely reads lighter
+# or heavier, so by the time one reaches here it is exactly as real a defect
+# as a wrong word - not a styling nuance to merely flag for review.
 ORANGE_TYPES = {
     "list-indent", "table-merge", "table-columns", "table-cell-layout", "figure-alignment", "figure-size",
-    "bold-missing", "bold-added", "shading", "marker-size", "text-space", "icon-changed",
+    "shading", "marker-size", "text-space", "icon-changed",
     "underline-missing", "underline-added", "line-spacing",
 }
+
+# An image or icon genuinely gone from one side - not resized, not moved, not
+# rendering a little differently, but not there at all. Severity alone (4, the
+# same tier as "figure oversized") would draw it in the ordinary, same-as-
+# every-other-Images-finding blue; outright absence is content missing
+# outright, same as a level-1 Content finding, and is drawn just as critical -
+# thicker, opaque, and in red - so it never blends into a page full of routine
+# size/alignment differences.
+_ALWAYS_CRITICAL_TYPES = {"figure-missing", "figure-added", "icon-missing", "icon-added"}
 
 
 def _render(doc: fitz.Document, output_dir: str, prefix: str) -> list[dict]:
@@ -520,8 +534,11 @@ def build_issue_report(chapters: list, expected: fitz.Document, actual: fitz.Doc
                 # Level 1 is what the document actually says or lacks outright -
                 # the one kind of finding a reader must not miss among the rest
                 # that also fail the run, so it is marked to draw darker.
-                "critical": (diff.get("severity") == 1 and diff.get("type") not in ORANGE_TYPES
-                             and not diff.get("review_only")),
+                "critical": (
+                    (diff.get("severity") == 1 and diff.get("type") not in ORANGE_TYPES
+                     and not diff.get("review_only"))
+                    or diff.get("type") in _ALWAYS_CRITICAL_TYPES
+                ),
             })
         chapter_rows.append({
             "id": f"ch{ci}", "title": chapter.title, "count": len(issues) - before,

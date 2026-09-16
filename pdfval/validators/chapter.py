@@ -65,7 +65,7 @@ from pdfval.extractor import get_figures, get_tables, get_vector_figures
 from pdfval.models import CheckResult, Issue
 from pdfval.validators.alignment import classify_marker
 from pdfval.validators.headings import body_style, resolve_entries
-from pdfval.validators.links import USABLE_SCHEMES, _named_destination_resolves
+from pdfval.validators.links import USABLE_SCHEMES, _named_destination_resolves, _uri_authority
 from pdfval.validators.table import _document_margins, _headers_match, _stitch_continued_tables
 from pdfval.validators.toc import (
     TocEntry,
@@ -264,7 +264,8 @@ _PAGE_REF_RE = re.compile(
 # printing the same thing. Marker STYLE is compared by Alignment Validation;
 # here only the words count.
 _LIST_MARKER_TOKEN_RE = re.compile(
-    r"(?:(?<=\s)|^)(?:\d{1,2}|[a-z]|[ivx]{2,4})[.)](?=\s|$)|[\u2022\u25e6\u25aa\u25b8\u2023\u2043\u00b7\u2219]",
+    r"(?:(?<=\s)|^)(?:\((?:\d{1,2}|[a-z]|[ivx]{2,4})\)|(?:\d{1,2}|[a-z]|[ivx]{2,4})[.)])(?=\s|$)"
+    r"|[\u2022\u25e6\u25aa\u25b8\u2023\u2043\u00b7\u2219]",
     re.IGNORECASE,
 )
 
@@ -1949,6 +1950,7 @@ def _short_label_mismatch(a: "Element", b: "Element") -> bool:
 
 _ITEM_MARKER_RE = re.compile(
     r"(?:(?<=\s)|^)((?:\d{1,2}|[a-z]|ii|iii|iv|vi|vii|viii|ix|xi|xii)[.)]"
+    r"|\((?:\d{1,2}|[a-z]|ii|iii|iv|vi|vii|viii|ix|xi|xii)\)"
     r"|[\u2022\u25e6\u25aa\u25b8\u2023\u2043\u00b7\u2219])(?=\s)",
     re.IGNORECASE,
 )
@@ -2321,7 +2323,7 @@ def icon_changes(exp_group: list[Element], act_group: list[Element],
 def _marker_phrase(marker: str) -> str:
     """“step 5”, “item b”, “a bulleted item” - a marker as a reader names it."""
     kind = _marker_kind(marker)
-    label = marker.rstrip(".)")
+    label = marker.strip("()").rstrip(".)")  # "(a)" and "a)" both read as just "a"
     if kind == "number":
         return f"step {label}"
     if kind in ("letter", "roman"):
@@ -2771,7 +2773,8 @@ def table_header_repeats(actual: fitz.Document, actual_path: str | None, pages: 
 _LIST_ITEM_MIN_KEY = 12
 _MARKER_REACH = 30.0          # points left of an item's first word its marker may sit
 _MARKER_TAIL_RE = re.compile(
-    r"(\d{1,2}[.)]|(?:ii|iii|iv|vi|vii|viii|ix|xi|xii)[.)]|[a-z][.)]"
+    r"(\(\d{1,2}\)|\((?:ii|iii|iv|vi|vii|viii|ix|xi|xii)\)|\([a-z]\)"
+    r"|\d{1,2}[.)]|(?:ii|iii|iv|vi|vii|viii|ix|xi|xii)[.)]|[a-z][.)]"
     r"|[\u2022\u25e6\u25aa\u25b8\u2023\u2043\u00b7\u2219\u25cf\u25a0\u2013\u2014-])\s*$",
     re.IGNORECASE,
 )
@@ -3481,6 +3484,11 @@ def link_changes(exp_links: list[Element], act_links: list[Element],
     # when Staging only links to the same address under some other heading.
     exp_targets = {(link.section, link.label) for link in exp_links}
     act_targets = {(link.section, link.label) for link in act_links}
+    # Every address Production links to anywhere in the chapter, scheme taken
+    # off - a bare "www.benq.com" in Staging against Production's own
+    # "https://www.benq.com" is the SAME address, not a link Staging broke,
+    # even when it is not this exact link's own pair that carries the scheme.
+    exp_addresses = {_uri_authority(link.label) for link in exp_links}
     out: list[dict] = []
     for a, b in _pair_links(exp_links, act_links):
         if b is None:
@@ -3492,20 +3500,25 @@ def link_changes(exp_links: list[Element], act_links: list[Element],
                             "summary": f"Hyperlink missing in Staging — “{a.text[:80]}” is a link in Production and plain text in Staging.",
                             "detail": f"Production link goes to: {a.label}"})
         elif a is None:
-            if b.detail:
+            if b.detail and _uri_authority(b.label) not in exp_addresses:
                 out.append({"type": "link-broken", "kind": KIND_LINK, "exp": None, "act": b,
                             "summary": f"Hyperlink not working in Staging — “{b.text[:80] or 'link'}”: {b.detail}.",
                             "detail": ""})
-            elif b.key in exp_blob and (b.section, b.label) not in exp_targets:
+            elif not b.detail and b.key in exp_blob and (b.section, b.label) not in exp_targets:
                 where = _phrase_anchor(expected, exp_elements, b.text, b.section)
                 out.append({"type": "link-added", "kind": KIND_LINK, "exp": where, "act": b,
                             "summary": f"Hyperlink added in Staging — “{b.text[:80]}” is plain text in Production.",
                             "detail": f"Staging link goes to: {b.label}"})
-        elif b.detail and not a.detail:
+        elif b.detail and not a.detail and _uri_authority(b.label) not in exp_addresses:
             out.append({"type": "link-broken", "kind": KIND_LINK, "exp": a, "act": b,
                         "summary": f"Hyperlink not working in Staging — “{b.text[:80]}”: {b.detail}.",
                         "detail": f"Production link goes to: {a.label}"})
-        elif a.label != b.label and not (a.label.startswith(("page ", "unresolved")) or b.label.startswith("page ")):
+        elif (a.label != b.label and _uri_authority(a.label) != _uri_authority(b.label)
+              and not (a.label.startswith(("page ", "unresolved")) or b.label.startswith("page "))):
+            # "https://www.benq.com" against the bare "www.benq.com", or against
+            # "http://www.benq.com" - the same address, spelled with or without
+            # a scheme, or with a different one, is not a link that "goes
+            # somewhere else"; a viewer opens both the same way.
             out.append({"type": "link-target", "kind": KIND_LINK, "exp": a, "act": _on_words(actual, b, a.text),
                         "summary": f"Hyperlink goes somewhere else — “{a.text[:80]}”.",
                         "detail": f"Production: {a.label} · Staging: {b.label}"})
@@ -3615,6 +3628,15 @@ def _figure_min_side(doc: fitz.Document) -> float:
 
 
 _NEXT_STEP_OPENER_RE = re.compile(r"^\s*(?:\d{1,2}|[a-z])[.)]\s", re.IGNORECASE)
+# pt: a short label reads about this wide at most. A run of body prose sitting
+# above a row of icon+label pairs (each icon on the left, its own label in a
+# column well to the right) can touch a figure's very edge at zero gap while
+# running on for hundreds of points past it - the same zero gap a genuine
+# label earns by sitting flush against the figure, but for an unrelated
+# reason. Ranked down by how far a candidate's width runs past what a label
+# ever needs, so the real label - a little farther away, but short - still
+# wins over prose that merely happens to graze the figure first.
+_CAPTION_LABEL_WIDTH = 170.0
 
 
 def _caption(fig: Element, texts: list[Element]) -> str:
@@ -3630,9 +3652,10 @@ def _caption(fig: Element, texts: list[Element]) -> str:
         tx0, ty0, tx1, ty1 = t.bbox
         dx = max(tx0 - x1, x0 - tx1, 0.0)
         dy = max(ty0 - y1, y0 - ty1, 0.0)
-        distance = (dx * dx + dy * dy) ** 0.5
-        if distance > _CAPTION_REACH:
+        gap = (dx * dx + dy * dy) ** 0.5
+        if gap > _CAPTION_REACH:
             continue
+        distance = gap + max(0.0, (tx1 - tx0) - _CAPTION_LABEL_WIDTH)
         # A numbered/lettered step opener ("3. On the Language page...")
         # printed just BELOW a figure is the instruction for the NEXT step,
         # not this one's label - a tutorial screenshot sits between its own
@@ -3658,12 +3681,22 @@ def _caption(fig: Element, texts: list[Element]) -> str:
     for t in texts:
         if t.kind != KIND_TABLE or not t.row_boxes:
             continue
+        best_row, best_overlap = None, 0.0
         for (page, bbox), row_cells in zip(t.row_boxes, t.cells):
-            if page != fig.page or min(y1, bbox[3]) - max(y0, bbox[1]) <= 0:
+            if page != fig.page:
                 continue
-            label = next((c for c in row_cells if (c or "").strip()), "")
-            if label:
-                return label[:_CAPTION_MAX_CHARS]
+            # The row with the MOST of the figure's own height inside it, not
+            # the first row touched at all: a figure's box is rarely cut at
+            # exactly its row's boundary, and returning on the first overlap
+            # found grabbed the row above's label from the one or two points
+            # a figure grazed into its tail end - every icon in a stacked
+            # checklist captioned one row early.
+            overlap = min(y1, bbox[3]) - max(y0, bbox[1])
+            if overlap > best_overlap:
+                best_row, best_overlap = row_cells, overlap
+        label = next((c for c in (best_row or ()) if (c or "").strip()), "")
+        if label:
+            return label[:_CAPTION_MAX_CHARS]
     # ... or the same row's item name set as ordinary text, with no ruling at
     # all to read as a table - a short, left-aligned label facing a picture
     # held in a fixed right-hand column sits far past an ordinary caption's
@@ -4189,6 +4222,35 @@ def _printed_elsewhere(fig: Element, doc: fitz.Document, taken: list[tuple[int, 
     return Element(kind=KIND_FIGURE, boxes=[(page_index, tuple(r))], width=r.width, height=r.height, fp=fp)
 
 
+def _figure_repeats_elsewhere(fig: Element, others: list[Element]) -> bool:
+    """Whether this same picture is ALSO used, at this same near-identical
+    fingerprint, somewhere else in the same document - a note icon or a menu
+    screenshot deliberately reused once per item. Only figures that do NOT
+    repeat are one-off illustrations, so a one-off pairing across two
+    different sections is a real misplacement, not a reused icon landing
+    beside whichever item it happens to sit closest to."""
+    return any(o is not fig and _figure_similarity(fig, o) >= _FIGURE_SAME for o in others)
+
+
+def _wrong_section_diff(a: Element, b: Element, name: str,
+                        exp_entries: list["TocEntry"], act_entries: list["TocEntry"],
+                        exp_figs: list[Element], act_figs: list[Element]) -> dict | None:
+    """A figure paired across two different sections is normally a picture
+    reused per topic (allowed through on looks alone) - but when it is a
+    one-off on BOTH sides, landing under a different heading in Staging than
+    Production had it under is a genuine misplacement, not a reuse."""
+    if not (a.section and b.section and a.section != b.section):
+        return None
+    if _figure_repeats_elsewhere(a, exp_figs) or _figure_repeats_elsewhere(b, act_figs):
+        return None
+    where_exp = heading_at(exp_entries, a.page, a.bbox[1]) or a.section
+    where_act = heading_at(act_entries, b.page, b.bbox[1]) or b.section
+    return {"type": "figure-wrong-section", "kind": KIND_FIGURE,
+            "summary": (f"Figure wrongly placed in Staging — {name} is printed under “{where_exp}” "
+                        f"in Production, but under “{where_act}” in Staging."),
+            "detail": f"Production: {where_exp} · Staging: {where_act}"}
+
+
 def figure_changes(
     exp_figs: list[Element], act_figs: list[Element],
     exp_texts: list[Element], act_texts: list[Element],
@@ -4300,6 +4362,9 @@ def figure_changes(
             diffs.extend(figure_label_missing(a, b, name, expected, actual))
             diffs.extend(visual_figure_changes(a, b, name, expected, actual))
         diffs = _settle_pair(diffs, a, b, expected, actual, exp_bands, act_bands, exp_section_at, act_section_at)
+        wrong_section = _wrong_section_diff(a, b, name, exp_entries, act_entries, exp_figs, act_figs)
+        if wrong_section:
+            diffs.append(wrong_section)
         rows.append({"exp": [a], "act": [b], "differences": diffs})
 
     # Second chance: figures still without a partner on both sides pair on how
@@ -4344,6 +4409,9 @@ def figure_changes(
             diffs.extend(figure_label_missing(a, b, name, expected, actual))
             diffs.extend(visual_figure_changes(a, b, name, expected, actual))
             diffs = _settle_pair(diffs, a, b, expected, actual, exp_bands, act_bands, exp_section_at, act_section_at)
+            wrong_section = _wrong_section_diff(a, b, name, exp_entries, act_entries, exp_figs, act_figs)
+            if wrong_section:
+                diffs.append(wrong_section)
             rows.append({"exp": [a], "act": [b], "differences": diffs})
             continue
         if look < _FIGURE_DIFFERENT:
@@ -4351,6 +4419,9 @@ def figure_changes(
                           "summary": f"Figure is a different picture — {name} is labelled differently in the two documents and the pictures do not match.",
                           "detail": f"appearance match {look:.0%} · Production label: “{exp_caps[i] or '—'}” · Staging label: “{act_caps[j] or '—'}”"})
         diffs = _settle_pair(diffs, a, b, expected, actual, exp_bands, act_bands, exp_section_at, act_section_at)
+        wrong_section = _wrong_section_diff(a, b, name, exp_entries, act_entries, exp_figs, act_figs)
+        if wrong_section:
+            diffs.append(wrong_section)
         rows.append({"exp": [a], "act": [b], "differences": diffs})
 
     # Last resort: image validation only asks whether a picture is there, not
@@ -4722,7 +4793,8 @@ def compare_group(
     if moved and a is not None and b is not None:
         out.append({
             "type": "moved", "kind": a.kind,
-            "summary": f"{KIND_LABEL[a.kind]} moved — it is printed in a different place in Staging.",
+            "summary": f"{KIND_LABEL[a.kind]} out of sequence — it is printed in a different place in Staging, "
+                       f"not where Production has it in the reading order.",
             "detail": (a.text or "")[:200], "minor": True,
         })
     out.extend(_compare_merged(a, b, size_scale))
@@ -4748,6 +4820,52 @@ def _looks_like_bare_marker(text: str) -> bool:
     to count: a bare "a" with no punctuation is left alone, since that is also
     how a genuinely doubled word ("without a a grommet ring") reads out."""
     return bool(_BARE_MARKER_RE.match((text or "").strip()))
+
+
+# The Private Use Area is deliberately NOT here on its own - manuals
+# legitimately map callout/UI glyphs into it, and a PUA character already
+# present in Production's own copy is the source document's own font, not a
+# regression. It only counts once it is NEW in Staging - see `_artifact_set`.
+_ENCODING_ARTIFACT_RE = re.compile(
+    r"[�￾￿\U0001fffe\U0001ffff\U0002fffe\U0002ffff\U0010fffe\U0010ffff]"
+    r"|[\x00-\x08\x0b\x0c\x0e-\x1f]"
+)
+_CID_TOKEN_RE = re.compile(r"\(cid:\s?\d+\)")  # PyMuPDF's literal text for a glyph with no ToUnicode mapping
+_PUA_RE = re.compile(r"[-\U000f0000-\U000ffffd\U00100000-\U0010fffd]")
+
+
+def _artifact_set(text: str) -> set[str]:
+    """The distinct un-decodable markers in `text`: the replacement character
+    and other noncharacters, raw control characters, unmapped Private-Use
+    glyphs, and the literal "(cid:N)" token PyMuPDF prints for a glyph with no
+    ToUnicode mapping at all - every one of them a place the text layer could
+    not read what is actually printed there."""
+    out = {ch for ch in (text or "") if _ENCODING_ARTIFACT_RE.match(ch) or _PUA_RE.match(ch)}
+    if _CID_TOKEN_RE.search(text or ""):
+        out.add("(cid:N)")
+    return out
+
+
+def _encoding_regression(kind: str, a_text: str, b_text: str) -> dict | None:
+    """A character Staging's copy carries that Production's matching text does
+    not - a real regression in whatever produced the new export (a font
+    subset missing a glyph, a broken re-encoding), not a source artefact both
+    sides already share (a PUA glyph or "(cid:N)" already in Production's own
+    copy is the source document's own font, and reported here only once it is
+    new). Checked both ways: Staging can just as easily be the clean copy of
+    a character Production's own export garbled."""
+    for lost, x_text, y_text in ((False, a_text, b_text), (True, b_text, a_text)):
+        new = _artifact_set(y_text) - _artifact_set(x_text)
+        if new:
+            shown = ", ".join(sorted(f"“{ch}”" if ch != "(cid:N)" else ch for ch in new)[:6])
+            side = "Staging" if not lost else "Production"
+            return {
+                "type": "text-encoding", "kind": kind,
+                "summary": (f"Text encoding issue in {side} — {len(new)} character(s) do not decode "
+                            f"({shown})."),
+                "detail": (y_text or "")[:200],
+            }
+    return None
 
 
 def _compare_merged(a: Element | None, b: Element | None, size_scale: float) -> list[dict]:
@@ -4879,6 +4997,11 @@ def _compare_merged(a: Element | None, b: Element | None, size_scale: float) -> 
                 "detail": "; ".join(changes[:6]) + (" …" if len(changes) > 6 else ""),
             })
         return out
+
+    if a.kind != KIND_FIGURE:
+        encoding = _encoding_regression(a.kind, a.text, b.text)
+        if encoding:
+            out.append(encoding)
 
     if a.key != b.key:
         gone, extra = _content_runs(a.key, b.key)
@@ -5113,6 +5236,33 @@ def _printed_in(el: Element, other_words: str, other_units: Counter | None = Non
     if len(squashed) >= minimum and squashed in other_words.replace(" ", ""):
         return True
     return len(tokens) <= _SHORT_LABEL_TOKENS and not (Counter(tokens) - Counter(other_words.split()))
+
+
+_TABLE_ROW_MATCH = 0.8  # a cell or row this alike is the same row, not a coincidence
+
+
+def _matches_table_row(text: str, tables: list[Element] | None, min_ratio: float = _TABLE_ROW_MATCH) -> bool:
+    """Whether `text` is (near enough to) one whole cell, or one whole row, of
+    a table on the OTHER side - a stronger, structural match than "somewhere
+    in this topic's running prose": a label-and-description table one side
+    grids and the other prints as plain paragraphs still holds the very same
+    row, one cell at a time, even when a single glyph the two extractions
+    read differently (a subset font's ToUnicode map missing one character)
+    keeps it from lining up as one exact, contiguous run of characters."""
+    if not text or not tables:
+        return False
+    key = _normalise(text)
+    if not key:
+        return False
+    for t in tables:
+        for row in t.cells or ():
+            for cell in row:
+                if cell and _ratio(key, _normalise(cell)) >= min_ratio:
+                    return True
+            row_text = _normalise(" ".join(c for c in row if c))
+            if row_text and _ratio(key, row_text) >= min_ratio:
+                return True
+    return False
 
 
 def _elsewhere(run: str, other_words: str) -> bool:
@@ -5626,6 +5776,22 @@ def table_row_changes(a: Element, b: Element, exp_units: Counter, act_units: Cou
             cell_changes.append((i, j, changed))
         if reordered:
             sequence_changes.append((i, j, reordered))
+    # A cell's own un-decodable character (a CJK/Arabic OSD language list read
+    # back as raw "(cid:N)" tokens is where this turns up most) is worth
+    # flagging on its own, independently of whatever `cell_changes` above made
+    # of the same cell - a table cell comparison can fold a garbled cell into
+    # "changed" or, if the two sides otherwise still look equal enough, drop
+    # it entirely, and either way loses the fact that it does not decode.
+    seen_encoding: set[str] = set()
+    for i, j in sorted(pairs.items()):
+        if i >= len(a.cells) or j >= len(b.cells):
+            continue
+        for cell_a, cell_b in zip(a.cells[i], b.cells[j]):
+            enc = _encoding_regression(KIND_TABLE, cell_a, cell_b)
+            if enc and enc["summary"] not in seen_encoding:
+                seen_encoding.add(enc["summary"])
+                enc["exp"], enc["act"] = _row_element(a, [i]), _row_element(b, [j])
+                out.append(enc)
     if merged_rows:
         # One issue for the table: the same merge decision printed on many rows
         # (a spanned Extension column, a status column split in two) reads as
@@ -5849,7 +6015,8 @@ def settle_content(diffs: list[dict], exp_words: str, act_words: str,
                    exp_el: Element | None = None, act_el: Element | None = None,
                    exp_units: Counter | None = None, act_units: Counter | None = None,
                    exp_keys: set[str] | None = None, act_keys: set[str] | None = None,
-                   exp_figures: list[Element] | None = None, act_figures: list[Element] | None = None) -> list[dict]:
+                   exp_figures: list[Element] | None = None, act_figures: list[Element] | None = None,
+                   exp_tables: list[Element] | None = None, act_tables: list[Element] | None = None) -> list[dict]:
     """Drop missing/extra content the other document prints elsewhere in the SAME
     heading's own topic - never a neighbouring or wider chapter's content.
 
@@ -5874,16 +6041,25 @@ def settle_content(diffs: list[dict], exp_words: str, act_words: str,
             words = act_words if kind == "missing" else exp_words
             units = act_units if kind == "missing" else exp_units
             own_figures = (exp_figures if kind == "missing" else act_figures) or []
+            other_tables = (act_tables if kind == "missing" else exp_tables) or []
             # A short label captioning a nearby icon ("WEEE", "Battery") is
             # never settled this way: the word merely appearing SOMEWHERE in
             # the topic's own running prose ("...equipment and/or Battery...")
             # is not evidence the icon still carries its own caption - unlike
             # a genuinely relocated label ("Deutsch" beside its paragraph on
             # one side, inside it on the other), losing an icon's caption is
-            # a real difference a reader would notice.
+            # a real difference a reader would notice. But a whole cell of an
+            # actual TABLE on the other side is not a coincidence the way a
+            # stray word in running prose is: a label-icon-description row one
+            # side grids and the other reflows into plain paragraphs still
+            # opens with the very same label, so it is the icon that was
+            # dropped, not the caption.
             caption = (el is not None and el.text and len(el.text) <= _LAYOUT_SHORT_CHARS
-                       and _near_a_figure(el, own_figures, reach=_HEADING_CAPTION_REACH))
-            if el is not None and not caption and _printed_in(el, words, units):
+                       and _near_a_figure(el, own_figures, reach=_HEADING_CAPTION_REACH)
+                       and not _matches_table_row(el.text, other_tables, min_ratio=0.85))
+            if el is not None and not caption and (
+                _printed_in(el, words, units) or _matches_table_row(el.text, other_tables)
+            ):
                 continue
             out.append(d)
             continue
@@ -6043,7 +6219,12 @@ def _underline_missing(a: Element, b: Element) -> list[str]:
 # is reported only when Staging's strokes are clearly thinner.
 _BOLD_ZOOM = 4.0        # ~290 dpi: a stroke is several pixels wide
 _INK_LEVEL = 150        # grey below this is ink
-_BOLD_SIMILAR = 0.80    # Staging's strokes at least this share of Production's read as bold too
+# Staging's strokes must be at least this share of Production's to read as
+# bold too - low enough to still catch a real, if modest, weight increase
+# (a regular font traded for a medium one, not just Regular-vs-Bold), high
+# enough that two renders of the very same weight, which differ only by a few
+# percent from anti-aliasing, are not called a difference.
+_BOLD_SIMILAR = 0.90
 
 
 _BOLD_MATCH_OVERLAP = 0.5  # a Staging line must share this much of the Production line's words
@@ -7058,6 +7239,84 @@ def _ocr_confirms_in_image(doc: fitz.Document, pages: list[int], toks: list[str]
     return False
 
 
+_SECTION_HEADING_BAND = 22.0  # pt: a heading's own printed line sits at most this far from its TocEntry y
+
+
+def _heading_own_bbox(doc: fitz.Document, entry: "TocEntry") -> tuple[float, float, float, float]:
+    """The printed line's own bounding box for a TOC entry - a `TocEntry`
+    carries only its y-position, not a box to highlight, so the page is
+    searched for the line at that position whose (squashed) text matches the
+    title. Falls back to a plain band across the column at that y when the
+    exact line can't be matched (a title split oddly across text runs), so
+    the section is still boxed somewhere close rather than not at all.
+    """
+    target = re.sub(r"\s+", "", normalize_title(entry.title))
+    best = None
+    try:
+        data = doc[entry.page].get_text("dict")
+    except Exception:
+        data = {"blocks": []}
+    for block in data.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            bbox = line.get("bbox")
+            if not bbox:
+                continue
+            y0 = bbox[1]
+            if abs(y0 - entry.y) > _SECTION_HEADING_BAND:
+                continue
+            text = "".join(s.get("text", "") for s in line.get("spans", []))
+            squashed = re.sub(r"\s+", "", normalize_title(text))
+            if target and (squashed == target or squashed.startswith(target) or target.startswith(squashed)):
+                return tuple(float(v) for v in bbox)
+            if best is None or abs(y0 - entry.y) < abs(best[1] - entry.y):
+                best = tuple(float(v) for v in bbox)
+    if best is not None:
+        return best
+    try:
+        width = doc[entry.page].rect.width
+    except Exception:
+        width = 550.0
+    return (40.0, entry.y, min(560.0, width - 40.0), entry.y + 18.0)
+
+
+def _section_missing_diffs(
+    entries: list["TocEntry"], span_start: tuple, span_end: tuple | None, doc: fitz.Document, lost: bool
+) -> list[dict]:
+    """One finding per heading this side has with no counterpart at all, on
+    either side, at any level - not just the L1 chapters `ChapterSpan`
+    already tracks - so a whole gone section reads as itself, not as a pile
+    of separately-missing paragraphs with nothing saying they shared a
+    vanished parent. Highlighted at the heading's own printed line - the
+    NAME of the section is what makes this finding legible, not its body,
+    which is why it is boxed there rather than spanning everything under it.
+    """
+    out: list[dict] = []
+    for entry in entries:
+        pos = (entry.page, entry.y)
+        if not (pos > span_start and (span_end is None or pos < span_end)):
+            continue
+        bbox = _heading_own_bbox(doc, entry)
+        el = Element(kind=KIND_HEADING, text=entry.title, key=normalize_title(entry.title), boxes=[(entry.page, bbox)])
+        other = "Staging" if lost else "Production"
+        out.append({
+            "type": "section-missing" if lost else "section-added",
+            "kind": KIND_HEADING,
+            "exp": el if lost else None,
+            "act": None if lost else el,
+            "summary": (
+                f"Section missing in Staging — “{entry.title}” and everything under it "
+                f"is not printed anywhere in {other}."
+                if lost else
+                f"Section only in Staging — “{entry.title}” and everything under it "
+                f"is not printed anywhere in {other}."
+            ),
+            "detail": "",
+        })
+    return out
+
+
 def _soften_artwork_text(chapter: "Chapter") -> None:
     """A short numeric/spec fragment ("0-40°C 10-90% 0-3000m") printed right
     beside a picture, and apparently missing on the other side, is not
@@ -7166,7 +7425,8 @@ def compare_chapters(
     topics: dict[str, dict] = {}
     exp_anchors: list[tuple] = []
     act_anchors: list[tuple] = []
-    for k, m in enumerate(match_toc_entries(exp_entries, act_entries)):
+    all_heading_matches = match_toc_entries(exp_entries, act_entries)
+    for k, m in enumerate(all_heading_matches):
         if m.expected_index is None or m.actual_index is None:
             continue
         e, a = exp_entries[m.expected_index], act_entries[m.actual_index]
@@ -7176,6 +7436,19 @@ def compare_chapters(
         act_anchors.append((a.page, a.y, topic))
     exp_anchors.sort()
     act_anchors.sort()
+    # A heading with no counterpart at all, at any level - not just the L1
+    # chapters ChapterSpan already tracks - is a whole SECTION gone, not a
+    # paragraph gone: reported as its own finding below, one per chapter,
+    # rather than left to read as a pile of unrelated missing paragraphs with
+    # no word saying they all vanished together because their heading did.
+    unmatched_exp_headings = [
+        exp_entries[m.expected_index] for m in all_heading_matches
+        if m.expected_index is not None and m.actual_index is None and not exp_entries[m.expected_index].excluded
+    ]
+    unmatched_act_headings = [
+        act_entries[m.actual_index] for m in all_heading_matches
+        if m.actual_index is not None and m.expected_index is None and not act_entries[m.actual_index].excluded
+    ]
 
     chapters: list[Chapter] = []
     for n, span in enumerate(pairs):
@@ -7220,6 +7493,8 @@ def compare_chapters(
         exp_by_topic: dict[str, list[Element]] = {}
         exp_figs_by_topic: dict[str, list[Element]] = {}
         act_figs_by_topic: dict[str, list[Element]] = {}
+        exp_tables_by_topic: dict[str, list[Element]] = {}
+        act_tables_by_topic: dict[str, list[Element]] = {}
         for topic in dict.fromkeys(e.section for e in exp_texts + act_texts):
             exp_topic = [e for e in exp_texts if e.section == topic]
             act_topic = [e for e in act_texts if e.section == topic]
@@ -7234,6 +7509,8 @@ def compare_chapters(
             exp_by_topic[topic] = exp_topic
             exp_figs_by_topic[topic] = exp_topic_figs
             act_figs_by_topic[topic] = act_topic_figs
+            exp_tables_by_topic[topic] = [e for e in exp_topic if e.kind == KIND_TABLE]
+            act_tables_by_topic[topic] = [e for e in act_topic if e.kind == KIND_TABLE]
         repeated: dict[tuple, int] = {}
         for exp_group, act_group, note, container in chapter.pairs:
             group_topic = (exp_group or act_group)[0].section
@@ -7245,6 +7522,7 @@ def compare_chapters(
                     exp_words, act_words, merge_elements(exp_group), merge_elements(act_group),
                     exp_units, act_units, exp_keys, act_keys,
                     exp_figs_by_topic.get(group_topic, []), act_figs_by_topic.get(group_topic, []),
+                    exp_tables_by_topic.get(group_topic, []), act_tables_by_topic.get(group_topic, []),
                 )
             )
             diffs = settle_tables(diffs, merge_elements(exp_group), merge_elements(act_group), exp_units, act_units)
@@ -7403,6 +7681,12 @@ def compare_chapters(
         _drop_confirmed_content_changes(chapter, expected, actual)
         _soften_artwork_text(chapter)
         _drop_appearance_only_figures(chapter)
+        for diff in (
+            _section_missing_diffs(unmatched_exp_headings, span.exp_span[0], span.exp_span[1], expected, lost=True)
+            + _section_missing_diffs(unmatched_act_headings, span.act_span[0], span.act_span[1], actual, lost=False)
+        ):
+            if len(chapter.differences) < MAX_ISSUES_PER_CHAPTER:
+                chapter.differences.append(diff)
         if _ONLY_TABLE_CHECKS:
             _keep_table_checks_only(chapter)
         if _VALIDATION_DISABLED:
@@ -7452,8 +7736,8 @@ def compare_chapters(
 # 1-3 fail the run. 4-6 are listed for review.
 SEVERITY_OF = {
     # 1 - what the chapter says, and how its lists are marked
-    "text": 1, "missing": 1, "added": 1, "note-label": 1, "table-cell": 1,
-    "table-cell-sequence": 1,
+    "text": 1, "missing": 1, "added": 1, "section-missing": 1, "section-added": 1, "note-label": 1, "table-cell": 1,
+    "table-cell-sequence": 1, "text-encoding": 1,
     "numbering": 1, "list-marker-missing": 1, "list-marker-added": 1,
     # 2 - hyperlinks
     "link-missing": 2, "link-added": 2, "link-target": 2, "link-broken": 2,
@@ -7466,7 +7750,7 @@ SEVERITY_OF = {
     "underline-missing": 5, "underline-added": 5, "line-spacing": 5,
     "icon-missing": 4, "icon-added": 4, "icon-colour": 4, "icon-changed": 4,
     # 6 - how it is laid out, not what it says - shown, never fails the run
-    "list-indent": 6, "figure-alignment": 6, "text-space": 6,
+    "list-indent": 6, "figure-alignment": 6, "text-space": 6, "moved": 6, "figure-wrong-section": 6,
     # (table-header-fill is not reported: Staging's header colour is its design.
     # A background gone altogether is: table-fill-missing.)
     "table-fill-missing": 3,
@@ -7535,7 +7819,7 @@ CATEGORIES = [
 CATEGORY_LABEL = {c["key"]: c["label"] for c in CATEGORIES}
 
 _TYPE_CATEGORY = {
-    "text": "content", "note-label": "content",
+    "text": "content", "note-label": "content", "section-missing": "content", "section-added": "content",
     "link-missing": "links", "link-added": "links", "link-target": "links", "link-broken": "links",
     "link-page-ref-inconsistent": "links",
     "numbering": "lists", "list-marker-missing": "lists", "list-marker-added": "lists", "list-indent": "lists",
@@ -7550,13 +7834,19 @@ _TYPE_CATEGORY = {
     "table-shape": "content", "table-header-repeat": "content", "table-cell": "content",
     "table-cell-sequence": "content",
     "table-row-missing": "content", "table-row-added": "content", "table-as-text": "content",
-    "text-space": "content",
+    "text-space": "content", "text-encoding": "content",
+    # A figure moved to the wrong section is a sequence/order problem, like a
+    # paragraph out of reading order - it reads as content, not as the
+    # picture's own look, so it is red like the rest of "moved", not blue.
+    "figure-wrong-section": "content",
 }
 
 
 def category_of(diff: dict) -> str:
     """Which of the six categories a difference belongs to."""
     kind = diff.get("type") or ""
+    if kind in _TYPE_CATEGORY:
+        return _TYPE_CATEGORY[kind]
     if kind.startswith("figure-"):
         return "images"
     if kind in ("missing", "added"):
@@ -7564,7 +7854,7 @@ def category_of(diff: dict) -> str:
         # missing is a table issue, a whole picture an image issue.
         element = diff.get("kind")
         return "images" if element == KIND_FIGURE else "content"
-    return _TYPE_CATEGORY.get(kind, "content")
+    return "content"
 
 
 # Formatting changes that are one styling decision when they repeat.
