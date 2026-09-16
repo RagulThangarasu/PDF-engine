@@ -151,6 +151,14 @@ def _comments(diff: dict, title: str, description: str) -> tuple[str, str]:
     if kind in fixed:
         return fixed[kind]
     if kind == "shading":
+        shading_titles = {
+            "Background shading added in Staging": ("Plain page in Production", "Shaded box added in Staging"),
+            "Background shading missing in Staging": ("Shaded box in Production", "Shading missing in Staging"),
+            "Note styling missing in Staging": ("Icon note in Production", "Note styling missing in Staging"),
+            "Extra content pulled into Staging's note box": ("Separate text in Production", "Pulled into note box in Staging"),
+        }
+        if title in shading_titles:
+            return shading_titles[title]
         return (("Plain page in Production", "Shaded box added in Staging") if "added" in title
                 else ("Shaded box in Production", "Shading missing in Staging"))
     if kind == "link-target":
