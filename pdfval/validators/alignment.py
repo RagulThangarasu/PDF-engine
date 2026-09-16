@@ -62,7 +62,7 @@ _ROMAN_NUMERAL_MARKERS = r"ii|iii|iv|v|vi|vii|viii|ix|x|xi|xii|xiii|xiv|xv|xvi|x
 _BULLET_GLYPHS = "\u2022\u25e6\u25aa\u25b8\u2023\u2043\u00b7\u2219"
 _LIST_MARKER_RE = re.compile(
     r"^\s*(\(\d{1,2}\)|\([a-zA-Z]\)|\((?:" + _ROMAN_NUMERAL_MARKERS + r")\)"
-    r"|\d{1,2}[.)]|[a-zA-Z][.)]|(?:" + _ROMAN_NUMERAL_MARKERS + r")[.)]|[" + _BULLET_GLYPHS + r"])\s+",
+    r"|\d{1,2} ?[.)]|[a-zA-Z] ?[.)]|(?:" + _ROMAN_NUMERAL_MARKERS + r") ?[.)]|[" + _BULLET_GLYPHS + r"])\s+",
     re.IGNORECASE,
 )
 
@@ -103,12 +103,15 @@ MIN_ITEM_KEY_CHARS = 6
 
 
 def classify_marker(marker: str) -> str:
-    if re.match(r"^\d{1,3}[.)]$", marker) or re.match(r"^\(\d{1,3}\)$", marker):
+    # A space sometimes sits between the marker and its own punctuation
+    # ("1 .", "a )") - a document's own quirk of spacing, not a different
+    # marker style from "1." or "a)".
+    if re.match(r"^\d{1,3} ?[.)]$", marker) or re.match(r"^\(\d{1,3}\)$", marker):
         return "number"
-    if (re.match(rf"^(?:{_ROMAN_NUMERAL_MARKERS})[.)]$", marker, re.IGNORECASE)
+    if (re.match(rf"^(?:{_ROMAN_NUMERAL_MARKERS}) ?[.)]$", marker, re.IGNORECASE)
             or re.match(rf"^\((?:{_ROMAN_NUMERAL_MARKERS})\)$", marker, re.IGNORECASE)):
         return "roman"
-    if re.match(r"^[a-zA-Z][.)]$", marker) or re.match(r"^\([a-zA-Z]\)$", marker):
+    if re.match(r"^[a-zA-Z] ?[.)]$", marker) or re.match(r"^\([a-zA-Z]\)$", marker):
         return "letter"
     return "bullet"
 

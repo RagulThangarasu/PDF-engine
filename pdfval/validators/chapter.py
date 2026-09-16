@@ -265,7 +265,7 @@ _PAGE_REF_RE = re.compile(
 # printing the same thing. Marker STYLE is compared by Alignment Validation;
 # here only the words count.
 _LIST_MARKER_TOKEN_RE = re.compile(
-    r"(?:(?<=\s)|^)(?:\((?:\d{1,2}|[a-z]|[ivx]{2,4})\)|(?:\d{1,2}|[a-z]|[ivx]{2,4})[.)])(?=\s|$)"
+    r"(?:(?<=\s)|^)(?:\((?:\d{1,2}|[a-z]|[ivx]{2,4})\)|(?:\d{1,2}|[a-z]|[ivx]{2,4}) ?[.)])(?=\s|$)"
     r"|[\u2022\u25e6\u25aa\u25b8\u2023\u2043\u00b7\u2219]",
     re.IGNORECASE,
 )
@@ -404,6 +404,9 @@ def reset_furniture_cache() -> None:
     _FIGURE_MIN_BY_DOC.clear()
     _FILL_CACHE.clear()
     _ICON_CACHE.clear()
+    _UNDERLINE_CACHE.clear()
+    _PAGE_ART_CACHE.clear()
+    _ART_FP_CACHE.clear()
 
 
 def _is_furniture(
@@ -2022,7 +2025,7 @@ def _short_label_mismatch(a: "Element", b: "Element") -> bool:
 # STYLES are compared.
 
 _ITEM_MARKER_RE = re.compile(
-    r"(?:(?<=\s)|^)((?:\d{1,2}|[a-z]|ii|iii|iv|vi|vii|viii|ix|xi|xii)[.)]"
+    r"(?:(?<=\s)|^)((?:\d{1,2}|[a-z]|ii|iii|iv|vi|vii|viii|ix|xi|xii) ?[.)]"
     r"|\((?:\d{1,2}|[a-z]|ii|iii|iv|vi|vii|viii|ix|xi|xii)\)"
     r"|[\u2022\u25e6\u25aa\u25b8\u2023\u2043\u00b7\u2219])(?=\s)",
     re.IGNORECASE,
@@ -2396,7 +2399,7 @@ def icon_changes(exp_group: list[Element], act_group: list[Element],
 def _marker_phrase(marker: str) -> str:
     """“step 5”, “item b”, “a bulleted item” - a marker as a reader names it."""
     kind = _marker_kind(marker)
-    label = marker.strip("()").rstrip(".)")  # "(a)" and "a)" both read as just "a"
+    label = marker.strip("()").rstrip(".)").strip()  # "(a)", "a)" and "a ." all read as just "a"
     if kind == "number":
         return f"step {label}"
     if kind in ("letter", "roman"):
@@ -2847,7 +2850,7 @@ _LIST_ITEM_MIN_KEY = 12
 _MARKER_REACH = 30.0          # points left of an item's first word its marker may sit
 _MARKER_TAIL_RE = re.compile(
     r"(\(\d{1,2}\)|\((?:ii|iii|iv|vi|vii|viii|ix|xi|xii)\)|\([a-z]\)"
-    r"|\d{1,2}[.)]|(?:ii|iii|iv|vi|vii|viii|ix|xi|xii)[.)]|[a-z][.)]"
+    r"|\d{1,2} ?[.)]|(?:ii|iii|iv|vi|vii|viii|ix|xi|xii) ?[.)]|[a-z] ?[.)]"
     r"|[\u2022\u25e6\u25aa\u25b8\u2023\u2043\u00b7\u2219\u25cf\u25a0\u2013\u2014-])\s*$",
     re.IGNORECASE,
 )
@@ -3143,7 +3146,7 @@ def list_structure_changes(exp: list[Element], act: list[Element],
 _INDENT_TOLERANCE = 6.0      # points an item may move before it is reported ...
 _INDENT_MAX = 48.0           # ... and at most this: further is a different layout (a table cell,
                              # a second column), measured against the wrong line, not an indent
-_NEXT_ITEM_RE = re.compile(r"^\s*(?:[•●▪◦·\-–—]|\(?[0-9]{1,2}[.)]|\(?[a-zA-Z][.)])\s")
+_NEXT_ITEM_RE = re.compile(r"^\s*(?:[•●▪◦·\-–—]|\(?[0-9]{1,2} ?[.)]|\(?[a-zA-Z] ?[.)])\s")
 _LINE_GEOM_CACHE: dict[tuple, list] = {}
 
 
@@ -3620,6 +3623,41 @@ def page_ref_dropped_changes(exp_group: list[Element], act_group: list[Element])
                     f"“{a_ref.group(0).strip()}”, Staging does not name a page there."),
         "detail": "",
     }]
+
+
+_STRAY_SPACE_PUNCT_RE = re.compile(r"[ \t]+([.,;:!?])")
+
+
+def _stray_space(group: list[Element]) -> str | None:
+    text = " ".join(e.text for e in group if e.text)
+    m = _STRAY_SPACE_PUNCT_RE.search(text)
+    if not m:
+        return None
+    lead = " ".join(text[: m.start()].split()[-3:])  # whole words, not a mid-word cut
+    return (lead + m.group(0)).strip()
+
+
+def stray_space_changes(exp_group: list[Element], act_group: list[Element]) -> list[dict]:
+    """A stray space directly before a sentence's own closing punctuation -
+    "the base ." instead of "the base." - left behind when words in the
+    middle of a sentence (often a page-number cross-reference the wording
+    comparison already treats as legitimately dropped) were deleted without
+    closing up the gap. Invisible to the wording comparison itself, which
+    collapses any run of whitespace to one space before two texts are
+    compared; checked directly on the printed text instead, and only when it
+    is a genuine difference between the two documents - not a stray space
+    either one happens to share, which is its own document's styling, not a
+    defect this comparison should flag."""
+    a_stray, b_stray = _stray_space(exp_group), _stray_space(act_group)
+    if b_stray and not a_stray:
+        return [{"type": "text-space", "kind": KIND_TEXT,
+                 "summary": f"Extra space in Staging — “{b_stray}” has a stray space Production does not.",
+                 "detail": ""}]
+    if a_stray and not b_stray:
+        return [{"type": "text-space", "kind": KIND_TEXT,
+                 "summary": f"Extra space in Production — “{a_stray}” has a stray space Staging does not.",
+                 "detail": ""}]
+    return []
 
 
 def page_ref_consistency_changes(act_links: list[Element]) -> list[dict]:
@@ -5329,6 +5367,14 @@ def _printed_in(el: Element, other_words: str, other_units: Counter | None = Non
     minimum = 4 if _CJK_RE.search(run) else _SQUASHED_MIN_CHARS
     if len(squashed) >= minimum and squashed in other_words.replace(" ", ""):
         return True
+    # A heading's own words scattered separately elsewhere in the topic's body
+    # prose ("copyright" in one sentence, "disclaimer" in another) is not the
+    # heading printed elsewhere - unlike a short caption/label, a heading is
+    # never legitimately folded into running text, so an extra/missing heading
+    # (e.g. a "Copyright and Disclaimer" section only one side wraps as its own
+    # heading) must not be silently settled just because its words are common.
+    if el.kind == KIND_HEADING:
+        return False
     return len(tokens) <= _SHORT_LABEL_TOKENS and not (Counter(tokens) - Counter(other_words.split()))
 
 
@@ -6912,8 +6958,15 @@ def _word_diff(before: str, after: str) -> list[dict]:
 
 def _skipped_heading(entry: TocEntry) -> bool:
     """A heading whose section is out of scope: a table of contents, a Q&A or
-    FAQ section, or front matter the heading resolver already marked."""
-    return entry.excluded or is_excluded_heading(entry.title or "")
+    FAQ section, or a regulatory declaration - never a heading `_mark_front_matter`
+    excluded only for not lining up as a shared chapter boundary. That flag
+    reuses the same `excluded` attribute for an unrelated purpose, and reading
+    it here fed front matter straight into `skip_spans`: real prose (a
+    "Copyright and Disclaimer" wrapper heading nesting the very sections the
+    other document bookmarks at the top level, say) was wiped from
+    `collect_elements` even on the page range `chapter_pairs` deliberately
+    swept into chapter 0 to keep comparing it."""
+    return is_excluded_heading(entry.title or "")
 
 
 _QA_FAQ_SKIP_MAX_PAGES = 1  # a topic-jump index or trailing blurb runs at most this far
@@ -7552,13 +7605,25 @@ def compare_chapters(
     # paragraph gone: reported as its own finding below, one per chapter,
     # rather than left to read as a pile of unrelated missing paragraphs with
     # no word saying they all vanished together because their heading did.
+    # Matched with `include_excluded=True` and filtered by `is_excluded_heading`
+    # (TOC/Q&A/RoHS-style titles) here, NOT the entry's own `.excluded` flag -
+    # that flag is overloaded by `_mark_front_matter` to also mean "sits before
+    # the first heading shared with the other document", which is true of a
+    # real wrapper heading like "Copyright & Disclaimer" nesting sub-headings
+    # the other document bookmarks at the top level (it sits right before its
+    # own first child heading, the "first shared heading" on that side) - using
+    # `match_toc_entries`'s default would drop it from consideration entirely,
+    # not just fail to match it, and it would never be reported missing/added.
+    all_heading_matches_incl_excluded = match_toc_entries(exp_entries, act_entries, include_excluded=True)
     unmatched_exp_headings = [
-        exp_entries[m.expected_index] for m in all_heading_matches
-        if m.expected_index is not None and m.actual_index is None and not exp_entries[m.expected_index].excluded
+        exp_entries[m.expected_index] for m in all_heading_matches_incl_excluded
+        if m.expected_index is not None and m.actual_index is None
+        and not is_excluded_heading(exp_entries[m.expected_index].title)
     ]
     unmatched_act_headings = [
-        act_entries[m.actual_index] for m in all_heading_matches
-        if m.actual_index is not None and m.expected_index is None and not act_entries[m.actual_index].excluded
+        act_entries[m.actual_index] for m in all_heading_matches_incl_excluded
+        if m.actual_index is not None and m.expected_index is None
+        and not is_excluded_heading(act_entries[m.actual_index].title)
     ]
 
     chapters: list[Chapter] = []
@@ -7671,6 +7736,7 @@ def compare_chapters(
                 diffs += marker_changes(exp_group, act_group, expected, actual)
                 diffs += shading_changes(exp_group, act_group, expected, actual)
                 diffs += page_ref_dropped_changes(exp_group, act_group)
+                diffs += stray_space_changes(exp_group, act_group)
                 diffs += line_spacing_changes(exp_group, act_group, expected, actual,
                                               exp_by_topic.get(topic, []), act_by_topic.get(topic, []))
                 if not any(e.kind == KIND_TABLE for e in exp_group + act_group):
