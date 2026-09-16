@@ -185,7 +185,7 @@
       <label><input type="checkbox" id="onlyActive"> Selected issue only</label>
       <select id="heading" onchange="jumpHeading(this.value)">
         <option value="">Go to heading…</option>
-        {% for h in view.anchors %}<option value="{{ loop.index0 }}">{{ '— ' * (h.level - 1) }}{{ h.title }}{{ '' if h.stage else ' (not in Staging)' }}</option>{% endfor %}
+        {% for h in view.anchors %}{% if not h.sync_only %}<option value="{{ loop.index0 }}">{{ '— ' * (h.level - 1) }}{{ h.title }}{{ '' if h.stage else ' (not in Staging)' }}</option>{% endif %}{% endfor %}
       </select>
       <button onclick="zoom(-0.1)" title="Zoom out">−</button><span class="zoomval" id="zoomval">100%</span><button onclick="zoom(0.1)" title="Zoom in">+</button><button onclick="zoom(0)" title="Show pages at the PDF's actual size">Actual size</button>
     </div>

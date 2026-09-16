@@ -26,7 +26,7 @@ import re
 import fitz
 
 from pdfval.report.chapters import _TYPE_HELP, _range, _side_content
-from pdfval.validators.chapter import CATEGORIES, category_of
+from pdfval.validators.chapter import CATEGORIES, category_of, table_anchors
 from pdfval.validators.headings import resolve_entries
 from pdfval.validators.toc import heading_at, match_toc_entries
 
@@ -385,15 +385,30 @@ def _y_share(doc: fitz.Document, page_index: int, y: float) -> float:
     return max(0.0, min(1.0, y / height))
 
 
+def _order_anchors(out: list[dict]) -> list[dict]:
+    """Sort a set of waypoints into Production's reading order and drop any
+    `stage` side that would then run backwards - a heading or table Staging
+    prints earlier than one already placed cannot be a waypoint, or scrolling
+    forward in Production would jump Staging back."""
+    out.sort(key=lambda h: (h["prod"]["page"], h["prod"]["y"]))
+    last_stage = (0, 0.0)
+    for h in out:
+        if h["stage"] is not None:
+            here = (h["stage"]["page"], h["stage"]["y"])
+            if here <= last_stage:
+                h["stage"] = None  # out of order - a Production-only waypoint instead of a wrong one
+            else:
+                last_stage = here
+    return out
+
+
 def _anchors(expected: fitz.Document, actual: fitz.Document, exp_entries, act_entries) -> list[dict]:
     """Production's own table of contents, whole - the nav lists every heading
     the baseline has, not just the ones Staging also has, and clicking one
     always moves Production there. `stage` is filled in only where Staging
-    has a usable match for it, in step with the matches before it (a heading
-    Staging prints earlier than one already placed cannot be a waypoint, or
-    scrolling forward in Production would jump Staging back): the JS side
-    interpolates Staging's position from its neighbours when a heading is
-    Production-only, the same way it already does for a one-sided issue."""
+    has a usable match for it, in step with the matches before it: the JS
+    side interpolates Staging's position from its neighbours when a heading
+    is Production-only, the same way it already does for a one-sided issue."""
     out: list[dict] = []
     for m in match_toc_entries(exp_entries, act_entries):
         if m.expected_index is None:
@@ -411,20 +426,12 @@ def _anchors(expected: fitz.Document, actual: fitz.Document, exp_entries, act_en
             "prod": {"page": e.page + 1, "y": _y_share(expected, e.page, e.y)},
             "stage": stage,
         })
-    out.sort(key=lambda h: (h["prod"]["page"], h["prod"]["y"]))
-    last_stage = (0, 0.0)
-    for h in out:
-        if h["stage"] is not None:
-            here = (h["stage"]["page"], h["stage"]["y"])
-            if here <= last_stage:
-                h["stage"] = None  # out of order - a Production-only waypoint instead of a wrong one
-            else:
-                last_stage = here
-    return out
+    return _order_anchors(out)
 
 
 def build_issue_report(chapters: list, expected: fitz.Document, actual: fitz.Document,
-                       output_dir: str | None) -> dict:
+                       output_dir: str | None,
+                       expected_path: str | None = None, actual_path: str | None = None) -> dict:
     """The data behind pdf.html."""
     exp_entries, act_entries = resolve_entries(expected, actual)
     issues: list[dict] = []
@@ -554,6 +561,15 @@ def build_issue_report(chapters: list, expected: fitz.Document, actual: fitz.Doc
     counts = {key: 0 for key in _CATEGORY_KEYS}
     for item in issues:
         counts[item["category"]] += 1
+    anchors = _anchors(expected, actual, exp_entries, act_entries)
+    if expected_path and actual_path:
+        # Table waypoints on top of heading ones: a chapter that packs several
+        # tables onto one page in Production and spreads them across several
+        # in Staging (or excludes a whole section, like a per-country RoHS
+        # declaration, from Content Validation altogether) has no other
+        # landmark between its surrounding headings, and drifts out of step
+        # without one.
+        anchors = _order_anchors(anchors + table_anchors(expected, actual, expected_path, actual_path))
     return {
         "total": len(issues),
         "passed": not issues,
@@ -562,7 +578,7 @@ def build_issue_report(chapters: list, expected: fitz.Document, actual: fitz.Doc
                     "ids": [it["id"] for it in issues if it["category"] == c["key"]]} for c in CATEGORIES],
         "issues": issues,
         "chapters": chapter_rows,
-        "anchors": _anchors(expected, actual, exp_entries, act_entries),
+        "anchors": anchors,
         "prod_pages": _render(expected, output_dir, "prod") if output_dir else [],
         "stage_pages": _render(actual, output_dir, "stage") if output_dir else [],
     }
