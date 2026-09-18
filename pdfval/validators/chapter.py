@@ -59,9 +59,10 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 import fitz
+from diff_match_patch import diff_match_patch
 
 from pdfval import i18n, imagefp, visual_diff
-from pdfval.extractor import get_figures, get_tables, get_vector_figures
+from pdfval.extractor import _cluster_rects, get_figures, get_tables, get_vector_figures
 from pdfval.models import CheckResult, Issue
 from pdfval.validators.alignment import classify_marker
 from pdfval.validators.headings import body_style, resolve_entries
@@ -1310,6 +1311,70 @@ def _is_leading_icon(doc: fitz.Document, page_index: int, bbox: tuple) -> bool:
     return False
 
 
+# A page whose body text was exported with its glyphs drawn as vector paths
+# rather than kept as real characters (a font-embedding restriction, most
+# often seen on regulatory/compliance pages carrying several languages) reads
+# as one huge, densely-packed "figure" - hundreds to thousands of tiny paths,
+# not the few dozen a real illustration's own strokes ever need, spanning
+# most of the page's own width because that is simply where the text column
+# runs. A full page scanned and embedded as one raster image is the same
+# problem from the other side: neither is "a picture", both are just how
+# that one page's content happens to be delivered on this side, and pairing
+# either against the OTHER side's normal figure or normal text can only ever
+# misfire, since there is nothing of matching shape to pair it with.
+_VECTORIZED_TEXT_DENSITY = 0.006  # primitives per pt^2 - several times any real illustration's own detail
+_PAGE_SCALE_WIDTH_FRAC = 0.5      # spans at least half the page's width
+_FULL_PAGE_RASTER_FRAC = 0.75     # a raster image this large a share of the page is a full-page scan
+
+
+def _is_page_scale_content(doc: fitz.Document, page_index: int, f) -> bool:
+    rect = doc[page_index].rect
+    if f.kind == "vector":
+        area = max(1.0, f.display_width * f.display_height)
+        density = f.primitives / area
+        return (
+            density >= _VECTORIZED_TEXT_DENSITY
+            and rect.width > 0 and f.display_width / rect.width >= _PAGE_SCALE_WIDTH_FRAC
+        )
+    if f.kind == "raster":
+        page_area = max(1.0, rect.width * rect.height)
+        return (f.display_width * f.display_height) / page_area >= _FULL_PAGE_RASTER_FRAC
+    return False
+
+
+def _marker_immediately_before(doc: fitz.Document, page_index: int, bbox: tuple) -> bool:
+    """A short list marker ("9.", "17.", "a)", a bullet glyph) is printed
+    immediately to the LEFT of this icon, on the same line - so the icon is a
+    numbered/bulleted item's own inline artwork, not a NOTE/TIP/WARNING icon
+    living in the page margin. A genuine margin icon has nothing printed
+    before it but margin whitespace; this one has the item's own marker,
+    which just happened to end up extracted as a separate text element from
+    its label (see `list_label_layout_changes`) - the split that otherwise
+    makes this icon geometrically indistinguishable from a real margin icon.
+    """
+    x0, y0, x1, y1 = bbox
+    try:
+        data = doc[page_index].get_text("dict")
+    except Exception:
+        return False
+    for block in data.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            spans = [s for s in line.get("spans", []) if s.get("text", "").strip()]
+            if not spans:
+                continue
+            ly0, ly1 = line["bbox"][1], line["bbox"][3]
+            overlap = min(y1, ly1) - max(y0, ly0)
+            if overlap < 0.5 * min(y1 - y0, ly1 - ly0):
+                continue
+            last = spans[-1]
+            lx1 = last["bbox"][2]
+            if 0 <= x0 - lx1 <= _LEADING_ICON_GAP and _LIST_MARKER_TOKEN_RE.fullmatch(last["text"].strip()):
+                return True
+    return False
+
+
 _INK_DPI = 48
 _INK_WHITE = 240
 
@@ -1485,6 +1550,7 @@ def collect_elements(
                 if f.display_width >= _figure_min_side(doc) and f.display_height >= _figure_min_side(doc)
                 and y0 - 2 <= (f.bbox[1] + f.bbox[3]) / 2 <= y1 + 2
                 and not _is_leading_icon(doc, page_index, f.bbox)
+                and not _is_page_scale_content(doc, page_index, f)
             ]
         except Exception:
             figures = []
@@ -2050,10 +2116,42 @@ _DASH_MARKERS = {"-", "–", "—"}
 # --- inline icons ------------------------------------------------------------
 _ICON_MAX_SIDE = 40.0       # an image no larger than this, inside a text block, is an inline icon
 _ICON_MIN_SIDE = 5.0
+# A compound icon button (two glyphs sharing one pill-shaped outline - a
+# volume-down/volume-up pair, say) is wider than a single icon but still only
+# one line tall, so it gets a wider berth on width alone rather than being
+# excluded purely for holding two symbols instead of one.
+_ICON_MAX_WIDE = 60.0
+# `_cluster_rects` rebuilds its whole output list on every merge, so a run of
+# N mostly-separate primitives can cost well past O(N^2) before it settles -
+# fine for a handful of icon fragments, not for a page with hundreds/thousands
+# of raw path segments (a detailed technical illustration, a densely hatched
+# diagram), which was measured to make a single page's icon lookup hang for
+# minutes. Two independent guards keep that from ever being reached: a
+# primitive too big in either dimension to be part of a compact icon glyph
+# (a table rule spanning most of the page, a large illustration's outline)
+# is dropped before it ever reaches clustering, since it's both useless for
+# icon detection and, being large, the single biggest driver of that
+# merge cost; and even after that filter, a page still offering more
+# icon-sized candidates than this is unusual enough (fine hatching, a dense
+# schematic) that clustering it isn't worth the risk - skipped rather than
+# gambled on.
+_RAW_PRIMITIVE_MAX_SIDE = 80.0
+_RAW_CLUSTER_MAX_PRIMITIVES = 400
 _ICON_HUE_DELTA = 25.0      # degrees of dominant hue before a colour change is reported
 _ICON_SAME = 0.6            # appearance match below which a paired icon is a different picture
 _ICON_COLOURED_SHARE = 0.08 # share of an icon's pixels that must be coloured for it to have a hue
 _ICON_CACHE: dict[tuple, list] = {}
+
+
+def _overlaps_existing(bbox: tuple, existing: list[tuple], threshold: float = 0.5) -> bool:
+    x0, y0, x1, y1 = bbox
+    area = max(1e-6, (x1 - x0) * (y1 - y0))
+    for ex0, ey0, ex1, ey1 in existing:
+        ix0, iy0 = max(x0, ex0), max(y0, ey0)
+        ix1, iy1 = min(x1, ex1), min(y1, ey1)
+        if ix1 > ix0 and iy1 > iy0 and ((ix1 - ix0) * (iy1 - iy0)) / area >= threshold:
+            return True
+    return False
 
 
 def _page_icons(doc: fitz.Document, page_index: int) -> list[tuple]:
@@ -2071,11 +2169,37 @@ def _page_icons(doc: fitz.Document, page_index: int) -> list[tuple]:
             boxes += [tuple(float(v) for v in f.bbox) for f in get_vector_figures(doc, page_index, print_ready=True)]
         except Exception:
             pass
-        _ICON_CACHE[key] = [
-            (page_index, b) for b in boxes
+        icon_boxes = [
+            b for b in boxes
             if _ICON_MIN_SIDE <= b[2] - b[0] <= _ICON_MAX_SIDE
             and _ICON_MIN_SIDE <= b[3] - b[1] <= _ICON_MAX_SIDE
         ]
+        # A compact multi-path glyph on a remote-control/button diagram can be
+        # too PLAIN (a bare outline box - broken artwork with nothing left
+        # inside it) or too small relative to a real illustration to pass
+        # get_vector_figures' "is this a real figure" bar, on EITHER side,
+        # regardless of which one is actually broken - so it never reaches the
+        # icon pool at all and a broken icon goes uncompared entirely, silent.
+        # Clustering the page's raw vector primitives directly, bypassing that
+        # figure-worthiness filter, recovers it; the icon-size bound is what
+        # keeps this from pulling in a table's own ruling lines or a full
+        # diagram, and the overlap check keeps it from double-counting an icon
+        # already found above.
+        try:
+            raw_rects = [
+                r for d in doc[page_index].get_drawings() if d.get("rect")
+                for r in [tuple(float(v) for v in d["rect"])]
+                if r[2] - r[0] <= _RAW_PRIMITIVE_MAX_SIDE and r[3] - r[1] <= _RAW_PRIMITIVE_MAX_SIDE
+            ]
+            if 0 < len(raw_rects) <= _RAW_CLUSTER_MAX_PRIMITIVES:
+                for bbox, _count in _cluster_rects(raw_rects, gap=2.0):
+                    w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                    if (_ICON_MIN_SIDE <= h <= _ICON_MAX_SIDE and _ICON_MIN_SIDE <= w <= _ICON_MAX_WIDE
+                            and not _overlaps_existing(bbox, icon_boxes)):
+                        icon_boxes.append(bbox)
+        except Exception:
+            pass
+        _ICON_CACHE[key] = [(page_index, b) for b in icon_boxes]
     return _ICON_CACHE[key]
 
 
@@ -2313,10 +2437,22 @@ def icon_changes(exp_group: list[Element], act_group: list[Element],
                     # right before a line's own start when it wraps to open
                     # one, and only living in the margin - outside the text
                     # column altogether - tells a callout's icon apart from it.
-                    if ix1 <= x0 + 2 and (
+                    # Neither half of that check actually rules out an inline
+                    # icon whose own list marker ("9.", "17.") was extracted as
+                    # a SEPARATE element from its label - a common split (see
+                    # `list_label_layout_changes`) that leaves the icon sitting
+                    # just left of THIS element's own start, indistinguishable
+                    # by either signal above from a genuine margin callout: a
+                    # short element is always "near its own top", and a
+                    # genuine callout icon likewise always has text starting
+                    # right after it. What tells them apart is what is printed
+                    # immediately to the icon's OWN left: a callout icon has
+                    # nothing there but page margin, an inline button icon has
+                    # the item's own marker.
+                    if (ix1 <= x0 + 2 and (
                         cy <= y0 + max(20.0, (y1 - y0) * 0.35)
                         or _is_leading_icon(doc, page_index, (ix0, iy0, ix1, iy1))
-                    ):
+                    ) and not _marker_immediately_before(doc, page_index, (ix0, iy0, ix1, iy1))):
                         continue
                     side, word = _icon_anchor(doc, page_index, icon[1])
                     # A callout's own icon (Note / Warning / TIP) is callout
@@ -3778,30 +3914,46 @@ def page_ref_dropped_changes(exp_group: list[Element], act_group: list[Element])
 
 
 _LABEL_LINE_TOLERANCE = 2  # extra words (a list number, a bullet) still read as "the label's own line"
+_SHORT_LABEL_MAX_WORDS = 4  # "Step 12:", "Important:" - longer than this is a sentence, not a lead-in label
+# A lead-in label with no bold styling of its own to mark it out - "Step 5:",
+# or one of the callout words this codebase already recognises (NOTE/TIP/
+# WARNING/…, `i18n._CALLOUT_WORDS`) - still reads as a distinct label a
+# reader's eye jumps to, purely from the short phrase-plus-colon shape.
+_SHORT_LABEL_LEAD_RE = re.compile(
+    r"^\s*(?:step\s*\d{1,3}|" + "|".join(sorted({re.escape(w) for w in i18n._CALLOUT_WORDS}, key=len, reverse=True))
+    + r")\s*[:：]",
+    re.IGNORECASE,
+)
 
 
 def _label_layout(doc: fitz.Document, group: list[Element]) -> str | None:
-    """"inline" when a list item's own leading bold label ("Reset", "USB-C
-    connector") shares its printed line with the description that follows it,
-    "own_line" when the label prints alone and the description starts on the
-    NEXT line down - the two house styles a "**Label** description" list item
-    can use. None when this is not that kind of list item at all.
+    """"inline" when a list item's own leading label ("**Reset**", "Step 5:")
+    shares its printed line with the description that follows it, "own_line"
+    when the label prints alone and the description starts on the NEXT line
+    down - the two house styles a "Label: description" item can use, whether
+    the label is set apart by bold or is plain text that merely reads as a
+    label from its short, colon-terminated shape. None when this is not that
+    kind of item at all.
 
-    The label and its description are sometimes ONE element (a bold prefix
-    run followed by plain continuation, when they wrap close enough to merge)
+    The label and its description are sometimes ONE element (a label run
+    followed by plain continuation, when they wrap close enough to merge)
     and sometimes TWO (the label's own short line, kept separate from the
     paragraph after it) - `group` is whichever `pair_elements` produced, and
     both shapes are read the same way."""
     if len(group) >= 2:
         first = group[0]
         words = [w for w in _TOKEN_RE.findall((first.text or "").casefold()) if w.isalpha()]
-        if words and first.bold_words and all(w in first.bold_words for w in words):
+        if not words:
+            return None
+        if first.bold_words and all(w in first.bold_words for w in words):
+            return "own_line"
+        if len(words) <= _SHORT_LABEL_MAX_WORDS and _SHORT_LABEL_LEAD_RE.match(first.text or ""):
             return "own_line"
         return None
     if len(group) != 1:
         return None
     el = group[0]
-    if not el.bold_words or not el.text or not el.boxes:
+    if not el.text or not el.boxes:
         return None
     words = [w for w in _TOKEN_RE.findall(el.text.casefold()) if w.isalpha()]
     label_words: list[str] = []
@@ -3809,8 +3961,12 @@ def _label_layout(doc: fitz.Document, group: list[Element]) -> str | None:
         if w not in el.bold_words:
             break
         label_words.append(w)
+    if not label_words:
+        m = _SHORT_LABEL_LEAD_RE.match(el.text)
+        if m:
+            label_words = [w for w in _TOKEN_RE.findall(m.group(0).casefold()) if w.isalpha()]
     if not label_words or len(label_words) >= len(words):
-        return None  # no bold prefix, or the whole element is bold - not this kind of item
+        return None  # no label lead-in, or the whole element is just that label - not this kind of item
     hits = _phrase_hits(doc, el, " ".join(label_words))
     if not hits:
         return None
@@ -4092,6 +4248,8 @@ def _figure_index(doc: fitz.Document) -> list[tuple]:
             for f in figures:
                 if f.display_width < _figure_min_side(doc) or f.display_height < _figure_min_side(doc):
                     continue
+                if _is_page_scale_content(doc, page_index, f):
+                    continue
                 raw = tuple(float(v) for v in f.bbox)
                 bbox = _ink_bbox(doc, page_index, raw)
                 items.append((page_index, bbox, imagefp.fingerprint(doc, page_index, bbox),
@@ -4120,8 +4278,8 @@ def _find_elsewhere(fig: Element, doc: fitz.Document, own_pages: list[int]) -> E
                    height=bbox[3] - bbox[1], fp=fp)
 
 
-_OVERSIZE_STEP = 0.20       # a figure this much larger in Staging is oversized ...
-_OVERSIZE_MIN_PT = 12.0     # ... and by at least this many points
+_OVERSIZE_STEP = 0.35       # a figure this much larger in Staging is oversized (was 0.20, increased to reduce false positives) ...
+_OVERSIZE_MIN_PT = 18.0     # ... and by at least this many points (was 12.0, increased for significance)
 _ALIGN_CENTRE = 0.12        # centre within this share of the text column = centred
 _ALIGN_SHIFT = 0.12         # and it must move at least this far to count
 _MARGIN_CACHE: dict[int, tuple] = {}
@@ -4922,7 +5080,11 @@ def figure_changes(
 
 _LAYOUT_MIN_CHARS = 4
 _LAYOUT_SHORT_CHARS = 20          # below this, only a container that STARTS with it counts
-_LAYOUT_COVERAGE = 0.9            # share of a long element's words present on the other side
+# The last-resort excuse when no verbatim phrase match was found anywhere -
+# a bag-of-words share, not a real match on meaning - so it is asked to be
+# almost total: two documents that reworded a passage while reusing most of
+# its vocabulary must still be told apart from one that only moved it.
+_LAYOUT_COVERAGE = 0.97           # share of a long element's words present on the other side
 _LAYOUT_COVERAGE_MIN_TOKENS = 12
 
 
@@ -5168,11 +5330,25 @@ def compare_group(
 
 
 _BARE_MARKER_RE = re.compile(
-    r"^(?:\d{1,2}[.)]?"
+    r"^(?:\d{1,2}[.)]"
     r"|(?:[a-z]|ii|iii|iv|vi|vii|viii|ix|xi|xii)[.)]"
     r"|[•◦▪▸‣⁃·∙])$",
     re.IGNORECASE,
 )
+
+
+def _looks_like_extraction_garbage(text: str) -> bool:
+    """Mostly PyMuPDF's own "(cid:N)" placeholder for a glyph with no
+    ToUnicode mapping at all - a font subset whose text layer could not be
+    read, not prose the other side genuinely lacks. A whole element made of
+    this (a table built from such a font, most often) has nothing reliable
+    to compare, so reporting it "missing"/"added" would claim a content
+    difference the extraction itself never actually read. A stray "(cid:N)"
+    inside an otherwise normal sentence is left alone - that is one bad
+    glyph in real prose, not an unreadable element."""
+    text = text or ""
+    cid_chars = sum(len(m.group()) for m in _CID_TOKEN_RE.finditer(text))
+    return cid_chars > 0 and cid_chars >= 0.5 * len(text.strip())
 
 
 def _looks_like_bare_marker(text: str) -> bool:
@@ -5234,11 +5410,89 @@ def _encoding_regression(kind: str, a_text: str, b_text: str) -> dict | None:
     return None
 
 
+# --- a glyph that decodes right but does not DRAW right ---------------------
+#
+# `_encoding_regression` catches a character the text layer cannot decode at
+# all - a replacement character, an unmapped Private-Use glyph, a bare
+# "(cid:N)". It has nothing to say about a character that decodes PERFECTLY
+# FINE (every text-based check above trusts it, correctly) but whose font
+# draws the wrong OUTLINE for that glyph ID - a font-subsetting bug where the
+# ToUnicode map and the glyph table disagree. A reader sees one character;
+# the text layer says another. The only way to catch that is to look at what
+# is actually drawn, which is what OCR is for.
+
+_GLYPH_STRIP_RE = re.compile(r"[\s，,。.、；;：:！!？?（）()“”‘’–—\-~*]")
+_GLYPH_MIN_LEN = 8       # characters, after stripping - too little context to trust a single substitution
+_GLYPH_MIN_FLANK = 3     # characters required to read back correctly on EACH side of the suspect one
+_GLYPH_MAX_BAD = 2       # at most this many characters may actually differ
+
+
+def glyph_render_changes(act_elements: list[Element], actual: fitz.Document) -> list[dict]:
+    """A single character (or two) inside a Staging element that Tesseract,
+    reading the page exactly as it is drawn, does not see - while every
+    character before and after it, in the same element, reads back exactly
+    as the text layer says. That specific shape - one clean substitution deep
+    inside an otherwise perfect OCR read - is what a broken embedded-font
+    glyph looks like. Scattered, page-wide OCR noise (Tesseract's ordinary
+    error rate on dense non-Latin text, worse at small sizes and inside
+    NOTE boxes) does not take this shape - a genuine misread disagrees with
+    its own neighbours too, not just the one word in between - so requiring
+    a long, clean run of agreement on both sides is what keeps this from
+    firing on ordinary OCR imprecision.
+
+    Reported as a REVIEW finding, never a confident assertion: OCR itself is
+    never perfect enough to be the last word on what is printed, only reason
+    enough to point a reviewer's eye at the exact spot.
+
+    Production is not checked here - not because it cannot have the same
+    bug, but because a PRODUCTION defect visually identical on both sides is
+    not something Staging did wrong, and every other absolute check in this
+    file (a broken image, an unstyled link) is scoped to Staging alone for
+    the same reason."""
+    if not act_elements:
+        return []
+    from pdfval import ocr
+
+    if not ocr.available():
+        return []
+    out: list[dict] = []
+    for el in act_elements:
+        if el.kind not in (KIND_TEXT, KIND_NOTE) or not el.text or not el.boxes:
+            continue
+        text_clean = _GLYPH_STRIP_RE.sub("", el.text)
+        if len(text_clean) < _GLYPH_MIN_LEN or not _CJK_RE.search(text_clean):
+            continue
+        page_index, bbox = el.boxes[0]
+        words = ocr.words_in(_page_words(actual).ocr_words(page_index), bbox, margin=4)
+        if not words:
+            continue
+        read_clean = _GLYPH_STRIP_RE.sub("", "".join(words))
+        if not read_clean:
+            continue
+        ops = [op for op in difflib.SequenceMatcher(None, text_clean, read_clean).get_opcodes()
+               if op[0] != "equal"]
+        if len(ops) != 1 or ops[0][0] != "replace":
+            continue
+        _, i1, i2, j1, j2 = ops[0]
+        if (i2 - i1) > _GLYPH_MAX_BAD or (j2 - j1) > _GLYPH_MAX_BAD:
+            continue
+        if i1 < _GLYPH_MIN_FLANK or len(text_clean) - i2 < _GLYPH_MIN_FLANK:
+            continue
+        out.append({
+            "type": "glyph-render", "kind": el.kind, "exp": None, "act": el,
+            "summary": (f"Possible broken glyph in Staging — the text says “{text_clean[i1:i2]}”, but the "
+                        f"page itself reads as “{read_clean[j1:j2]}” there; worth a look by eye."),
+            "detail": text_clean[:200],
+            "review_only": True,
+        })
+    return out
+
+
 def _compare_merged(a: Element | None, b: Element | None, size_scale: float) -> list[dict]:
     if a is None and b is None:
         return []
     if b is None:
-        if a.kind == KIND_TEXT and _looks_like_bare_marker(a.text):
+        if (a.kind == KIND_TEXT and _looks_like_bare_marker(a.text)) or _looks_like_extraction_garbage(a.text):
             return []
         return [{
             "type": "missing",
@@ -5247,7 +5501,7 @@ def _compare_merged(a: Element | None, b: Element | None, size_scale: float) -> 
             "detail": a.text[:400] if a.text else f"{int(a.width)}×{int(a.height)}pt figure",
         }]
     if a is None:
-        if b.kind == KIND_TEXT and _looks_like_bare_marker(b.text):
+        if (b.kind == KIND_TEXT and _looks_like_bare_marker(b.text)) or _looks_like_extraction_garbage(b.text):
             return []
         return [{
             "type": "added",
@@ -5379,6 +5633,24 @@ def _compare_merged(a: Element | None, b: Element | None, size_scale: float) -> 
                 "detail": "",
                 "word_diff": _word_diff(a.text, b.text),
             })
+        else:
+            # `_content_runs` compares WORDS only (`_TOKEN_RE` strips every
+            # punctuation mark before it looks) - deliberately, so a real
+            # content loss isn't lost among reflow noise. That also made a
+            # genuine punctuation-only edit invisible: the same words, but a
+            # sentence that lost its period, or a comma where Production has
+            # none. `a.key != b.key` already proved something besides
+            # whitespace differs once the word-level check comes back empty;
+            # `_word_diff` (word-tokenised, not the character key) confirms
+            # it is real punctuation and not just quote-style folding.
+            wd = _word_diff(a.text, b.text)
+            if any(op["type"] != "equal" for op in wd):
+                out.append({
+                    "type": "punctuation", "kind": a.kind,
+                    "summary": "Punctuation changed — the wording is the same, only punctuation differs.",
+                    "detail": "",
+                    "word_diff": wd,
+                })
 
     if a.kind == KIND_NOTE and a.label != b.label:
         out.append({
@@ -5506,6 +5778,14 @@ _SQUASHED_MIN_CHARS = 12   # below this, text found with its spaces ignored prov
 
 _CJK_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿가-힯]")
 _SHORT_LABEL_TOKENS = 6   # a label this short may be printed inside a longer line or a table
+# `_printed_in`'s own fallback has no phrase or order requirement at all - it
+# just asks whether every one of the element's words, as a bag, exists
+# somewhere in the topic's remaining words - so it is trusted only for an
+# actual one-or-two-word LABEL ("Deutsch", "WEEE"), never for a short
+# SENTENCE: "Restart the device now." losing its own meaning while every one
+# of its four common words happens to recur elsewhere in the topic is exactly
+# the kind of miss a bag-of-words match cannot tell apart from a real one.
+_SHORT_LABEL_BAG_TOKENS = 2
 
 
 def _cells_text(el: Element) -> str:
@@ -5609,7 +5889,7 @@ def _printed_in(el: Element, other_words: str, other_units: Counter | None = Non
     # heading) must not be silently settled just because its words are common.
     if el.kind == KIND_HEADING:
         return False
-    return len(tokens) <= _SHORT_LABEL_TOKENS and not (Counter(tokens) - Counter(other_words.split()))
+    return len(tokens) <= _SHORT_LABEL_BAG_TOKENS and not (Counter(tokens) - Counter(other_words.split()))
 
 
 _TABLE_ROW_MATCH = 0.8  # a cell or row this alike is the same row, not a coincidence
@@ -6041,7 +6321,25 @@ def table_row_changes(a: Element, b: Element, exp_units: Counter, act_units: Cou
     pairs = _pair_rows(a, b, rows_a, rows_b, units_a, units_b)
     shorter = min(len(rows_a), len(rows_b))
     if shorter >= 2 and len(pairs) < _ROWS_RELIABLE * shorter:
-        return []  # the two grids were read too differently to compare row by row
+        # The two grids were read too differently to trust a row-by-row
+        # match - but that is exactly the situation a genuine row loss/gain
+        # tends to cause (a table missing several rows in Staging often also
+        # reads badly row-by-row), and returning nothing here left the reader
+        # with no signal at all that anything was wrong. A plain row COUNT
+        # still holds even when pairing does not, so it is reported as a
+        # fallback rather than staying silent - Production's own row count is
+        # the one Staging must not fall short of, and any extra beyond it is
+        # itself worth flagging, not just a shortfall.
+        if len(rows_a) != len(rows_b):
+            return [{
+                "type": "table-row-count", "kind": KIND_TABLE,
+                "summary": (
+                    f"Table row count differs — Production has {len(rows_a)} rows, "
+                    f"Staging has {len(rows_b)} (rows could not be matched one-to-one to say which)."
+                ),
+                "detail": "", "exp": a, "act": b,
+            }]
+        return []
 
     outside_a = exp_units - sum((units_a[i] for i in rows_a), Counter())
     outside_b = act_units - sum((units_b[j] for j in rows_b), Counter())
@@ -6842,6 +7140,16 @@ def space_changes(exp_group: list[Element], act_group: list[Element]) -> list[di
 
 
 _COVERAGE_MIN_TOKENS = 2    # shorter runs are the text checks' own business
+# The two checks below excuse a run because its WORDS, as a bag, exist
+# somewhere in the whole other document - no phrase, no order, nothing
+# actually saying it is the SAME sentence - so for a short run this is nearly
+# always true of pure coincidence (the ten most common words in any manual
+# recur constantly) and would excuse genuinely misplaced content this very
+# function exists to catch (content under the WRONG heading, invisible to
+# every topic-scoped check above it). Trusted only once a run is long enough
+# that its full word-for-word coverage elsewhere stops being a coincidence;
+# a shorter run must still clear the exact-phrase check just above it.
+_COVERAGE_BAG_MIN_TOKENS = 6
 
 
 def _topic_stream(elements: list[Element]) -> list[tuple[str, Element]]:
@@ -7070,12 +7378,14 @@ def plain_text_scan(chapters: list["Chapter"], expected: fitz.Document,
         ):
             if len(run) < _COVERAGE_MIN_TOKENS or _CJK_RE.search("".join(run)):
                 continue
-            if f" {' '.join(run)} " in other or set(run) <= covered:
-                continue  # printed elsewhere in the book, or already reported
+            if f" {' '.join(run)} " in other:
+                continue  # the exact phrase, printed elsewhere in the book
             if "".join(run) in solid:
                 continue  # the same characters, only split or joined differently
-            if all(counts[t] >= n for t, n in Counter(run).items()):
-                continue  # every word is printed in the book - just in another order or place
+            if len(run) >= _COVERAGE_BAG_MIN_TOKENS and (
+                set(run) <= covered or all(counts[t] >= n for t, n in Counter(run).items())
+            ):
+                continue  # already reported, or every word printed in the book - just in another order or place
             if f" {' '.join(run)} " in raw_other:
                 continue  # on the page, just classified differently (a table cell, a heading)
             el = source[start][1]
@@ -7197,6 +7507,12 @@ def _quote_as_printed(diff: dict, expected: fitz.Document | None = None,
 
 
 _WORD_RE = re.compile(r"\s+")
+# diff-match-patch (Myers' algorithm + semantic-boundary cleanup - the same
+# family of diff used by most text-diff tools, e.g. diffchecker.com) works on
+# characters; the standard technique for a WORD-level diff with it is to map
+# each unique word to one private-use-area character first; run the char-diff
+# on those; then map back. One shared instance since it is stateless per call.
+_WORD_DMP = diff_match_patch()
 
 
 def _word_diff(before: str, after: str) -> list[dict]:
@@ -7206,23 +7522,57 @@ def _word_diff(before: str, after: str) -> list[dict]:
     # in wording and must never be boxed as a missing word.
     a = [w for w in _WORD_RE.split(before.strip()) if w and not _LIST_MARKER_TOKEN_RE.fullmatch(w)]
     b = [w for w in _WORD_RE.split(after.strip()) if w and not _LIST_MARKER_TOKEN_RE.fullmatch(w)]
-    ops: list[dict] = []
     # Curly and straight quotes are the same character to a reader: “display’s”
     # against "display's" is no wording change.
     fa, fb = [w.translate(_QUOTES) for w in a], [w.translate(_QUOTES) for w in b]
-    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=fa, b=fb, autojunk=False).get_opcodes():
+
+    word_to_char: dict[str, str] = {}
+    orig_a: dict[str, str] = {}
+    orig_b: dict[str, str] = {}
+
+    def encode(folded: list[str], original: list[str], orig_map: dict[str, str]) -> str:
+        chars = []
+        for fw, ow in zip(folded, original):
+            c = word_to_char.get(fw)
+            if c is None:
+                c = chr(0xE000 + len(word_to_char))
+                word_to_char[fw] = c
+            chars.append(c)
+            orig_map.setdefault(c, ow)
+        return "".join(chars)
+
+    diffs = _WORD_DMP.diff_main(encode(fa, a, orig_a), encode(fb, b, orig_b))
+    _WORD_DMP.diff_cleanupSemantic(diffs)
+
+    ops: list[dict] = []
+    i = 0
+    while i < len(diffs):
+        op, chunk = diffs[i]
+        if op == 0:
+            ops.append({"type": "equal", "text": " ".join(orig_a[c] for c in chunk)})
+            i += 1
+            continue
+        # A maximal run of consecutive non-equal chunks is judged as one unit
+        # (the same way SequenceMatcher's single "replace" span was), not
+        # chunk by chunk - diff-match-patch can still hand back an adjacent
+        # del then ins for what is really one substitution.
+        run_del: list[str] = []
+        run_ins: list[str] = []
+        while i < len(diffs) and diffs[i][0] != 0:
+            rop, rchunk = diffs[i]
+            (run_del if rop == -1 else run_ins).extend(orig_a[c] if rop == -1 else orig_b[c] for c in rchunk)
+            i += 1
         # A run of punctuation or spacing alone ("." / "—") is never boxed:
         # boxes and insertion marks are for missing words.
         # "&" is a word ("og", "and"), not punctuation: "& (EU)" -> "og (EU)" is a change.
-        if tag != "equal" and not _TOKEN_RE.search(" ".join(a[i1:i2] + b[j1:j2]).replace("&", "and")):
-            tag = "equal"
-        if tag == "equal":
-            ops.append({"type": "equal", "text": " ".join(a[i1:i2] or b[j1:j2])})
-        else:
-            if i1 != i2:
-                ops.append({"type": "del", "text": " ".join(a[i1:i2])})
-            if j1 != j2:
-                ops.append({"type": "ins", "text": " ".join(b[j1:j2])})
+        if not _TOKEN_RE.search(" ".join(run_del + run_ins).replace("&", "and")):
+            if run_del or run_ins:
+                ops.append({"type": "equal", "text": " ".join(run_del or run_ins)})
+            continue
+        if run_del:
+            ops.append({"type": "del", "text": " ".join(run_del)})
+        if run_ins:
+            ops.append({"type": "ins", "text": " ".join(run_ins)})
     return ops
 
 
@@ -7382,11 +7732,23 @@ def chapter_pairs(expected: fitz.Document, actual: fitz.Document) -> list[Chapte
             # BEFORE the first one that does, its content is invisible to every
             # chapter's span: never reported missing, never compared, just
             # silently skipped. Starting the very first chapter at the top of
-            # each document instead of at its own heading sweeps that front
-            # matter into it, so a genuine difference there is still caught
-            # rather than passing the whole run in silence.
-            exp_start = (0, 0.0)
-            act_start = (0, 0.0)
+            # its own SECOND page instead of at its own heading sweeps that
+            # front matter in (page two onward - Copyright, Disclaimer, Safety
+            # Warnings, whatever either side bookmarks differently), so a
+            # genuine difference there is still caught rather than passing the
+            # whole run in silence.
+            #
+            # Page one itself is never swept in this way, deliberately: it is
+            # the cover - the title, product photo, logo, legal boilerplate a
+            # reader sees before any real section - and it is pure design,
+            # not prose. It legitimately differs release to release and
+            # language to language (a rebrand, a new photo, a different
+            # legal line for a different market), and comparing it word for
+            # word only ever produces confusing, mis-attributed findings
+            # (a cover title's own wording reported as belonging to whatever
+            # real chapter happens to start next).
+            exp_start = (min(1, exp_entry.page), 0.0)
+            act_start = (min(1, act_entry.page), 0.0)
 
         def within(tops, start, end, skip) -> list[str]:
             return [
@@ -8146,6 +8508,9 @@ def compare_chapters(
         for diff in page_ref_consistency_changes(act_links):
             if len(chapter.differences) < MAX_ISSUES_PER_CHAPTER:
                 chapter.differences.append(diff)
+        for diff in glyph_render_changes(act_elements, actual):
+            if len(chapter.differences) < MAX_ISSUES_PER_CHAPTER:
+                chapter.differences.append(diff)
         _drop_printed_nearby(chapter, expected, actual)
         _drop_confirmed_content_changes(chapter, expected, actual)
         _soften_artwork_text(chapter)
@@ -8206,7 +8571,7 @@ def compare_chapters(
 SEVERITY_OF = {
     # 1 - what the chapter says, and how its lists are marked
     "text": 1, "missing": 1, "added": 1, "section-missing": 1, "section-added": 1, "note-label": 1, "table-cell": 1,
-    "table-cell-sequence": 1, "text-encoding": 1,
+    "table-cell-sequence": 1, "text-encoding": 1, "glyph-render": 1,
     "numbering": 1, "list-marker-missing": 1, "list-marker-added": 1,
     # 2 - hyperlinks
     "link-missing": 2, "link-added": 2, "link-target": 2, "link-broken": 2,
@@ -8220,12 +8585,13 @@ SEVERITY_OF = {
     "icon-missing": 4, "icon-added": 4, "icon-colour": 4, "icon-changed": 4,
     # 6 - how it is laid out, not what it says - shown, never fails the run
     "list-indent": 6, "figure-alignment": 6, "text-space": 6, "moved": 6, "figure-wrong-section": 6,
+    "punctuation": 6,
     "list-label-layout": 6, "list-marker-glyph": 6,
     # (table-header-fill is not reported: Staging's header colour is its design.
     # A background gone altogether is: table-fill-missing.)
     "table-fill-missing": 3,
     "table-shape": 6, "table-merge": 6, "table-header-repeat": 6, "table-cell-layout": 6,
-    "table-row-missing": 6, "table-row-added": 6, "table-columns": 6, "table-as-text": 6,
+    "table-row-missing": 6, "table-row-added": 6, "table-row-count": 6, "table-columns": 6, "table-as-text": 6,
 }
 SEVERITY_LABEL = {
     1: "Content & lists", 2: "Hyperlinks", 4: "Images", 5: "Bold", 6: "Layout",
@@ -8303,8 +8669,8 @@ _TYPE_CATEGORY = {
     "table-cell-layout": "tables",
     "table-shape": "content", "table-header-repeat": "content", "table-cell": "content",
     "table-cell-sequence": "content",
-    "table-row-missing": "content", "table-row-added": "content", "table-as-text": "content",
-    "text-space": "content", "text-encoding": "content",
+    "table-row-missing": "content", "table-row-added": "content", "table-row-count": "content", "table-as-text": "content",
+    "text-space": "content", "text-encoding": "content", "punctuation": "content", "glyph-render": "content",
     # A figure moved to the wrong section is a sequence/order problem, like a
     # paragraph out of reading order - it reads as content, not as the
     # picture's own look, so it is red like the rest of "moved", not blue.
@@ -8366,8 +8732,12 @@ def validate_chapters(
             }
             if a is not None:
                 details["expected_page"] = a.page + 1
+                if a.bbox and any(a.bbox):
+                    details["exp_bbox"] = list(a.bbox)
             if b is not None:
                 details["actual_page"] = b.page + 1
+                if b.bbox and any(b.bbox):
+                    details["act_bbox"] = list(b.bbox)
             if diff.get("detail"):
                 details["detail"] = diff["detail"]
             if a is not None and a.text:

@@ -708,6 +708,7 @@ def match_toc_entries(
             matches.extend(TocMatch(None, act_visible[j]) for j in range(j1, j2))
         elif tag == "replace":
             used_act: set[int] = set()
+            unmatched_i: list[int] = []
             for i in range(i1, i2):
                 best_j, best_ratio = None, 0.0
                 for j in range(j1, j2):
@@ -720,8 +721,31 @@ def match_toc_entries(
                     used_act.add(best_j)
                     matches.append(TocMatch(exp_visible[i], act_visible[best_j]))
                 else:
-                    matches.append(TocMatch(exp_visible[i], None))
-            matches.extend(TocMatch(None, act_visible[j]) for j in range(j1, j2) if j not in used_act)
+                    unmatched_i.append(i)
+            unmatched_j = [j for j in range(j1, j2) if j not in used_act]
+            # Wording alone couldn't pair the rest - a heading independently
+            # reworded into a near-synonym ("Auto-Presence Detection" /
+            # "Human Body Sensing") can share almost no characters even
+            # though it is unambiguously the same section. Fall back to
+            # POSITION: within this same locally-diverging run, pair leftover
+            # headings up in their shared reading order, one for one - not
+            # gated on matching LEVEL too, because the two sides' level
+            # numbers are not a reliable signal on their own: an outline
+            # with no real nesting at all (every heading level 1, common for
+            # a Production export with a flat bookmark list) paired against
+            # the other side's genuinely nested one would otherwise fail this
+            # fallback for every single sub-heading, which is exactly the
+            # case it exists to catch. A real level mismatch is still
+            # reported (`level_changed` in `build_toc_report`); it just no
+            # longer means "not the same heading at all" on its own.
+            ui = uj = 0
+            while ui < len(unmatched_i) and uj < len(unmatched_j):
+                i, j = unmatched_i[ui], unmatched_j[uj]
+                matches.append(TocMatch(exp_visible[i], act_visible[j]))
+                ui += 1
+                uj += 1
+            matches.extend(TocMatch(exp_visible[unmatched_i[k]], None) for k in range(ui, len(unmatched_i)))
+            matches.extend(TocMatch(None, act_visible[unmatched_j[k]]) for k in range(uj, len(unmatched_j)))
     return matches
 
 
@@ -812,23 +836,19 @@ def heading_at(entries: list[TocEntry], page: int, y: float) -> str | None:
     return result
 
 
-def extract_sections(doc: fitz.Document, entries: list[TocEntry]) -> list[str]:
-    """For each TOC entry, return the text from that heading up to the next heading (any level).
-
-    The "next heading" is resolved by true reading order (page, then y) rather
-    than bookmark-list order: some PDFs' outline trees list a short callout/
-    sidebar heading after a heading that is spatially lower on the same page,
-    which would otherwise make a section swallow unrelated later content.
-    """
-    return ["\n".join(b["text"] for b in blocks) for blocks in extract_section_blocks(doc, entries)]
-
-
 def extract_section_blocks(
     doc: fitz.Document, entries: list[TocEntry], keep_chrome: bool = False
 ) -> list[list[dict]]:
-    """Same section boundaries as `extract_sections`, but keep each text block's
-    own page/bbox so callers can locate a specific sentence on the rendered
-    page (e.g. to draw a highlight box in a screenshot).
+    """For each TOC entry, the text blocks from that heading up to the next
+    heading (any level), each keeping its own page/bbox so callers can locate
+    a specific sentence on the rendered page (e.g. to draw a highlight box in
+    a screenshot).
+
+    The "next heading" is resolved by true reading order (page, then y)
+    rather than bookmark-list order: some PDFs' outline trees list a short
+    callout/sidebar heading after a heading that is spatially lower on the
+    same page, which would otherwise make a section swallow unrelated later
+    content.
 
     `keep_chrome=True` keeps the page furniture this normally drops - running
     headers and footers, bare page numbers, a printed contents listing - tagged
@@ -1296,7 +1316,9 @@ def build_toc_report(expected: fitz.Document, actual: fitz.Document) -> dict:
     Every bookmark from either document, in reading order, with its status and
     the specific way it differs (dropped, added, renumbered to a different
     nesting level, moved to a different position, or landed on a different page
-    number). Plus a one-line count of each so the page can lead with the tally.
+    number), plus - for a matched heading - roughly how much of its content
+    was actually there to compare on both sides. Plus a one-line count of each
+    so the page can lead with the tally.
     """
     # This IS the dedicated bookmark comparison, so it lists EVERY bookmark -
     # including a Q&A/contents-index heading that the section-by-section content

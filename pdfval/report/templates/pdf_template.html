@@ -97,9 +97,12 @@
      an A4 one. A page wider than its pane scrolls sideways. */
   .pagewrap { position: relative; display: flex; gap: 10px; align-items: flex-start; margin: 0 auto 26px; width: max-content; }
   .lines { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
-  .link { stroke: var(--c, var(--box-on)); stroke-width: 1.25; opacity: .75; }
+  /* Hidden until the reader hovers (or pins) the issue it belongs to - drawing
+     every issue's line across both pages at once was unreadable clutter the
+     moment a page carried more than a handful of findings. */
+  .link { stroke: var(--c, var(--box-on)); stroke-width: 1.25; opacity: 0; }
   .link.hover, .link.on { stroke-width: 2; opacity: 1; }
-  .link.critical { stroke-width: 1.75; opacity: 1; --c: var(--c-content); }
+  .link.critical { stroke-width: 1.75; --c: var(--c-content); }
   /* --pscale: Production is scaled up to Staging's page size when the two
      were set on different paper sizes (an A5 baseline against an A4 rebuild),
      so the same paragraph lines up at roughly the same screen position and
