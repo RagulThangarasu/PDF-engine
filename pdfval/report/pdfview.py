@@ -116,8 +116,15 @@ def _check_issues(report: ValidationReport, n_exp: int, n_act: int) -> list[dict
             if check.name == "Content Validation" and issue.message in _TEXT_DIFF_MESSAGES:
                 continue
             d = issue.details or {}
-            bbox = d.get("bbox")
             side = _bbox_side(issue.message, d)
+            # `exp_bbox`/`act_bbox` are each element's own box (Chapter
+            # Validation); older/other checks still hand back one shared
+            # `bbox` for whichever side `side` names - both are honoured so a
+            # finding boxes the exact text instead of falling back to the
+            # section/page anchor below.
+            bbox = d.get("exp_bbox") if side == "prod" else d.get("act_bbox")
+            if bbox is None:
+                bbox = d.get("bbox")
             exp_page, act_page = d.get("expected_page"), d.get("actual_page")
             if exp_page is None and act_page is None and isinstance(issue.page, int):
                 # Only the validator's own 0-based page is known.

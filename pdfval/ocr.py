@@ -11,6 +11,7 @@ rather than failing a run when it is missing.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 
 import fitz
@@ -51,6 +52,56 @@ def tessdata_dir() -> str | None:
 
 def available() -> bool:
     return tessdata_dir() is not None
+
+
+# Tesseract's own default is "eng" - reading a Traditional Chinese callout
+# page with it produces near-total garbage, since a Latin-only model has no
+# CJK glyphs to recognise at all. Every OCR call here instead picks the
+# script actually printed on the page, straight from its own PDF text layer
+# (already extracted, so no extra render), and only ever falls back to
+# English when nothing else in the packs installed on this machine matches.
+_HANGUL_RE = re.compile(r"[가-힣]")
+_KANA_RE = re.compile(r"[぀-ヿ]")
+_HAN_RE = re.compile(r"[一-鿿]")
+_SIMPLIFIED_ONLY_RE = re.compile(r"[产装内会与关国东车义为]")  # simplified forms with no traditional-form overlap
+_SCRIPT_LANGS = {
+    "hangul": ("kor",),
+    "kana": ("jpn",),
+    # chi_tra and chi_sim both loaded at once measurably hedges toward
+    # simplified output even on an all-Traditional page (Tesseract picks
+    # whichever combined model scores higher character by character) - so
+    # only the variant this page's OWN text layer actually uses is loaded.
+    "han_simplified": ("chi_sim",),
+    "han_traditional": ("chi_tra",),
+}
+
+
+def _detect_script(text: str) -> str | None:
+    if _HANGUL_RE.search(text):
+        return "hangul"
+    if _KANA_RE.search(text):
+        return "kana"
+    if _HAN_RE.search(text):
+        return "han_simplified" if _SIMPLIFIED_ONLY_RE.search(text) else "han_traditional"
+    return None
+
+
+def _ocr_language(text: str) -> str:
+    """The Tesseract language string for text written in this script - its
+    own packs first, "eng" always appended so Latin words, model numbers and
+    punctuation mixed into the same page are still read.  A pack this
+    installation does not have (a language pack is optional, same as
+    Tesseract itself) is silently left out rather than passed to Tesseract,
+    which would otherwise fail the whole OCR call over one missing language.
+    """
+    script = _detect_script(text)
+    if script is None:
+        return "eng"
+    tessdata = tessdata_dir()
+    have = lambda lang: tessdata and os.path.isfile(os.path.join(tessdata, f"{lang}.traineddata"))
+    packs = [lang for lang in _SCRIPT_LANGS[script] if have(lang)]
+    packs.append("eng")
+    return "+".join(packs)
 
 
 # OCR is the slowest thing in a run (~0.3s a page). Content Validation, Image
@@ -109,7 +160,15 @@ class PageWords:
         if available() and _ocr_pages_done < OCR_PAGE_BUDGET:
             try:
                 page_obj = self._doc[page]
-                tp = page_obj.get_textpage_ocr(flags=0, dpi=OCR_DPI, full=True, tessdata=tessdata_dir())
+                # The page's own text layer already tells us what script is
+                # printed here - read straight off it, no extra render, and
+                # right even for a page OCR is being asked to double-check
+                # BECAUSE the text layer might be wrong (a wrong character is
+                # still the right script almost always).
+                language = _ocr_language(page_obj.get_text("text"))
+                tp = page_obj.get_textpage_ocr(
+                    flags=0, language=language, dpi=OCR_DPI, full=True, tessdata=tessdata_dir()
+                )
                 result = [
                     (w[0], w[1], w[2], w[3], w[4]) for w in page_obj.get_text("words", textpage=tp)
                 ]

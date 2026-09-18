@@ -55,7 +55,7 @@ _BOXES_BEFORE_LIST = 3         # more word boxes than this on a side: one box, c
 ORANGE_TYPES = {
     "list-indent", "table-merge", "table-columns", "table-cell-layout", "figure-alignment", "figure-size",
     "shading", "marker-size", "text-space", "icon-changed",
-    "underline-missing", "underline-added", "line-spacing",
+    "underline-missing", "underline-added", "line-spacing", "glyph-render",
 }
 
 # An image or icon genuinely gone from one side - not resized, not moved, not
@@ -393,6 +393,40 @@ def _y_share(doc: fitz.Document, page_index: int, y: float) -> float:
     return max(0.0, min(1.0, y / height))
 
 
+def _proportional_page(page: int, own_pages: list[int], other_pages: list[int]) -> int | None:
+    """Roughly where `page` (a position within `own_pages`, this chapter's own
+    page range on one side) falls on the OTHER side's copy of the same
+    chapter - the same technique the figure reconciliation pass already uses
+    for a figure with no matched caption, applied here as a fallback anchor
+    for any "missing"/"added" finding with nothing to box on the other side
+    at all. Without it, that finding's pin falls all the way back to the
+    section's own heading, which can be most of a page away from where the
+    reader would actually look - a diagram's own dimension labels, missing on
+    one side, land near the section's opening paragraph instead of near the
+    diagram they belong to.
+    """
+    if not own_pages or not other_pages or page not in own_pages:
+        return None
+    frac = own_pages.index(page) / max(1, len(own_pages) - 1)
+    return other_pages[round(frac * (len(other_pages) - 1))]
+
+
+def _proportional_anchor(
+    own_doc: fitz.Document, page: int, y: float,
+    own_pages: list[int], other_pages: list[int], other_doc: fitz.Document,
+) -> tuple[int, float] | None:
+    """`(page, y)` in POINTS on the OTHER side for an element with no
+    counterpart there at all: the page from `_proportional_page`, at the SAME
+    relative height down that page the element sits at on its own - not the
+    top of the page, which reads as "the section heading" regardless of where
+    in the section the missing content actually was."""
+    prop_page = _proportional_page(page, own_pages, other_pages)
+    if prop_page is None:
+        return None
+    share = _y_share(own_doc, page, y)
+    return (prop_page, share * (other_doc[prop_page].rect.height or 1.0))
+
+
 def _order_anchors(out: list[dict]) -> list[dict]:
     """Sort a set of waypoints into Production's reading order and drop any
     `stage` side that would then run backwards - a heading or table Staging
@@ -435,6 +469,87 @@ def _anchors(expected: fitz.Document, actual: fitz.Document, exp_entries, act_en
             "stage": stage,
         })
     return _order_anchors(out)
+
+
+# A dense area - a spec table whose cells split into a different number of
+# lines between the two documents, a page of many similar list items - can
+# produce several issues of the exact SAME kind, each boxed on the page and
+# lined to its own comment. Past a handful, those lines cross every other
+# one's and the page stops being readable, even though each individual
+# finding is real. A couple of the same kind in one section stays as-is
+# (specific enough to be worth its own comment); past that, the rest fold
+# into ONE comment per (section, type) that lists each one as its own bullet
+# and keeps every one's own boxes lit up, instead of drawing a separate,
+# overlapping line for each.
+_CONSOLIDATE_MIN = 2  # this many (or more) of the same kind in one section fold into one card
+
+
+def _bounding_boxes(boxes: list[dict]) -> list[dict]:
+    """One box per page spanning every box on it, instead of one per issue.
+
+    A consolidated card unions every member's own boxes - for a genuine
+    pile-up that is dozens of small boxes again, each with its own line back
+    to the one card, which is the exact clutter consolidating the CARDS was
+    meant to remove; it just moved from the sidebar onto the page. This is
+    the same "box the paragraph once" rule `build_issue_report` already
+    applies within a single diff's own word-marks, extended to a merged
+    card's boxes too.
+    """
+    by_page: dict[int, list[dict]] = {}
+    for b in boxes:
+        by_page.setdefault(b["page"], []).append(b)
+    out = []
+    for page, page_boxes in by_page.items():
+        x0 = min(b["bbox"][0] for b in page_boxes)
+        y0 = min(b["bbox"][1] for b in page_boxes)
+        x1 = max(b["bbox"][2] for b in page_boxes)
+        y1 = max(b["bbox"][3] for b in page_boxes)
+        out.append({"page": page, "bbox": [x0, y0, x1, y1]})
+    return out
+
+
+def _consolidate_issues(issues: list[dict]) -> list[dict]:
+    groups: dict[tuple, list[dict]] = {}
+    order: list[tuple] = []
+    for issue in issues:
+        key = (issue["section"], issue["type"])
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(issue)
+
+    out: list[dict] = []
+    for key in order:
+        members = groups[key]
+        if len(members) < _CONSOLIDATE_MIN:
+            out.extend(members)
+            continue
+        merged = dict(members[0])
+        # What actually distinguishes one member from the next. For most
+        # kinds that's `description` ("Missing in Staging: '...'"); but for a
+        # "missing"/"added" element - nothing to box on the other side at all
+        # - `description` is only ever the same fixed boilerplate ("nothing
+        # answers to it in Staging") and the real quoted excerpt lives in
+        # `comment_prod`/`comment_stage` instead (see `_comments`). Preferring
+        # whichever of those is non-empty, and falling back to `description`
+        # then `title`, is what keeps every kind's bullets specific instead of
+        # N copies of one generic line.
+        merged["changes"] = [
+            m.get("comment_prod") or m.get("comment_stage") or m["description"] or m["title"]
+            for m in members
+        ]
+        merged["occurrences"] = sum(m["occurrences"] for m in members)
+        prod_boxes = [b for m in members for b in m["prod_boxes"]]
+        stage_boxes = [b for m in members for b in m["stage_boxes"]]
+        if len(prod_boxes) > _BOXES_BEFORE_LIST:
+            prod_boxes = _bounding_boxes(prod_boxes)
+        if len(stage_boxes) > _BOXES_BEFORE_LIST:
+            stage_boxes = _bounding_boxes(stage_boxes)
+        merged["prod_boxes"] = prod_boxes[:MAX_BOXES_PER_ISSUE]
+        merged["stage_boxes"] = stage_boxes[:MAX_BOXES_PER_ISSUE]
+        merged["title"] = f"{merged['title']} ({len(members)} places)"
+        out.append(merged)
+    return out
 
 
 def build_issue_report(chapters: list, expected: fitz.Document, actual: fitz.Document,
@@ -481,6 +596,19 @@ def build_issue_report(chapters: list, expected: fitz.Document, actual: fitz.Doc
             # both - closer to the reader's actual place than the top of the
             # whole heading the figure falls under.
             exp_near, act_near = diff.get("exp_anchor"), diff.get("act_anchor")
+            # A plain "missing"/"added" text finding (nothing to box on the
+            # OTHER side at all) never gets one of those - it falls straight
+            # to the topic heading below unless given a closer guess here:
+            # roughly where the element's own page falls, proportionally,
+            # within the other side's copy of the same chapter.
+            if act_near is None and a is not None and a.boxes and chapter.exp_pages and chapter.act_pages:
+                page, y = a.boxes[0][0], a.boxes[0][1][1]
+                act_near = _proportional_anchor(
+                    expected, page, y, chapter.exp_pages, chapter.act_pages, actual)
+            if exp_near is None and b is not None and b.boxes and chapter.exp_pages and chapter.act_pages:
+                page, y = b.boxes[0][0], b.boxes[0][1][1]
+                exp_near = _proportional_anchor(
+                    actual, page, y, chapter.act_pages, chapter.exp_pages, expected)
             prod_anchor = (
                 {"page": exp_near[0] + 1, "y": _y_share(expected, exp_near[0], exp_near[1])}
                 if exp_near and 0 <= exp_near[0] < expected.page_count else
@@ -555,6 +683,7 @@ def build_issue_report(chapters: list, expected: fitz.Document, actual: fitz.Doc
                     or diff.get("type") in _ALWAYS_CRITICAL_TYPES
                 ),
             })
+        issues[before:] = _consolidate_issues(issues[before:])
         chapter_rows.append({
             "id": f"ch{ci}", "title": chapter.title, "count": len(issues) - before,
             "prod_range": _range(chapter.exp_pages), "stage_range": _range(chapter.act_pages),

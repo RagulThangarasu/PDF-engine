@@ -186,14 +186,12 @@ def _fragments_present_elsewhere(word_diff: list, exp_idx: "_DocIndex", act_idx:
     """
     deleted = " ".join(
         op.get("text", "")
-        for ops in word_diff
-        for op in ops
+        for op in word_diff
         if op.get("type") == "del" and op.get("text", "").strip()
     ).strip()
     inserted = " ".join(
         op.get("text", "")
-        for ops in word_diff
-        for op in ops
+        for op in word_diff
         if op.get("type") == "ins" and op.get("text", "").strip()
     ).strip()
     if not deleted or not inserted:
@@ -278,12 +276,6 @@ def _verdict(
         # Content Validation itself, and explicitly a review-only finding.
         # Drop it only when there is literally nothing textual to show.
         wd = d.get("word_diff")
-        changed = "".join(
-            op.get("text", "")
-            for ops in (wd or [])
-            for op in ops
-            if op.get("type") in ("del", "ins")
-        ).strip()
         if not wd and not d.get("expected") and not d.get("actual"):
             return _DROP
         return "review"
@@ -327,8 +319,7 @@ def _verdict(
         if wd:
             changed = "".join(
                 op["text"]
-                for ops in wd
-                for op in ops
+                for op in wd
                 if op.get("type") in ("del", "ins") and op.get("text", "").strip()
             )
             if not _norm(changed):  # only whitespace / punctuation moved

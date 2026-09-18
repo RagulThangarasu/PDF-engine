@@ -124,6 +124,9 @@ HIGHLIGHT_MAX_PER_FIGURE = 4  # more candidate boxes than this => it's artwork, 
 HIGHLIGHT_MATCH_DISTANCE = 60.0  # points - how far a counterpart box may sit
 
 BLANK_STDDEV = 1.0  # a rendered figure flatter than this is blank
+LOW_CONTRAST_STDDEV = 3.0  # very low contrast image (high correlation = likely corrupted)
+MONOCHROME_THRESHOLD = 0.85  # share of pixels matching dominant color = mostly one color
+CORRUPTION_MIN_PIXELS = 100  # minimum pixels in a rendered image before checking quality
 
 _BARE_NUMBER_RE = re.compile(r"^\(?(\d{1,2})[.)]?$")
 _LABEL_STOPWORDS = {
@@ -805,8 +808,10 @@ def _broken_reason(doc: fitz.Document, page: int, img: ImageInfo) -> str | None:
         pix = doc[page].get_pixmap(clip=rect, alpha=False)
         if not pix.width or not pix.height:
             return "figure renders with no pixels"
-        if _stddev(pix) < BLANK_STDDEV:
-            return "figure renders blank (a single flat colour)"
+        # Check various corruption/quality issues
+        quality_issue = _check_image_quality(pix)
+        if quality_issue:
+            return quality_issue
     except Exception:
         return "figure could not be rendered"
     return None
@@ -823,6 +828,22 @@ def _stddev(pix: fitz.Pixmap) -> float:
         data = pix.samples[::17] or b"\x00"
         mean = sum(data) / len(data)
         return (sum((b - mean) ** 2 for b in data) / len(data)) ** 0.5
+
+
+def _check_image_quality(pix: fitz.Pixmap) -> str | None:
+    """Blank/corrupted-render check only: a figure that decodes but paints as a
+    single flat colour. Deliberately NOT flagging low-contrast or mostly-
+    white/black renders - a legitimate icon or logo on a white background is
+    exactly that (confirmed: flagged 'Broken image' on unmodified figures
+    compared against themselves), so those checks were removed rather than
+    tuned.
+    """
+    if pix.width * pix.height < CORRUPTION_MIN_PIXELS:
+        return None
+    std = _stddev(pix)
+    if std < BLANK_STDDEV:
+        return "figure renders blank (a single flat colour)"
+    return None
 
 
 def _page_offset_fraction(doc: fitz.Document, page: int, img: ImageInfo) -> float:

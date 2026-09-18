@@ -182,6 +182,8 @@ def test_identical_icon_is_not_reported():
 
 def _copyright_disclaimer_expected() -> fitz.Document:
     doc = fitz.open()
+    cover = doc.new_page(width=612, height=792)
+    cover.insert_text((72, 300), "Monitor XL2540", fontsize=28)
     p0 = doc.new_page(width=612, height=792)
     p0.insert_text((72, 60), "Copyright", fontsize=16)
     p0.insert_textbox(fitz.Rect(72, 90, 540, 200),
@@ -194,12 +196,14 @@ def _copyright_disclaimer_expected() -> fitz.Document:
     p2.insert_text((72, 60), "Getting Started", fontsize=16)
     p2.insert_textbox(fitz.Rect(72, 90, 540, 200),
                       "Unpack the monitor and place it on a stable, flat surface near an outlet.", fontsize=10)
-    doc.set_toc([[1, "Copyright", 1], [1, "Disclaimer", 2], [1, "Getting Started", 3]])
+    doc.set_toc([[1, "Copyright", 2], [1, "Disclaimer", 3], [1, "Getting Started", 4]])
     return doc
 
 
 def _copyright_disclaimer_actual() -> fitz.Document:
     doc = fitz.open()
+    cover = doc.new_page(width=612, height=792)
+    cover.insert_text((72, 300), "Monitor XL2540", fontsize=28)
     p0 = doc.new_page(width=612, height=792)
     p0.insert_text((72, 40), "Copyright & Disclaimer", fontsize=18)
     p0.insert_text((72, 70), "Copyright", fontsize=14)
@@ -212,8 +216,8 @@ def _copyright_disclaimer_actual() -> fitz.Document:
     p1.insert_text((72, 60), "Getting Started", fontsize=16)
     p1.insert_textbox(fitz.Rect(72, 90, 540, 200),
                       "Unpack the monitor and place it on a stable, flat surface near an outlet.", fontsize=10)
-    doc.set_toc([[1, "Copyright & Disclaimer", 1], [2, "Copyright", 1], [2, "Disclaimer", 1],
-                 [1, "Getting Started", 2]])
+    doc.set_toc([[1, "Copyright & Disclaimer", 2], [2, "Copyright", 2], [2, "Disclaimer", 2],
+                 [1, "Getting Started", 3]])
     return doc
 
 
@@ -225,6 +229,11 @@ def test_wrapper_heading_only_in_staging_is_reported():
     # `_mark_front_matter` marks it `.excluded` for an unrelated reason (front
     # matter position), not because it is a TOC/Q&A/RoHS title. It must still
     # be reported as its own section-added finding, not silently dropped.
+    # A cover page (page one) precedes all of this on both sides: chapter_pairs
+    # never sweeps page one itself into any chapter's span (see its own "cover
+    # page proper" comment), so this front matter is placed on pages two and
+    # three, same as it would be in a real manual, to test what it is actually
+    # meant to test rather than the unrelated cover-page exclusion.
     expected, actual = _copyright_disclaimer_expected(), _copyright_disclaimer_actual()
     try:
         chapters = compare_chapters(expected, actual)
