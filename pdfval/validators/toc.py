@@ -836,23 +836,19 @@ def heading_at(entries: list[TocEntry], page: int, y: float) -> str | None:
     return result
 
 
-def extract_sections(doc: fitz.Document, entries: list[TocEntry]) -> list[str]:
-    """For each TOC entry, return the text from that heading up to the next heading (any level).
-
-    The "next heading" is resolved by true reading order (page, then y) rather
-    than bookmark-list order: some PDFs' outline trees list a short callout/
-    sidebar heading after a heading that is spatially lower on the same page,
-    which would otherwise make a section swallow unrelated later content.
-    """
-    return ["\n".join(b["text"] for b in blocks) for blocks in extract_section_blocks(doc, entries)]
-
-
 def extract_section_blocks(
     doc: fitz.Document, entries: list[TocEntry], keep_chrome: bool = False
 ) -> list[list[dict]]:
-    """Same section boundaries as `extract_sections`, but keep each text block's
-    own page/bbox so callers can locate a specific sentence on the rendered
-    page (e.g. to draw a highlight box in a screenshot).
+    """For each TOC entry, the text blocks from that heading up to the next
+    heading (any level), each keeping its own page/bbox so callers can locate
+    a specific sentence on the rendered page (e.g. to draw a highlight box in
+    a screenshot).
+
+    The "next heading" is resolved by true reading order (page, then y)
+    rather than bookmark-list order: some PDFs' outline trees list a short
+    callout/sidebar heading after a heading that is spatially lower on the
+    same page, which would otherwise make a section swallow unrelated later
+    content.
 
     `keep_chrome=True` keeps the page furniture this normally drops - running
     headers and footers, bare page numbers, a printed contents listing - tagged
@@ -1314,26 +1310,6 @@ def build_toc_comparison(expected: fitz.Document, actual: fitz.Document) -> list
     return rows
 
 
-def _content_coverage(exp_text: str, act_text: str) -> int:
-    """A content-MATCH percentage for one matched heading: how closely the two
-    sides' AMOUNT of prose lines up, not whether the wording matches (Content
-    Validation already checks that word for word, on every sentence, always -
-    this is not a lighter/partial check standing in for that one, and every
-    section is fully compared regardless of what this number reads). A section
-    that lost most of its paragraphs on one side reads as a low percentage
-    here even though its heading itself matched fine, which is exactly the
-    case a heading-only comparison can't see on its own - genuinely matching
-    content earns 100%, and a real content loss is what pulls this below it,
-    not incomplete testing.
-    """
-    exp_sents = [s for s in i18n.split_sentences(exp_text) if len(s.split()) >= 3]
-    act_sents = [s for s in i18n.split_sentences(act_text) if len(s.split()) >= 3]
-    if not exp_sents and not act_sents:
-        return 100
-    lo, hi = sorted((len(exp_sents), len(act_sents)))
-    return round(100 * lo / hi) if hi else 100
-
-
 def build_toc_report(expected: fitz.Document, actual: fitz.Document) -> dict:
     """The full standalone bookmark/TOC comparison behind `toc.html`.
 
@@ -1354,12 +1330,6 @@ def build_toc_report(expected: fitz.Document, actual: fitz.Document) -> dict:
     have_exp, have_act = bool(exp_entries), bool(act_entries)
 
     matches = match_toc_entries(exp_entries, act_entries)
-    # One pass per side, in entry order - `extract_sections` already does the
-    # wrapped-line/paragraph reconstruction, reused here rather than
-    # re-derived, so this reads the same content Content Validation itself
-    # would see between one heading and the next.
-    exp_texts = extract_sections(expected, exp_entries) if exp_entries else []
-    act_texts = extract_sections(actual, act_entries) if act_entries else []
 
     rows: list[dict] = []
     counts = {"matched": 0, "missing": 0, "extra": 0, "level_changed": 0, "page_shifted": 0}
@@ -1379,7 +1349,6 @@ def build_toc_report(expected: fitz.Document, actual: fitz.Document) -> dict:
                 notes.append(f"nesting level {e.level} → {a.level}")
             if page_delta != 0:
                 notes.append(f"page {e.page + 1} → {a.page + 1} ({page_delta:+d})")
-            content_match_pct = _content_coverage(exp_texts[m.expected_index], act_texts[m.actual_index])
             rows.append({
                 "heading": e.title,
                 "expected_level": e.level,
@@ -1390,7 +1359,6 @@ def build_toc_report(expected: fitz.Document, actual: fitz.Document) -> dict:
                 "level_changed": level_changed,
                 "page_delta": page_delta,
                 "note": "; ".join(notes),
-                "content_match_pct": content_match_pct,
             })
         elif m.expected_index is not None:
             e = exp_entries[m.expected_index]
@@ -1405,13 +1373,6 @@ def build_toc_report(expected: fitz.Document, actual: fitz.Document) -> dict:
                 "level_changed": False,
                 "page_delta": None,
                 "note": "in Production only — this bookmark is not in Staging",
-                # None, not 0: this heading was never MATCHED at all, so there
-                # is no "how much of its content carried over" to measure -
-                # 0% reads as "all its content is gone", which a heading with
-                # no counterpart bookmark to check against cannot claim. Real
-                # content loss on a genuinely one-sided heading still surfaces
-                # in Content Validation itself, word for word.
-                "content_match_pct": None,
             })
         else:
             a = act_entries[m.actual_index]
@@ -1426,23 +1387,7 @@ def build_toc_report(expected: fitz.Document, actual: fitz.Document) -> dict:
                 "level_changed": False,
                 "page_delta": None,
                 "note": "in Staging only — Staging adds this bookmark",
-                "content_match_pct": None,
             })
-
-    # One overall figure for the page to lead with: of every heading Production
-    # has, how much of it - matched at all, AND with content in roughly the
-    # same amount on both sides - actually got compared. A heading that never
-    # matched still contributes 0 here (dividing by every row, not just the
-    # matched ones) when at least some heading DID match - a few genuinely
-    # one-sided headings among an otherwise-working bookmark comparison really
-    # should pull this number down. But when NOTHING matched at all - most
-    # starkly, a Production PDF with no embedded bookmarks at all, where every
-    # single Staging bookmark reads "Extra" - there is no comparison to have
-    # scored 0%; that is a different fact (no bookmarks to compare BY) from
-    # "every matched heading lost its content", and reported as such rather
-    # than as a misleading wall of red 0%s.
-    matched_pcts = [r["content_match_pct"] for r in rows if r["status"] in ("Matched", "Changed")]
-    overall_content_match_pct = round(sum(matched_pcts) / len(rows)) if matched_pcts else None
 
     return {
         "have_expected_toc": have_exp,
@@ -1451,5 +1396,4 @@ def build_toc_report(expected: fitz.Document, actual: fitz.Document) -> dict:
         "actual_headings": sum(1 for e in act_entries if not e.excluded),
         "counts": counts,
         "rows": rows,
-        "overall_content_match_pct": overall_content_match_pct,
     }
