@@ -32,6 +32,7 @@ JPEG_QUALITY = 80
 
 RED = (0.86, 0.15, 0.15)
 ORANGE = (0.90, 0.51, 0.0)
+BLUE = (0.15, 0.39, 0.92)  # pictures, as the viewer draws them
 INK = (0.09, 0.09, 0.11)
 MUTED = (0.40, 0.44, 0.50)
 RULE = (0.89, 0.90, 0.92)
@@ -165,11 +166,13 @@ def write_issues_pdf(view: dict, expected: fitz.Document, actual: fitz.Document,
 
     labels = {c["key"]: c["label"] for c in view.get("categories") or []}
     for it in issues:
-        colour = ORANGE if it.get("minor") else RED
+        picture = it.get("category") == "images"
+        colour = BLUE if picture else ORANGE if it.get("minor") else RED
+        name = "Blue" if picture else "Orange" if it.get("minor") else "Red"
         w.room(120)
         where = " › ".join(p for p in (it.get("chapter"), it.get("section")) if p)
         w.text(f"#{it['n']}   {labels.get(it['category'], it['category'])}   ·   "
-               f"{'Orange' if it.get('minor') else 'Red'}", size=8.5, bold=True, color=colour, gap=1)
+               f"{name}", size=8.5, bold=True, color=colour, gap=1)
         if where:
             w.text(f"Topic: {where}", size=9, color=MUTED, gap=2)
         w.text(it.get("title") or "", size=12, bold=True, gap=3)

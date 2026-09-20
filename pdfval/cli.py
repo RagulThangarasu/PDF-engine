@@ -91,8 +91,11 @@ def run(
         from pdfval.ocr import reset_ocr_cache
         from pdfval.visual_diff import reset_cache as reset_visual_cache
 
+        from pdfval.validators.camelot_tables import reset_cache as reset_camelot_cache
+
         reset_ocr_cache()
         reset_visual_cache()
+        reset_camelot_cache()
     return report
 
 

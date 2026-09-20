@@ -5,6 +5,8 @@ deletions shift later pages), so headings are matched by title text only.
 """
 from __future__ import annotations
 
+from pdfval import ocr as _ocr
+
 import difflib
 import re
 import weakref
@@ -582,7 +584,7 @@ def _heading_line_map(doc: fitz.Document, page_index: int) -> dict[str, list[tup
     if cached is not None:
         return cached
 
-    data = doc[page_index].get_text("dict")
+    data = _ocr.page_text_dict(doc, page_index)
     rows: list[tuple[str, float, float, bool]] = []  # text, y0, size, heavy
     for block in data.get("blocks", []):
         if block.get("type") != 0:

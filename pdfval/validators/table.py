@@ -186,6 +186,31 @@ def _columns_line_up(prev_t: dict, cur_t: dict) -> bool:
     return shared / max(len(prev_edges), len(cur_edges)) >= COLUMN_ALIGN_MIN_SHARE
 
 
+def _starts_after_text(doc: fitz.Document, page_index: int, table_top: float) -> bool:
+    """A heading, or more than a line of text, printed on this page above
+    `table_top`: the page opens with new content, so a table under it starts
+    there rather than continuing the last page's. A running header or page
+    number alone is a single short line and does not count."""
+    try:
+        data = doc[page_index].get_text("dict")
+    except Exception:
+        return False
+    lines, sizes, body = [], [], []
+    for block in data.get("blocks", []):
+        for line in block.get("lines", []):
+            text = "".join(s.get("text", "") for s in line.get("spans", [])).strip()
+            size = max((float(s.get("size") or 0) for s in line.get("spans", [])), default=0.0)
+            if text:
+                body.append(size)
+            if text and not text.isdigit() and line["bbox"][3] <= table_top - 1:
+                lines.append(text)
+                sizes.append(size)
+    if not lines:
+        return False
+    usual = sorted(body)[len(body) // 2] if body else 0.0
+    return len(lines) >= 2 or (usual and max(sizes) >= 1.2 * usual)
+
+
 def _is_continuation(doc: fitz.Document, prev_page: int, prev_t: dict, cur_page: int, cur_t: dict) -> bool:
     """A table runs to near the bottom of a page and another table starts near
     the top of the very next page over the same columns - the same logical table
@@ -199,6 +224,8 @@ def _is_continuation(doc: fitz.Document, prev_page: int, prev_t: dict, cur_page:
         return False  # previous table doesn't reach the bottom - not a continuation
     if cur_t["bbox"][1] > cur_rect.y0 + cur_rect.height * HEADER_BAND_RATIO:
         return False  # this table doesn't start near the top - not a continuation
+    if _starts_after_text(doc, cur_page, cur_t["bbox"][1]):
+        return False  # a heading or paragraph opens the page first - a new table
     prev_rows, cur_rows = prev_t["rows"], cur_t["rows"]
     prev_cols = len(prev_rows[0]) if prev_rows else 0
     cur_cols = len(cur_rows[0]) if cur_rows else 0

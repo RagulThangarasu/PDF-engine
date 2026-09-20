@@ -272,7 +272,8 @@ def _queue_position(run_id: str) -> int:
             return 1
 
 
-def _run_ai_review(run_dir: str, run_id: str, expected_path: str, actual_path: str) -> None:
+def _run_ai_review(run_dir: str, run_id: str, expected_path: str, actual_path: str,
+                   anchors: list | None = None) -> None:
     """The optional AI pass - runs after the deterministic report is already
     written, and can never fail the run: any error here (Ollama not running,
     model missing, a page timing out) is swallowed and simply leaves no
@@ -286,12 +287,18 @@ def _run_ai_review(run_dir: str, run_id: str, expected_path: str, actual_path: s
         act_pages = fitz.open(actual_path).page_count
         page_count = min(exp_pages, act_pages)
         pdfview_dir = os.path.join(run_dir, "pdfview")
+        # Which Staging page each Production page is really the counterpart of,
+        # from the same matched waypoints the viewer scrolls by. Paired by page
+        # NUMBER the AI was comparing unrelated pages from the first inserted
+        # page onwards, and every note past that point was invented from the
+        # mismatch rather than found on the page.
+        pairs = ai_review.page_pairs(anchors, exp_pages, act_pages)
 
         def cb(i: int, n: int) -> None:
             _set_progress(run_dir, run_id, percent=98, label=f"AI visual review — page {i}/{n}")
 
         _set_progress(run_dir, run_id, percent=98, label="AI visual review starting…")
-        notes = ai_review.review_pages(pdfview_dir, page_count, progress_cb=cb)
+        notes = ai_review.review_pages(pdfview_dir, page_count, progress_cb=cb, pairs=pairs)
         with open(os.path.join(run_dir, "ai_review.json"), "w", encoding="utf-8") as f:
             json.dump({"model": ai_review.VISION_MODEL, "notes": notes}, f)
     except Exception:  # noqa: BLE001
@@ -338,7 +345,10 @@ def _start_job(app, run_id, run_dir, expected_path, actual_path, exp_name, act_n
                     new_comparison_url=url_for("upload_form"),
                 )
             if ai_enabled:
-                _run_ai_review(run_dir, run_id, expected_path, actual_path)
+                _run_ai_review(
+                    run_dir, run_id, expected_path, actual_path,
+                    anchors=(getattr(report, "issue_report", None) or {}).get("anchors"),
+                )
             _set_progress(run_dir, run_id, percent=100, label="Done", done=True)
         except Exception as exc:  # noqa: BLE001
             traceback.print_exc()

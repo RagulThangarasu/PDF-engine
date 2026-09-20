@@ -119,6 +119,8 @@ _ocr_pages_done = 0
 
 def reset_ocr_cache() -> None:
     global _ocr_pages_done
+    _SCANNED_CACHE.clear()
+    _TEXT_DICT_CACHE.clear()
     _OCR_RAW_CACHE.clear()
     _ocr_pages_done = 0
 
@@ -233,3 +235,98 @@ def words_in(words: list[tuple], bbox: tuple, margin: float = 0.0) -> list[str]:
         if x0 <= cx <= x1 and y0 <= cy <= y1:
             out.append(text)
     return out
+
+
+# A page is "scanned" when one embedded image covers most of it and the text
+# layer carries next to nothing: its words exist only as pixels, so every
+# text comparison has to go through OCR or it silently compares nothing.
+SCANNED_RASTER_FRAC = 0.75   # share of the page one image must cover
+SCANNED_MAX_NATIVE_WORDS = 8  # a stray page number / stamp is still "no text layer"
+_SCANNED_CACHE: dict[tuple, bool] = {}
+
+
+def is_scanned_page(doc: fitz.Document, page: int) -> bool:
+    key = (id(doc), doc.page_count, page)
+    if key in _SCANNED_CACHE:
+        return _SCANNED_CACHE[key]
+    result = False
+    try:
+        page_obj = doc[page]
+        area = max(1.0, page_obj.rect.width * page_obj.rect.height)
+        biggest = 0.0
+        for info in page_obj.get_image_info():
+            bbox = info.get("bbox")
+            if bbox:
+                r = fitz.Rect(bbox) & page_obj.rect
+                biggest = max(biggest, r.width * r.height / area)
+        if biggest >= SCANNED_RASTER_FRAC:
+            words = [w for w in page_obj.get_text("words") if w[4].strip()]
+            result = len(words) <= SCANNED_MAX_NATIVE_WORDS
+    except Exception:
+        result = False
+    _SCANNED_CACHE[key] = result
+    return result
+
+
+def scanned_pages(doc: fitz.Document) -> list[int]:
+    return [i for i in range(doc.page_count) if is_scanned_page(doc, i)]
+
+
+def ocr_lines(words: list[tuple]) -> list[tuple]:
+    """Group OCR words into printed lines: [(bbox, text), ...] in reading
+    order. Words belong to one line when their vertical extents mostly
+    overlap and they sit left-to-right without a column-sized gap."""
+    bands: list[list[tuple]] = []
+    for w in sorted(words, key=lambda w: ((w[1] + w[3]) / 2, w[0])):
+        if not str(w[4]).strip():
+            continue
+        band = bands[-1] if bands else None
+        if band is not None:
+            b0, b1 = min(x[1] for x in band), max(x[3] for x in band)
+            h = min(b1 - b0, w[3] - w[1])
+            if h > 0 and min(b1, w[3]) - max(b0, w[1]) >= 0.5 * h:
+                band.append(w)
+                continue
+        bands.append([w])
+    out = []
+    for band in bands:
+        band.sort(key=lambda w: w[0])
+        height = max(1.0, sum(w[3] - w[1] for w in band) / len(band))
+        pieces: list[list[tuple]] = [[band[0]]]
+        for w in band[1:]:
+            # a gap this wide is a column gutter, not a word space
+            if w[0] - pieces[-1][-1][2] > 3 * height:
+                pieces.append([w])
+            else:
+                pieces[-1].append(w)
+        for row in pieces:
+            bbox = (min(w[0] for w in row), min(w[1] for w in row),
+                    max(w[2] for w in row), max(w[3] for w in row))
+            out.append((bbox, " ".join(str(w[4]) for w in row)))
+    out.sort(key=lambda r: (round(r[0][1], 1), r[0][0]))
+    return out
+
+
+_TEXT_DICT_CACHE: dict[tuple, dict] = {}
+
+
+def page_text_dict(doc: fitz.Document, page: int) -> dict:
+    """`page.get_text("dict")`, except that a scanned page answers with its
+    OCR reading in the same shape (one block per line, one span per line) -
+    so heading lookup finds a title that exists only as pixels. Font size is
+    estimated from the line's height; weight is unknown and left regular."""
+    if not is_scanned_page(doc, page):
+        return doc[page].get_text("dict")
+    key = (id(doc), doc.page_count, page)
+    if key in _TEXT_DICT_CACHE:
+        return _TEXT_DICT_CACHE[key]
+    blocks = []
+    for bbox, text in ocr_lines(PageWords(doc).ocr_words(page)):
+        size = max(1.0, (bbox[3] - bbox[1]) * 0.8)
+        span = {"text": text, "bbox": bbox, "size": size, "flags": 0, "font": "OCR",
+                "color": 0, "origin": (bbox[0], bbox[3])}
+        blocks.append({"type": 0, "bbox": bbox, "lines": [{"bbox": bbox, "spans": [span]}]})
+    rect = doc[page].rect
+    result = {"width": rect.width, "height": rect.height, "blocks": blocks}
+    _TEXT_DICT_CACHE[key] = result
+    return result

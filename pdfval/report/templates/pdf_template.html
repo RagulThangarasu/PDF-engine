@@ -59,6 +59,14 @@
   .chip.on b { color: #fff; }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--c, var(--ink));
          margin-right: 5px; vertical-align: 0; }
+  /* Noise: kinds of difference a reader may not want to read through on a
+     given pass (an "ignore whitespace" switch, but per kind). Checkboxes, not
+     chips: unlike the category filter, any number can be hidden at once. */
+  .noise { display: flex; flex-wrap: wrap; gap: 4px 10px; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  .noise label { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); cursor: pointer; }
+  .noise label:has(input:checked) { color: var(--ink); font-weight: 600; }
+  .noise input { margin: 0; }
+  .noise b { font-variant-numeric: tabular-nums; font-weight: 400; }
   nav .search { padding: 8px; border-bottom: 1px solid var(--line); }
   nav input { width: 100%; font: inherit; font-size: 13px; padding: 6px 8px; border: 1px solid #ccd; border-radius: 6px; }
   nav .list { overflow: auto; flex: 1; }
@@ -74,12 +82,17 @@
   .it .m { font-weight: 600; }
   .it .n { color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 5px; }
   .it .h, .it .pg { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .it .clabel { display: inline-block; margin-left: 6px; padding: 0 6px; border: 1px solid #c0392b; border-radius: 999px;
+                color: #b42318; font-size: 11px; font-weight: 600; line-height: 16px; vertical-align: 1px; }
   .it .d { font-size: 12px; margin-top: 3px; line-height: 1.45; }
   .it .t { font-size: 12px; margin-top: 3px; line-height: 1.5; overflow-wrap: anywhere; display: -webkit-box;
            -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
   .it.on .t { display: block; }
   .it .t b { font-weight: 600; }
+  /* Diffchecker's own convention: red for what only the original (Production)
+     side has, green for what only the changed (Staging) side has. */
   mark.red { background: #fbd5d5; color: #8a1111; font-weight: 700; border-radius: 2px; padding: 0 1px; }
+  mark.green { background: #fbd5d5; color: #8a1111; font-weight: 700; border-radius: 2px; padding: 0 1px; }
   .gap { color: #b42318; font-weight: 800; }
   .empty { padding: 16px; color: var(--muted); }
 
@@ -127,6 +140,9 @@
   /* The line from the other document's box, across the panes, to the same comment. */
   .xlines { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; z-index: 6; }
   .xlink { stroke: var(--box-on); stroke-width: 1.5; stroke-dasharray: 5 3; }
+  /* Every issue's line is drawn; the one under the cursor or selected is
+     the solid, full-strength one, the rest sit back out of its way. */
+  .xlink.rest { stroke-width: 1; opacity: .3; }
   .page img { display: block; width: 100%; height: 100%; }
   .page .no { position: absolute; top: 4px; right: 6px; font-size: 11px; color: var(--muted);
               background: rgba(255,255,255,.85); padding: 0 4px; border-radius: 3px; }
@@ -146,6 +162,24 @@
   .box:hover, .box.hover { opacity: 1; box-shadow: 0 0 0 3px color-mix(in srgb, var(--c, var(--box-on)) 20%, transparent); }
   .box.on { border-width: 3px; opacity: 1; box-shadow: 0 0 0 3px color-mix(in srgb, var(--c, var(--box-on)) 20%, transparent); z-index: 3; }
   .box.critical { border-width: 3px; opacity: 1; --c: var(--c-content); }
+  /* Picture findings stay blue, critical or not: a missing or extra picture
+     is drawn thicker, never in the content red. */
+  .box.cat-images.critical, .note.cat-images.critical, .link.cat-images.critical,
+  .it.cat-images.critical { --c: var(--c-images); }
+  /* Every category but Images: a marker pen over the text itself, not an
+     outline with a separate floating comment and a line pointing to it -
+     what and where read together at a glance, the title/description are
+     still one hover away (see box.title, set in JS). Images keep the
+     outline + comment + line above: a picture has no "text" to tint. */
+  /* Everything that is not missing/extra text stays invisible on the page
+     until picked from the issue list, so the page itself is never covered. */
+  .box.ghost { border-color: transparent; opacity: 1; box-shadow: none; }
+  .box.ghost:hover, .box.ghost.hover { border-color: transparent; box-shadow: none; }
+  .box.ghost.on { border: 2px dashed #c0392b; box-shadow: none; }
+  /* Only text that is missing or extra gets a highlight, and it is always
+     red; every other finding is an outline with no background at all. */
+  .box.fill { border-width: 1px; border-color: #c0392b; background: rgba(192, 57, 43, .30); }
+  .box.fill.on, .box.fill:hover, .box.fill.hover { background: rgba(192, 57, 43, .45); }
   /* No number badge — the box is tied to its comment by the line drawn between them. */
   .note { position: absolute; left: 0; right: 0; font-size: 12px; line-height: 1.35; color: #111; background: #fff;
           border: 1px solid var(--c, var(--box-on)); border-left-width: 3px; border-radius: 4px; padding: 4px 6px;
@@ -154,6 +188,19 @@
   .note.on { border-left-width: 4px; background: #fafbff; font-weight: 600; z-index: 2; opacity: 1; }
   .note.critical { border-left-width: 4px; font-weight: 600; opacity: 1; --c: var(--c-content); }
   .no-notes .note, .no-notes .lines { display: none; }
+  /* Comments are plain: grey edge, no category colour; red only for missing/extra text. */
+  .note { border-color: #d0d5dd !important; }
+  .note.textgap { border-color: #c0392b !important; }
+  .note .clabel { display: inline-block; margin: 0 4px 2px 0; padding: 0 6px; border: 1px solid #c0392b; border-radius: 999px;
+                  color: #b42318; font-size: 10.5px; font-weight: 600; line-height: 15px; }
+  .lines line { opacity: 0 !important; }
+  .lines line.on, .lines line.hover, .lines line.imgline { opacity: 1 !important; }
+  .lines line.imgline { stroke: var(--c-images) !important; }
+  /* A picture that differs is always RED-BOXED, never tinted: a fill over
+     artwork hides the very thing the reader is asked to compare. */
+  .box.imgbox { border: 2px solid #c0392b !important; background: transparent !important; opacity: 1; }
+  .box.imgbox.on { border-width: 3px !important; }
+  .note.imgnote { border-color: var(--c-images) !important; }
   .hide-others .box:not(.on), .hide-others .note:not(.on), .hide-others .link:not(.on) { display: none; }
   body[data-cat="content"] .box:not(.cat-content), body[data-cat="images"] .box:not(.cat-images),
   body[data-cat="links"] .box:not(.cat-links), body[data-cat="lists"] .box:not(.cat-lists),
@@ -164,6 +211,10 @@
   body[data-cat="content"] .link:not(.cat-content), body[data-cat="images"] .link:not(.cat-images),
   body[data-cat="links"] .link:not(.cat-links), body[data-cat="lists"] .link:not(.cat-lists),
   body[data-cat="bold"] .link:not(.cat-bold), body[data-cat="tables"] .link:not(.cat-tables), body[data-cat="formatting"] .link:not(.cat-formatting) { display: none; }
+  /* Same idea, one class per noise group, any number on at once. */
+  body.hide-noise-space .noise-space, body.hide-noise-punctuation .noise-punctuation,
+  body.hide-noise-order .noise-order, body.hide-noise-styling .noise-styling,
+  body.hide-noise-layout .noise-layout { display: none; }
   @media (max-width: 900px) {
     .main { flex-direction: column; }
     nav { width: auto; height: 38vh; border-right: 0; border-bottom: 1px solid var(--line); }
@@ -206,6 +257,13 @@
         <button class="chip cat-{{ c.key }}{{ ' zero' if not c.count }}" data-cat="{{ c.key }}" onclick="setCat('{{ c.key }}')" title="{{ c.help }}"><span class="dot"></span>{{ c.label }}<b>{{ c.count }}</b></button>
         {% endfor %}
       </div>
+      {% if view.noise_groups %}
+      <div class="noise">
+        {% for g in view.noise_groups %}
+        <label title="{{ g.help }}"><input type="checkbox" data-noise="{{ g.key }}" onchange="toggleNoise(this)"> Hide {{ g.label }}<b>({{ g.count }})</b></label>
+        {% endfor %}
+      </div>
+      {% endif %}
       <div class="search"><input id="q" type="search" placeholder="Search issues…" oninput="filterNav()"></div>
       <div class="list" id="list"></div>
     </nav>
@@ -253,8 +311,11 @@ function pagesOf(it, side) { return [...new Set(boxesOf(it, side).map(b => b.pag
 // What the comment says: the issue, each spot that differs on this page, and
 // where it is on both documents.
 function noteFor(it, side, page) {
-  const note = el('div', 'note cat-' + it.category + (it.minor ? ' minor' : '') + (it.critical ? ' critical' : ''));
-  note.appendChild(el('div', 'ttl', it.title));
+  const note = el('div', 'note cat-' + it.category + (it.minor ? ' minor' : '') + (it.critical ? ' critical' : '') + (it.noise ? ' noise-' + it.noise : ''));
+  const ttl = el('div', 'ttl');
+  (it.content_label || '').split(' · ').filter(Boolean).forEach(l => ttl.appendChild(el('span', 'clabel', l)));
+  ttl.appendChild(document.createTextNode(' ' + it.title));
+  note.appendChild(ttl);
   const own = [...new Set(boxesOf(it, side).filter(b => b.page === page && b.note).map(b => b.note))];
   const listed = it.changes && it.changes.length;
   const lines = listed ? it.changes : own.length ? own : [side === 'prod' ? it.comment_prod : it.comment_stage].filter(Boolean);
@@ -298,14 +359,46 @@ function buildPane(side, pages) {
     root.appendChild(wrap);
     byPage[p.n] = { el: d, gutter, wrap, svg, w: p.w, h: p.h };
   });
+  // What gets the red highlight: text missing, extra or changed - words,
+  // punctuation, quotes and spaces included - and the table rows, cells and
+  // merged cells that differ.
+  const TEXT_GAP_TYPES = new Set(['missing', 'added', 'text', 'section-missing', 'section-added',
+                                   'table-row-missing', 'table-row-added', 'table-cell', 'table-merge',
+                                   'table-cell-sequence', 'punctuation', 'symbol', 'text-space',
+                                   'page-ref-in-staging', 'paragraph-gap']);
   issues.forEach(it => {
     const home = homeOf(it);
+    // Images and tables read worse under a solid tint (see above); so does a
+    // printed NOTE/warning callout that already carries its own shaded
+    // background and icon - filling it solid red on top makes its own
+    // printed text unreadable, not just marked. Those keep the outline +
+    // comment too, same as images and tables.
+    const textGap = TEXT_GAP_TYPES.has(it.type);
+    const boxed = !textGap || it.category === 'images' || it.type === 'shading' || it.type === 'note-label';
     const notes = new Map();
     boxesOf(it, side).forEach(b => {
       const pg = byPage[b.page];
       if (!pg) return;
       const [x0, y0, x1, y1] = b.bbox, pad = 2;
-      const box = el('div', 'box cat-' + it.category + (it.minor ? ' minor' : '') + (it.critical ? ' critical' : ''));
+      // A consolidated card's box can be the union of everywhere it occurs
+      // on the page (see `_bounding_boxes` in issues.py) - large enough to
+      // cover a whole table or half a page. A solid tint that big reads as
+      // "the table/image itself was marked", not "somewhere in here differs",
+      // so anything past a page-area share falls back to an outline too.
+      // Only a text-sized box is tinted: one spanning a figure, its labels
+      // or a whole region would paint over the page, so it stays invisible.
+      const bigBox = ((x1 - x0) * (y1 - y0)) / (pg.w * pg.h) > 0.06 || (y1 - y0) / pg.h > 0.10
+        || (it.kind && !['text', 'table', 'note', 'heading'].includes(it.kind));
+      // Text only one document has is highlighted on THAT document; the
+      // other side's box only marks where it would be, so it stays invisible.
+      const absentHere = (side === 'stage' && /missing$/.test(it.type || '')) || (side === 'prod' && /added$/.test(it.type || ''));
+      // Image differences - missing, extra, broken, changed, resized - are
+      // always outlined in red, with their comment and its line shown.
+      const imageIssue = it.category === 'images';
+      // A synthetic marker (`_marker_box`) is a PIN at roughly where the
+      // content belongs - there is nothing wrong with the text it lands on,
+      // usually the topic's heading, so it is never tinted like changed words.
+      const box = el('div', 'box ' + (imageIssue ? 'imgbox ' : boxed || bigBox || absentHere || b.marker ? 'ghost ' : 'fill ') + 'cat-' + it.category + (it.minor ? ' minor' : '') + (it.critical ? ' critical' : '') + (it.noise ? ' noise-' + it.noise : ''));
       box.style.left = ((x0 - pad) / pg.w * 100) + '%';
       box.style.top = ((y0 - pad) / pg.h * 100) + '%';
       box.style.width = ((x1 - x0 + 2 * pad) / pg.w * 100) + '%';
@@ -315,13 +408,22 @@ function buildPane(side, pages) {
       box.onmouseenter = () => hoverId(it.id, true); box.onmouseleave = () => hoverId(it.id, false);
       box.onclick = e => { e.stopPropagation(); select(it.id, side); };
       pg.el.appendChild(box);
-      // ONE comment per issue: it lives beside the Production box (Staging's when
-      // Production has none) and says what differs on both sides. The other
-      // document's boxes are tied to it by a line drawn across the panes.
+      // Images and tables alone keep a comment (an outline box, not a tint -
+      // a picture and a table both read worse under a solid fill, and a
+      // table's own findings need the same room a note gives to list every
+      // changed cell). It lives beside the Production box (Staging's when
+      // Production has none), the other document's boxes tied to it by a
+      // line across the panes. Every other category's tint is its own
+      // caption - what and where together - so nothing further is drawn.
+      // Every finding has its comment beside the page: its content label and
+      // what changed. The connector line only shows for the finding hovered
+      // or selected, so the page is never criss-crossed.
       if (side !== home) { CROSS.push({ box, id: it.id }); return; }
       let note = notes.get(b.page);
       if (!note) {
         note = noteFor(it, side, b.page);
+        if (textGap) note.classList.add('textgap');
+        if (imageIssue) note.classList.add('imgnote');
         note.dataset.id = it.id;
         note.dataset.y = y0 / pg.h;
         note.title = box.title;
@@ -331,7 +433,7 @@ function buildPane(side, pages) {
         pg.gutter.appendChild(note);
       }
       const line = document.createElementNS(SVG_NS, 'line');
-      line.setAttribute('class', 'link cat-' + it.category + (it.minor ? ' minor' : '') + (it.critical ? ' critical' : ''));
+      line.setAttribute('class', 'link ' + (imageIssue ? 'imgline ' : '') + 'cat-' + it.category + (it.minor ? ' minor' : '') + (it.critical ? ' critical' : '') + (it.noise ? ' noise-' + it.noise : ''));
       line.dataset.id = it.id;
       pg.svg.appendChild(line);
       LINKS.push({ box, note, line, wrap: pg.wrap });
@@ -377,7 +479,9 @@ function drawLines() {
 }
 
 // Lines across the panes, from the other document's boxes to the issue's one
-// comment - for the selected and the hovered issue only, so the page stays clean.
+// comment. Every issue on screen gets its line, so a comment is never left
+// pointing at one document alone; the selected and hovered ones are drawn at
+// full strength and the rest faintly, so the page still reads.
 let XSVG = null;
 function drawCross() {
   if (!XSVG) {
@@ -390,7 +494,10 @@ function drawCross() {
   const host = XSVG.getBoundingClientRect();
   const seen = (r, pr) => r.width > 0 && r.bottom > pr.top && r.top < pr.bottom;
   const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
-  new Set([active, hovered].filter(v => v != null)).forEach(id => {
+  const lit = new Set([active, hovered].filter(v => v != null));
+  // The faint ones first, so the selected and hovered lines are drawn over them.
+  const ids = [...new Set(CROSS.map(c => c.id))].sort((x, y) => lit.has(x) - lit.has(y));
+  ids.forEach(id => {
     const it = issues[id], home = homeOf(it), away = other(home);
     const hr = panes[home].getBoundingClientRect(), ar = panes[away].getBoundingClientRect();
     const notes = [...panes[home].querySelectorAll('.note[data-id="' + id + '"]')]
@@ -404,7 +511,7 @@ function drawCross() {
       const nr = notes.reduce((a, r) => Math.abs(r.top + r.height / 2 - cy) < Math.abs(a.top + a.height / 2 - cy) ? r : a);
       const left = nr.right <= br.left;
       const ln = document.createElementNS(SVG_NS, 'line');
-      ln.setAttribute('class', 'xlink');
+      ln.setAttribute('class', 'xlink' + (lit.has(id) ? '' : ' rest'));
       ln.setAttribute('x1', clamp(left ? br.left : br.right, ar.left, ar.right) - host.left);
       ln.setAttribute('y1', clamp(cy, ar.top, ar.bottom) - host.top);
       ln.setAttribute('x2', clamp(left ? nr.right : nr.left, hr.left, hr.right) - host.left);
@@ -415,16 +522,17 @@ function drawCross() {
 }
 let layoutQueued = false;
 function relayout() {
+  layoutEpoch++;  // the waypoint measurements are stale - see `anchorTops`
   if (layoutQueued) return;
   layoutQueued = true;
   requestAnimationFrame(() => { layoutQueued = false; layoutNotes(); });
 }
 
 // ---- the nav: every issue, by category ----
-function textWithMarks(parts) {
+function textWithMarks(parts, side) {
   const f = document.createDocumentFragment();
   parts.forEach(p => {
-    if (p.hl) f.appendChild(el('mark', 'red', p.t));
+    if (p.hl) f.appendChild(el('mark', side === 'stage' ? 'green' : 'red', p.t));
     else if (p.gap) { const g = el('span', 'gap', '‸'); g.title = 'The other document has words here'; f.appendChild(g); }
     else f.appendChild(document.createTextNode(p.t));
     f.appendChild(document.createTextNode(' '));
@@ -441,13 +549,15 @@ function buildNav() {
     det.append(sum, el('div', 'help', g.help));
     g.ids.forEach(id => {
       const it = issues[id];
-      const row = el('div', 'it cat-' + it.category + (it.critical ? ' critical' : '')); row.dataset.id = id;
+      const row = el('div', 'it cat-' + it.category + (it.critical ? ' critical' : '') + (it.noise ? ' noise-' + it.noise : '')); row.dataset.id = id;
+      if (it.noise) row.dataset.noise = it.noise;
       const head = el('div', 'm');
       head.append(el('span', 'dot'), document.createTextNode(it.title));
+      (it.content_label || '').split(' · ').filter(Boolean).forEach(l => head.append(el('span', 'clabel', l)));
       row.append(head, el('div', 'h', it.chapter + (it.section ? ' › ' + it.section : '')), el('div', 'd', it.description));
-      [['prod_parts', 'Production: '], ['stage_parts', 'Staging: ']].forEach(([key, label]) => {
+      [['prod_parts', 'Production: ', 'prod'], ['stage_parts', 'Staging: ', 'stage']].forEach(([key, label, side]) => {
         if (!it[key].length) return;
-        const t = el('div', 't'); t.append(el('b', null, label), textWithMarks(it[key])); row.appendChild(t);
+        const t = el('div', 't'); t.append(el('b', null, label), textWithMarks(it[key], side)); row.appendChild(t);
       });
       if (!it.prod_parts.length && !it.stage_parts.length && it.detail) row.appendChild(el('div', 'd', it.detail));
       const where = [];
@@ -488,10 +598,25 @@ function anchorTop(side, h) {
   const p = h[side];
   return p ? pageTop(side, p.page, p.y) : null;
 }
+// Every matched paragraph is a waypoint, so there are hundreds of them, and
+// measuring them all on every scroll frame would make scrolling crawl. A
+// waypoint's offset only moves when the LAYOUT does (zoom, resize, the nav
+// opening), never when the pane scrolls - `pageTop` is written in scroll-
+// invariant terms - so the measurements are taken once per layout and reused.
+let layoutEpoch = 0;
+const topsCache = { prod: { epoch: -1, tops: null }, stage: { epoch: -1, tops: null } };
+function anchorTops(side) {
+  const c = topsCache[side];
+  if (c.epoch !== layoutEpoch || !c.tops) {
+    c.tops = ANCHORS.map(h => anchorTop(side, h));
+    c.epoch = layoutEpoch;
+  }
+  return c.tops;
+}
 function follow(side, force) {
   const to = other(side);
-  const a = ANCHORS.map(h => anchorTop(side, h));
-  const b = ANCHORS.map(h => anchorTop(to, h));
+  const a = anchorTops(side);
+  const b = anchorTops(to);
   const usable = k => a[k] != null && b[k] != null;
   const line = panes[side].scrollTop + READ_LINE;
   let at = -1;
@@ -521,7 +646,11 @@ function follow(side, force) {
   scrollPane(to, target);
 }
 function showNow(at) {
-  document.getElementById('now').textContent = at < 0 ? '' : ANCHORS[at].title;
+  // Walk back to the last real heading: the waypoints between them are
+  // paragraphs, whose first words are not what "where am I" means.
+  let k = at;
+  while (k >= 0 && ANCHORS[k].sync_only) k--;
+  document.getElementById('now').textContent = k < 0 ? '' : ANCHORS[k].title;
 }
 SIDES.forEach(side => {
   let pending = false;
@@ -573,8 +702,21 @@ function select(id, from) {
   layoutNotes();
   const it = issues[id];
   const placed = {};
+  // Open BOTH panes at the same finding. A card is often several findings
+  // merged, and one of them can have a box on one side only (a figure missing
+  // in Staging) - taking each side's own first box then opened Production on
+  // one finding and Staging on another, pages apart, so the two panes showed
+  // unrelated content. `pair` is the finding each box came from: the first one
+  // boxed on BOTH sides is the one that can mirror them.
+  const pairsOf = side => boxesOf(it, side).map(b => b.pair).filter(p => p != null);
+  const shared = pairsOf('prod').filter(p => pairsOf('stage').includes(p));
+  const mirror = shared.length ? Math.min(...shared) : null;
+  const firstBox = side => {
+    const boxes = boxesOf(it, side);
+    return (mirror != null && boxes.find(b => b.pair === mirror)) || boxes[0];
+  };
   SIDES.forEach(side => {
-    const b = boxesOf(it, side)[0];
+    const b = firstBox(side);
     if (!b) return;
     placed[side] = true;
     if (side === from) return;
@@ -594,7 +736,7 @@ function select(id, from) {
       if (top != null) { scrollPane(side, top - READ_LINE + 20); return; }
     }
     if (!placed[other(side)]) return;
-    const b = boxesOf(it, other(side))[0];
+    const b = firstBox(other(side));
     const idx = findAnchor(it.section || it.chapter, other(side), b ? b.page : null);
     if (idx >= 0 && ANCHORS[idx][side]) {
       const h = ANCHORS[idx];
@@ -618,6 +760,7 @@ function step(d) {
 
 // ---- filters ----
 let category = '';
+const hiddenNoise = new Set();
 function setCat(key) {
   category = key;
   document.body.dataset.cat = key;
@@ -625,10 +768,22 @@ function setCat(key) {
   filterNav();
   relayout();
 }
+// Same idea as `setCat`, but any number of noise kinds can be hidden at once -
+// unrelated wording changes still fail the run, so this only ever hides,
+// never drops: the counts above keep saying how many are out of sight.
+function toggleNoise(cb) {
+  const key = cb.dataset.noise;
+  hiddenNoise[cb.checked ? 'add' : 'delete'](key);
+  document.body.classList.toggle('hide-noise-' + key, cb.checked);
+  filterNav();
+  relayout();
+}
 function filterNav() {
   const q = document.getElementById('q').value.trim().toLowerCase();
   document.querySelectorAll('.it').forEach(r => {
-    r.hidden = !((!category || r.classList.contains('cat-' + category)) && (!q || r.textContent.toLowerCase().includes(q)));
+    r.hidden = !((!category || r.classList.contains('cat-' + category))
+      && !(r.dataset.noise && hiddenNoise.has(r.dataset.noise))
+      && (!q || r.textContent.toLowerCase().includes(q)));
   });
   document.querySelectorAll('details.grp').forEach(g => {
     const n = g.querySelectorAll('.it:not([hidden])').length;

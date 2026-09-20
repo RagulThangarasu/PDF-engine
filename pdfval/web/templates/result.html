@@ -86,7 +86,7 @@
       <p style="color:#555; font-size:0.85rem; margin-top:0;">A local AI model's own look at each page, alongside the checks above — not a replacement for them.</p>
       {% if ai_notes.notes %}
         {% for n in ai_notes.notes %}
-        <div style="margin-bottom:0.75rem; font-size:0.88rem;"><b>Page {{ n.page }}:</b> {{ n.note }}</div>
+        <div style="margin-bottom:0.75rem; font-size:0.88rem;"><b>Production p.{{ n.page }}{% if n.stage_page and n.stage_page != n.page %} ↔ Staging p.{{ n.stage_page }}{% endif %}:</b> {{ n.note }}</div>
         {% endfor %}
       {% else %}
         <p class="none">No visual differences noted.</p>
