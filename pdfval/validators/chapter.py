@@ -52,6 +52,8 @@ wants listed, and the check is worthless if it drowns them:
 """
 from __future__ import annotations
 
+from pdfval.docid import doc_key
+
 import difflib
 import itertools
 import re
@@ -370,7 +372,7 @@ def _furniture(doc: fitz.Document) -> tuple[set, set]:
     there are chapters - and it is the one thing in the band that must never be
     dropped, so size is what separates the two.
     """
-    key = (id(doc), doc.page_count)
+    key = (doc_key(doc), doc.page_count)
     hit = _FURNITURE_CACHE.get(key)
     if hit is not None:
         return hit
@@ -479,7 +481,7 @@ _TABLE_BOX_CACHE: dict[tuple, list] = {}
 
 def _inside_table(doc: fitz.Document, page_index: int, bbox: tuple) -> bool:
     """This line sits inside a ruled table detected on the page."""
-    key = (id(doc), page_index)
+    key = (doc_key(doc), page_index)
     if key not in _TABLE_BOX_CACHE:
         from pdfval.extractor import _page_table_bboxes
         try:
@@ -596,7 +598,7 @@ def _page_underlines(doc: fitz.Document, page_index: int) -> list:
     beneath whatever text sits just above it. A PDF has no "underline" font
     flag the way bold or italic do; an underline is always a separately drawn
     line, found the same way `_has_underline` finds one under a hyperlink."""
-    key = (id(doc), page_index)
+    key = (doc_key(doc), page_index)
     if key not in _UNDERLINE_CACHE:
         try:
             _UNDERLINE_CACHE[key] = [
@@ -2520,7 +2522,7 @@ def _overlaps_existing(bbox: tuple, existing: list[tuple], threshold: float = 0.
 
 
 def _page_icons(doc: fitz.Document, page_index: int) -> list[tuple]:
-    key = (id(doc), page_index)
+    key = (doc_key(doc), page_index)
     if key not in _ICON_CACHE:
         try:
             infos = doc[page_index].get_image_info(xrefs=True)
@@ -3078,7 +3080,7 @@ _FILL_CACHE: dict[tuple, list] = {}
 
 
 def _page_fills(doc: fitz.Document, page_index: int) -> list["fitz.Rect"]:
-    key = (id(doc), page_index)
+    key = (doc_key(doc), page_index)
     if key not in _FILL_CACHE:
         page = doc[page_index]
         fills = []
@@ -3619,7 +3621,7 @@ _CHAR_CACHE: dict[tuple, list] = {}
 
 
 def _page_chars(doc: fitz.Document, page_index: int) -> list[tuple]:
-    key = (id(doc), page_index)
+    key = (doc_key(doc), page_index)
     if key not in _CHAR_CACHE:
         out = []
         try:
@@ -3984,7 +3986,7 @@ _LINE_GEOM_CACHE: dict[tuple, list] = {}
 
 def _text_lines(doc: fitz.Document, page_index: int) -> list[tuple[tuple, str]]:
     """Every text line on the page as (bbox, text)."""
-    key = (id(doc), page_index)
+    key = (doc_key(doc), page_index)
     if key not in _LINE_GEOM_CACHE:
         out: list[tuple[tuple, str]] = []
         try:
@@ -4165,7 +4167,7 @@ _LANDING_SLACK = 16.0  # points: a destination sits just above the heading it op
 
 
 def _named_destinations(doc: fitz.Document) -> dict:
-    key = id(doc)
+    key = doc_key(doc)
     if key not in _NAMES_CACHE:
         try:
             _NAMES_CACHE[key] = doc.resolve_names() or {}
@@ -4778,7 +4780,7 @@ _FIGURE_MIN_BY_DOC: dict[int, float] = {}
 
 
 def _figure_min_side(doc: fitz.Document) -> float:
-    return _FIGURE_MIN_BY_DOC.get(id(doc), _FIGURE_MIN_SIDE)
+    return _FIGURE_MIN_BY_DOC.get(doc_key(doc), _FIGURE_MIN_SIDE)
 
 
 _NEXT_STEP_OPENER_RE = re.compile(r"^\s*(?:\d{1,2}|[a-z])[.)]\s", re.IGNORECASE)
@@ -4883,7 +4885,7 @@ def _describe(fig: Element, caption: str) -> str:
 
 def _figure_index(doc: fitz.Document) -> list[tuple]:
     """Every figure in the whole document: (page, bbox, fingerprint)."""
-    key = id(doc)
+    key = doc_key(doc)
     if key not in _FIG_INDEX:
         items = []
         for page_index in range(doc.page_count):
@@ -4932,7 +4934,7 @@ _MARGIN_CACHE: dict[int, tuple] = {}
 
 
 def _text_column(doc: fitz.Document, page_index: int) -> tuple[float, float]:
-    key = id(doc)
+    key = doc_key(doc)
     if key not in _MARGIN_CACHE:
         try:
             _MARGIN_CACHE[key] = _document_margins(doc)
@@ -4964,7 +4966,7 @@ _LABEL_WORDS: dict[int, object] = {}
 
 def _page_words(doc: fitz.Document):
     from pdfval import ocr
-    key = id(doc)
+    key = doc_key(doc)
     if key not in _LABEL_WORDS:
         _LABEL_WORDS[key] = ocr.PageWords(doc)
     return _LABEL_WORDS[key]
@@ -5318,7 +5320,7 @@ _ELSEWHERE_AREA_RATIO = 4.0  # a counterpart elsewhere this much larger or small
 
 
 def _page_artwork_boxes(doc: fitz.Document, page_index: int) -> list["fitz.Rect"]:
-    key = (id(doc), page_index)
+    key = (doc_key(doc), page_index)
     if key not in _PAGE_ART_CACHE:
         rect = doc[page_index].rect
         _PAGE_ART_CACHE[key] = _artwork_boxes(doc, page_index, rect.y0, rect.y1)
@@ -5328,7 +5330,7 @@ def _page_artwork_boxes(doc: fitz.Document, page_index: int) -> list["fitz.Rect"
 def _cached_fingerprint(doc: fitz.Document, page_index: int, bbox: tuple):
     # A whole-document crawl checks the same page's candidates against every
     # still-unmatched figure - fingerprinted once here, not once per figure.
-    key = (id(doc), page_index, tuple(round(v, 1) for v in bbox))
+    key = (doc_key(doc), page_index, tuple(round(v, 1) for v in bbox))
     if key not in _ART_FP_CACHE:
         try:
             _ART_FP_CACHE[key] = imagefp.fingerprint(doc, page_index, bbox)
@@ -9798,7 +9800,7 @@ def _nearby_squashed(doc: fitz.Document, pages: list[int]) -> str:
     """The text of these pages and two either side, as one run of letters and
     digits - page references and bracketed cross-references taken out."""
     want = tuple(sorted({p + d for p in pages for d in range(-2, 3) if 0 <= p + d < doc.page_count}))
-    key = (id(doc), want)
+    key = (doc_key(doc), want)
     if key not in _SQUASHED_PAGES:
         _SQUASHED_PAGES[key] = "".join(_audit_tokens(" ".join(doc[p].get_text("text") for p in want)))
     return _SQUASHED_PAGES[key]
@@ -10137,7 +10139,7 @@ def _document_squashed_text(doc: fitz.Document) -> str:
     lines with dot leaders) are cut out first - a heading LISTED in the other
     document's table of contents is not the same as its section being printed
     there."""
-    key = (id(doc), doc.page_count)
+    key = (doc_key(doc), doc.page_count)
     if key not in _DOC_TEXT_CACHE:
         parts = []
         for i in range(doc.page_count):
@@ -10331,8 +10333,8 @@ def compare_chapters(
     size_scale = (act_body / exp_body) if exp_body and act_body else 1.0
     if exp_body and act_body:
         biggest = max(exp_body, act_body)
-        _FIGURE_MIN_BY_DOC[id(expected)] = _FIGURE_MIN_SIDE * exp_body / biggest
-        _FIGURE_MIN_BY_DOC[id(actual)] = _FIGURE_MIN_SIDE * act_body / biggest
+        _FIGURE_MIN_BY_DOC[doc_key(expected)] = _FIGURE_MIN_SIDE * exp_body / biggest
+        _FIGURE_MIN_BY_DOC[doc_key(actual)] = _FIGURE_MIN_SIDE * act_body / biggest
 
     # Topics: every heading both documents have, at every level, matched in
     # order. Content is compared only inside its own topic, straight across.
@@ -10966,6 +10968,15 @@ CATEGORIES = [
              "columns. What a cell or row says - changed words, a missing row, a lost space - is Content."},
     {"key": "formatting", "label": "Formatting",
      "help": "The same text set visibly differently - printed on a shaded box in one document only."},
+    # Only ever filled when the optional AI review is switched on. It carries
+    # the page-by-page sweep's own gaps, boxed where they were measured, with
+    # the model's reading of what they mean - findings no named rule produced.
+    # The completeness sweep: every mirrored page measured and compared as a
+    # whole, so a difference no rule names is still found. Filled whether or
+    # not the optional AI review runs; when it does, its notes join it here.
+    {"key": "sweep", "label": "Page sweep",
+     "help": "Differences found by measuring both pages and comparing them, rather than by a named "
+             "rule - words, links or tables on one page and not its counterpart. Shown for review."},
 ]
 CATEGORY_LABEL = {c["key"]: c["label"] for c in CATEGORIES}
 

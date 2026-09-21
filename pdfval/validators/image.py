@@ -32,6 +32,8 @@ above it reflows.
 """
 from __future__ import annotations
 
+from pdfval.docid import doc_key
+
 import itertools
 import re
 from dataclasses import dataclass
@@ -200,14 +202,14 @@ class _Context:
         """Fingerprints are memoised: the same figure is compared against many
         candidates, and rasterising its region once per comparison dominated
         the check's run time."""
-        key = (id(doc), page, tuple(round(v, 1) for v in bbox))
+        key = (doc_key(doc), page, tuple(round(v, 1) for v in bbox))
         if key not in self._fingerprints:
             self._fingerprints[key] = imagefp.fingerprint(doc, page, bbox)
         return self._fingerprints[key]
 
     def render(self, doc: fitz.Document, page: int, bbox: tuple):
         """Memoised common-scale render, for the sliding second opinion."""
-        key = (id(doc), page, tuple(round(v, 1) for v in bbox))
+        key = (doc_key(doc), page, tuple(round(v, 1) for v in bbox))
         if key not in self._renders:
             self._renders[key] = imagefp.render_gray(doc, page, bbox)
         return self._renders[key]
