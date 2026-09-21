@@ -190,7 +190,7 @@ def parse_topic(path: str, raw: bytes) -> Topic:
                 words.append(child.tail)
 
     walk(root)
-    text = " ".join(" ".join(words).split())
+    text = clean(" ".join(words))
     return Topic(path=path, title=title, text=text, notes=notes,
                  list_items=list_items, tables=tables, xml=raw.decode("utf-8", "replace"))
 
@@ -239,7 +239,15 @@ def pdf_sections(pdf_path: str) -> list[dict]:
                       for t in doc[p].find_tables().tables]
         except Exception:
             tables = []
-        joined = " ".join(" ".join(text).split())
+        # The heading itself and the page number printed at the top of the page
+        # are furniture, not the section's words - left in, every section
+        # opens with a red mark for its own title.
+        lines = [ln for ln in text if not _TOC_LEADER.match(ln.strip())]
+        while lines and (lines[0].strip().isdigit()
+                         or _key(lines[0]) == _key(entry.title)
+                         or _key(lines[0]).startswith(_key(entry.title)[:24])):
+            lines.pop(0)
+        joined = clean(" ".join(lines))
         notes = len(_NOTE_LABEL.findall(joined))
         out.append({"title": entry.title, "page": entry.page + 1, "text": joined,
                     "level": entry.level, "start": start, "stop": stop,
@@ -249,6 +257,27 @@ def pdf_sections(pdf_path: str) -> list[dict]:
 
 _MARKER_LINE = re.compile(r"^(?:[•●▪◦]|\d{1,2}[.)])\s*\S")
 _NOTE_LABEL = re.compile(r"\b(NOTE|TIP|WARNING|CAUTION|IMPORTANT)\b\s*:", re.IGNORECASE)
+# A word broken across a line end - "war-" / "ranty" - is one word, not two,
+# and not a difference from the topic that spells it whole.
+_WRAP_HYPHEN = re.compile(r"(\w)-\s+(?=[a-z])")
+# Bullet glyphs are the TEMPLATE's: a topic says <li>, the PDF draws a dot.
+# Marking every one of them red says nothing about the content.
+_BULLETS = re.compile("[\u2022\u25cf\u25aa\u25e6\u2023\u2043]")
+
+
+# A contents listing - "Copyright......... 2" - belongs to no section. The
+# pages carry no bookmark of their own, so they fall inside whichever section
+# precedes them and read as content that topic failed to write.
+_TOC_LEADER = re.compile(r"^.*\.{4,}.*$", re.MULTILINE)
+
+
+def clean(text: str) -> str:
+    """A PDF section's text as the TOPIC would have written it: wrap hyphens
+    closed up, bullet glyphs dropped, whitespace normalised. Both sides are
+    cleaned the same way, so the comparison is like for like."""
+    text = _WRAP_HYPHEN.sub(r"\1", text or "")
+    text = _BULLETS.sub(" ", text)
+    return " ".join(text.split())
 
 
 # --- matching topics to sections --------------------------------------------
@@ -259,6 +288,37 @@ TITLE_MATCH = 0.72   # below this two titles are not the same section
 WORDS_SHOWN = 15     # of the words only one side has, before "and N more"
 _WORD_RE = re.compile(r"[\wÀ-￿]+", re.UNICODE)
 _MIN_WORD = 3        # shorter tokens are markers and noise, not content
+
+
+def diff_parts(a_text: str, b_text: str) -> tuple[list, list]:
+    """Both sides as [(text, differs)] runs, word by word.
+
+    The report shows the two texts side by side in full - a reviewer needs to
+    read what is there, not a list of loose words - so the difference has to
+    be marked IN them. Everything that matches stays plain; only what is on
+    one side and not the other is marked, which is what "highlight the issues"
+    means when most of the page is identical.
+    """
+    a_words, b_words = (a_text or "").split(), (b_text or "").split()
+    fold_a = [w.casefold().strip(".,;:()\u201c\u201d\"'") for w in a_words]
+    fold_b = [w.casefold().strip(".,;:()\u201c\u201d\"'") for w in b_words]
+    a_out: list = []
+    b_out: list = []
+
+    def add(bag, words, differs):
+        if not words:
+            return
+        text = " ".join(words)
+        if bag and bag[-1][1] == differs:
+            bag[-1] = (bag[-1][0] + " " + text, differs)
+        else:
+            bag.append((text, differs))
+
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
+            a=fold_a, b=fold_b, autojunk=False).get_opcodes():
+        add(a_out, a_words[i1:i2], tag != "equal")
+        add(b_out, b_words[j1:j2], tag != "equal")
+    return a_out, b_out
 
 
 def _key(title: str) -> str:
@@ -333,14 +393,19 @@ def compare(topics: list, sections: list) -> list[dict]:
             continue
         missing = _only_in(sec["text"], topic.text)
         extra = _only_in(topic.text, sec["text"])
-        if missing:
-            out.append({"kind": "words-not-in-topic", "severity": "high",
-                        "topic": topic.path, "title": sec["title"], "page": sec["page"],
-                        "detail": f"Printed in the PDF here and not in the topic: {missing}."})
-        if extra:
-            out.append({"kind": "words-not-published", "severity": "high",
-                        "topic": topic.path, "title": sec["title"], "page": sec["page"],
-                        "detail": f"In the topic and not printed in the PDF here: {extra}."})
+        if missing or extra:
+            topic_parts, pdf_parts = diff_parts(topic.text, sec["text"])
+            said = []
+            if missing:
+                said.append(f"in the PDF and not in the topic: {missing}")
+            if extra:
+                said.append(f"in the topic and not printed: {extra}")
+            out.append({
+                "kind": "words-differ", "severity": "high",
+                "topic": topic.path, "title": sec["title"], "page": sec["page"],
+                "detail": "; ".join(said).capitalize() + ".",
+                "topic_parts": topic_parts, "pdf_parts": pdf_parts,
+            })
         # Structure. The topic DECLARES these; the PDF DRAWS them. A count that
         # disagrees means something was dropped or added between the two, which
         # is a content question - unlike how the template chooses to style them,
@@ -436,17 +501,34 @@ def write_report(findings: list[dict], out_dir: str, pdf_path: str,
     rows = []
     for n, f in enumerate(findings, start=1):
         shot = shots.get(id(f))
-        img = (f'<img src="{html.escape(shot)}" alt="PDF page {f.get("page")}">' if shot else
-               '<div class="noshot">no screenshot</div>')
+        img = (f'<details class="shot"><summary>PDF page {f.get("page")}</summary>'
+               f'<img src="{html.escape(shot)}" alt="PDF page {f.get("page")}"></details>'
+               if shot else "")
+        # The two sides in full, with ONLY what differs marked. A reviewer has
+        # to read what is actually there; a list of loose words out of context
+        # cannot be checked against the page.
+        # PDF on the LEFT (the published page a reviewer is holding), the
+        # ditamap topic on the RIGHT (the source it should have come from).
+        left = _marked(f.get("pdf_parts"))
+        right = _marked(f.get("topic_parts"))
+        pair = ""
+        if left or right:
+            pair = f"""
+          <div class="pair">
+            <div class="side"><h4>PDF <span>{f'p.{f["page"]}' if f.get('page') else ''}</span></h4>
+              <div class="body">{left or _EMPTY}</div></div>
+            <div class="side"><h4>Topic <span>(ditamap)</span></h4>
+              <div class="body">{right or _EMPTY}</div></div>
+          </div>"""
         rows.append(f"""
         <article class="f {html.escape(f['severity'])}">
           <header><span class="n">{n}</span>
             <span class="kind">{html.escape(_KIND_LABEL.get(f['kind'], f['kind']))}</span>
             <span class="where">{html.escape(f.get('title') or '')}
               {f'&middot; PDF p.{f["page"]}' if f.get('page') else ''}</span></header>
-          <p>{html.escape(f['detail'])}</p>
+          <p class="detail">{html.escape(f['detail'])}</p>
           {f'<p class="topic">{html.escape(f["topic"])}</p>' if f.get('topic') else ''}
-          <div class="shot">{img}</div>
+          {pair}{img}
         </article>""")
     summary = " ".join(
         f'<span class="pill">{html.escape(_KIND_LABEL.get(k, k))}: <b>{v}</b></span>'
@@ -462,7 +544,24 @@ def write_report(findings: list[dict], out_dir: str, pdf_path: str,
     return path
 
 
+_EMPTY = '<span class="none">\u2014 nothing here \u2014</span>'
+
+
+def _marked(parts) -> str:
+    """Runs of text, with only the differing ones wrapped in a red mark."""
+    import html as _h
+
+    if not parts:
+        return ""
+    out = []
+    for text, differs in parts:
+        piece = _h.escape(text)
+        out.append(f'<mark>{piece}</mark>' if differs else piece)
+    return " ".join(out)
+
+
 _KIND_LABEL = {
+    "words-differ": "Wording differs",
     "topic-not-published": "Topic not published",
     "section-not-in-topics": "In the PDF, not in the topics",
     "words-not-in-topic": "Words missing from the topic",
@@ -473,33 +572,48 @@ _KIND_LABEL = {
 _REPORT_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Topics vs PDF</title><style>
-:root {{ --line:#e6e8ec; --muted:#667085; --high:#a01515; --med:#8a5a00; }}
+:root {{ --line:#e6e8ec; --muted:#667085; --high:#c0392b; --med:#8a5a00; }}
 * {{ box-sizing:border-box }}
-body {{ margin:0; font:14px/1.5 -apple-system,Segoe UI,Roboto,Arial,sans-serif; color:#1a1a1a; background:#f5f6f8 }}
-.wrap {{ max-width:1080px; margin:0 auto; padding:22px 22px 120px }}
+body {{ margin:0; font:14px/1.55 -apple-system,Segoe UI,Roboto,Arial,sans-serif; color:#1a1a1a; background:#f5f6f8 }}
+.wrap {{ max-width:1380px; margin:0 auto; padding:22px 22px 120px }}
 h1 {{ font-size:20px; margin:0 0 4px }}
-.meta {{ color:var(--muted); font-size:12px; margin-bottom:14px }}
+.meta {{ color:var(--muted); font-size:12px; margin-bottom:12px }}
 .pill {{ display:inline-block; background:#fff; border:1px solid var(--line); border-radius:999px;
         padding:3px 10px; font-size:12px; margin:0 6px 6px 0 }}
 .pill.ok {{ border-color:#bfe3c9; color:#1a7a34 }}
 .f {{ background:#fff; border:1px solid var(--line); border-left-width:4px; border-radius:8px;
-     padding:12px 14px; margin-bottom:12px }}
+     padding:12px 14px; margin-bottom:14px }}
 .f.high {{ border-left-color:var(--high) }} .f.medium {{ border-left-color:var(--med) }}
 .f header {{ display:flex; gap:10px; align-items:baseline; margin-bottom:6px; flex-wrap:wrap }}
 .n {{ font-weight:700; color:var(--muted) }}
 .kind {{ font-weight:700 }}
 .where {{ color:var(--muted); font-size:12px }}
-.topic {{ color:var(--muted); font-size:11px; font-family:ui-monospace,Menlo,monospace; overflow-wrap:anywhere }}
-.shot img {{ max-width:100%; border:1px solid var(--line); border-radius:6px; margin-top:8px }}
-.noshot {{ color:#aab; font-size:12px; margin-top:6px }}
+.detail {{ margin:0 0 8px }}
+.topic {{ color:var(--muted); font-size:11px; font-family:ui-monospace,Menlo,monospace;
+         overflow-wrap:anywhere; margin:0 0 8px }}
+/* The two sides, side by side. Only what differs is red - everything that
+   matches stays plain, or the marking says nothing. */
+.pair {{ display:grid; grid-template-columns:1fr 1fr; gap:12px }}
+@media (max-width:900px) {{ .pair {{ grid-template-columns:1fr }} }}
+.side {{ border:1px solid var(--line); border-radius:6px; background:#fcfcfd; min-width:0 }}
+.side h4 {{ margin:0; padding:6px 10px; font-size:11px; text-transform:uppercase; letter-spacing:.04em;
+           color:var(--muted); border-bottom:1px solid var(--line); background:#f7f8fa;
+           border-radius:6px 6px 0 0 }}
+.side h4 span {{ font-weight:400; text-transform:none; letter-spacing:0 }}
+.side .body {{ padding:9px 11px; max-height:340px; overflow:auto; font-size:13px; overflow-wrap:anywhere }}
+mark {{ background:#fde0de; color:#8a1711; font-weight:600; border-radius:2px; padding:0 2px }}
+.none {{ color:#aab }}
+details.shot {{ margin-top:10px }}
+details.shot summary {{ cursor:pointer; color:var(--muted); font-size:12px }}
+details.shot img {{ max-width:100%; border:1px solid var(--line); border-radius:6px; margin-top:8px }}
 .ok {{ color:#1a7a34 }}
 </style></head><body><div class="wrap">
 <h1>Topics vs published PDF</h1>
 <div class="meta">PDF: <b>{pdf}</b> &middot; map: {ditamap}<br>
 {topics} topics compared against {sections} PDF sections &middot; <b>{total}</b> differences</div>
 <div>{summary}</div>
-<p class="meta">Words and structure are compared. How the publishing template STYLES a note,
-a list or a heading is not - that is the template's decision, not a content defect.</p>
+<p class="meta">Both sides are shown in full; <mark>only what differs is marked</mark>. Words and
+structure are compared - how the publishing template STYLES a note, a list or a heading is not.</p>
 {rows}
 </div></body></html>"""
 

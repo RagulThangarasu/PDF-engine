@@ -42,15 +42,33 @@ def test_words_in_the_pdf_and_not_the_topic_are_reported():
     sec = _section("Connecting the Receiver",
                    t.text + " Then slide the power switch to the on position.",
                    notes=1, items=2, tables=[3])
-    kinds = {f["kind"] for f in A.compare([t], [sec])}
-    assert "words-not-in-topic" in kinds
-    assert "words-not-published" not in kinds
+    found = [f for f in A.compare([t], [sec]) if f["kind"] == "words-differ"]
+    assert found and "in the pdf and not in the topic" in found[0]["detail"].lower()
+    assert "in the topic and not printed" not in found[0]["detail"].lower()
 
 
 def test_words_in_the_topic_and_not_the_pdf_are_reported():
     t = A.parse_topic("/x/t1.dita", _TOPIC)
     sec = _section("Connecting the Receiver", "Connect the HDMI cable.", notes=1, items=2, tables=[3])
-    assert any(f["kind"] == "words-not-published" for f in A.compare([t], [sec]))
+    found = [f for f in A.compare([t], [sec]) if f["kind"] == "words-differ"]
+    assert found and "in the topic and not printed" in found[0]["detail"].lower()
+
+
+def test_both_sides_come_back_with_only_the_differences_marked():
+    """The report shows each side in full - a reviewer reads what is there -
+    so the difference is marked IN the text, not listed away from it."""
+    t = A.parse_topic("/x/t1.dita", _TOPIC)
+    sec = _section("Connecting the Receiver", t.text + " Slide the power switch on.",
+                   notes=1, items=2, tables=[3])
+    f = [x for x in A.compare([t], [sec]) if x["kind"] == "words-differ"][0]
+    assert any(not differs for _, differs in f["topic_parts"])      # matching text stays plain
+    marked = [text for text, differs in f["pdf_parts"] if differs]
+    assert marked and "power switch" in " ".join(marked)
+
+
+def test_identical_text_marks_nothing():
+    a, b = A.diff_parts("the same words on both sides", "the same words on both sides")
+    assert not any(d for _, d in a) and not any(d for _, d in b)
 
 
 def test_a_topic_with_no_section_and_a_section_with_no_topic():
