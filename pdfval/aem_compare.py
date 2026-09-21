@@ -351,13 +351,24 @@ def _words(text: str):
     return Counter(w.casefold() for w in _WORD_RE.findall(text or "") if len(w) >= _MIN_WORD)
 
 
-def _only_in(mine: str, theirs: str) -> str:
+def only_in(mine: str, theirs: str) -> list:
+    """Every word `mine` prints more often than `theirs` does - all of them.
+
+    The report names them all. A clipped list ("and 109 more") cannot be
+    checked against anything, which is the one thing a reviewer has to do
+    with it.
+    """
     a, b = _words(mine), _words(theirs)
-    short = [w for w, n in a.items() if n > b.get(w, 0)]
-    if not short:
+    return sorted(w for w, n in a.items() if n > b.get(w, 0))
+
+
+def _only_in(mine: str, theirs: str) -> str:
+    """The same words as one sentence, for the finding's headline."""
+    words = only_in(mine, theirs)
+    if not words:
         return ""
-    shown = ", ".join(f"“{w}”" for w in short[:WORDS_SHOWN])
-    return shown + (f" and {len(short) - WORDS_SHOWN} more" if len(short) > WORDS_SHOWN else "")
+    shown = ", ".join(f"“{w}”" for w in words[:WORDS_SHOWN])
+    return shown + (f" and {len(words) - WORDS_SHOWN} more" if len(words) > WORDS_SHOWN else "")
 
 
 def _covers(outer: dict, inner: dict) -> bool:
@@ -395,8 +406,9 @@ def compare(topics: list, sections: list, pdf_path: str = "") -> list[dict]:
                         "detail": (f"The PDF prints “{sec['title']}” on page {sec['page']}, and no "
                                    f"topic in the map carries that heading.")})
             continue
-        missing = _only_in(sec["text"], topic.text)
-        extra = _only_in(topic.text, sec["text"])
+        missing_words = only_in(sec["text"], topic.text)
+        extra_words = only_in(topic.text, sec["text"])
+        missing, extra = _only_in(sec["text"], topic.text), _only_in(topic.text, sec["text"])
         if missing or extra:
             topic_parts, pdf_parts = diff_parts(topic.text, sec["text"])
             said = []
@@ -409,6 +421,7 @@ def compare(topics: list, sections: list, pdf_path: str = "") -> list[dict]:
                 "topic": topic.path, "title": sec["title"], "page": sec["page"],
                 "detail": "; ".join(said).capitalize() + ".",
                 "topic_parts": topic_parts, "pdf_parts": pdf_parts,
+                "missing_words": missing_words, "extra_words": extra_words,
             })
         # Structure. The topic DECLARES these; the PDF DRAWS them. A count that
         # disagrees means something was dropped or added between the two, which
@@ -504,62 +517,45 @@ _SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 def write_report(findings: list[dict], out_dir: str, pdf_path: str,
                  ditamap: str, topics: int, sections: int,
-                 shots: dict | None = None) -> str:
-    """One self-contained HTML file: every difference, with its screenshot."""
+                 shots: dict | None = None, topic_list: list | None = None) -> str:
+    """One self-contained HTML file, organised the way a reviewer works: topic
+    by topic, each with its verdict, every differing word named in full, and
+    both sides as pictures."""
     import html
-    from collections import Counter
+    from collections import Counter, OrderedDict
 
     os.makedirs(out_dir, exist_ok=True)
     shots = shots or {}
-    findings = sorted(findings, key=lambda f: (_SEVERITY_ORDER.get(f["severity"], 3), f.get("page") or 0))
     counts = Counter(f["kind"] for f in findings)
-    rows = []
-    for n, f in enumerate(findings, start=1):
-        shot = shots.get(id(f))
-        tshot = (shots.get(("topic", f.get("topic"))) if f.get("topic") else None)
-        # Both sides as PICTURES, side by side: the page as it prints, and the
-        # topic drawn as what its markup declares. A reviewer checks a page by
-        # looking at it, not by reading a list of words.
-        views = ""
-        if shot or tshot:
-            left = (f'<img src="{html.escape(shot)}" alt="PDF page {f.get("page")}">'
-                    if shot else _EMPTY)
-            right = (f'<img src="{html.escape(tshot)}" alt="topic render">' if tshot else _EMPTY)
-            views = f"""
-          <div class="pair views">
-            <div class="side"><h4>PDF <span>{f'p.{f["page"]}' if f.get('page') else ''} - as printed</span></h4>
-              <div class="shotbody">{left}</div></div>
-            <div class="side"><h4>Topic <span>(ditamap) - as its markup declares</span></h4>
-              <div class="shotbody">{right}</div></div>
-          </div>"""
-        img = views
-        # The two sides in full, with ONLY what differs marked. A reviewer has
-        # to read what is actually there; a list of loose words out of context
-        # cannot be checked against the page.
-        # PDF on the LEFT (the published page a reviewer is holding), the
-        # ditamap topic on the RIGHT (the source it should have come from).
-        left = _marked(f.get("pdf_parts"))
-        right = _marked(f.get("topic_parts"))
-        pair = ""
-        if left or right:
-            pair = f"""
-          <div class="pair">
-            <div class="side"><h4>PDF <span>{f'p.{f["page"]}' if f.get('page') else ''}</span></h4>
-              <div class="body">{left or _EMPTY}</div></div>
-            <div class="side"><h4>Topic <span>(ditamap)</span></h4>
-              <div class="body">{right or _EMPTY}</div></div>
-          </div>"""
-        rows.append(f"""
-        <article class="f {html.escape(f['severity'])}">
-          <header><span class="n">{n}</span>
-            <span class="kind">{html.escape(_KIND_LABEL.get(f['kind'], f['kind']))}</span>
-            <span class="where">{html.escape(f.get('title') or '')}
-              {f'&middot; PDF p.{f["page"]}' if f.get('page') else ''}</span></header>
-          <p class="detail">{html.escape(f['detail'])}</p>
-          {f'<p class="topic">{html.escape(f["topic"])}</p>' if f.get('topic') else ''}
-          {img}
-          {f'<details class="words"><summary>the words, side by side</summary>{pair}</details>' if pair else ''}
-        </article>""")
+
+    # Group by topic. A reviewer opens one topic, fixes it, opens the next -
+    # findings scattered by severity across fourteen topics cannot be worked.
+    groups: "OrderedDict[str, dict]" = OrderedDict()
+    for t in topic_list or []:
+        groups[t.path] = {"title": t.title, "path": t.path, "findings": [], "topic": t}
+    for f in findings:
+        key = f.get("topic") or "\u2014 no topic \u2014"
+        g = groups.setdefault(key, {"title": f.get("title") or key, "path": f.get("topic"),
+                                    "findings": [], "topic": None})
+        g["findings"].append(f)
+
+    blocks = []
+    for key, g in groups.items():
+        fs = g["findings"]
+        clean_topic = not fs
+        badge = ('<span class="verdict ok">no differences</span>' if clean_topic else
+                 f'<span class="verdict bad">{len(fs)} issue{"s" if len(fs) != 1 else ""}</span>')
+        tshot = shots.get(("topic", g["path"])) if g["path"] else None
+        rows = []
+        for n, f in enumerate(fs, start=1):
+            rows.append(_finding_html(f, n, shots, html))
+        blocks.append(f"""
+      <section class="topic-block {'clean' if clean_topic else 'has-issues'}">
+        <h2>{html.escape(g['title'] or '')} {badge}</h2>
+        {f'<p class="path">{html.escape(g["path"])}</p>' if g.get('path') else ''}
+        {"".join(rows) or '<p class="ok">Everything this topic declares is printed in the PDF, and everything the PDF prints here is in the topic.</p>'}
+      </section>""")
+
     summary = " ".join(
         f'<span class="pill">{html.escape(_KIND_LABEL.get(k, k))}: <b>{v}</b></span>'
         for k, v in counts.most_common())
@@ -567,11 +563,61 @@ def write_report(findings: list[dict], out_dir: str, pdf_path: str,
         pdf=html.escape(os.path.basename(pdf_path)), ditamap=html.escape(ditamap),
         topics=topics, sections=sections, total=len(findings),
         summary=summary or '<span class="pill ok">No differences found</span>',
-        rows="\n".join(rows) or '<p class="ok">Every topic matches the PDF section built from it.</p>')
+        rows="\n".join(blocks) or '<p class="ok">Every topic matches the PDF section built from it.</p>')
     path = os.path.join(out_dir, "aem-vs-pdf.html")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(doc)
     return path
+
+
+def _chips(words: list, css: str, label: str, html) -> str:
+    """Every word, named. Not a sample - the list is the finding."""
+    if not words:
+        return ""
+    chips = "".join(f'<span class="chip {css}">{html.escape(w)}</span>' for w in words)
+    return f'<div class="chips"><span class="chip-label">{label} ({len(words)})</span>{chips}</div>'
+
+
+def _finding_html(f: dict, n: int, shots: dict, html) -> str:
+    shot = shots.get(id(f))
+    tshot = shots.get(("topic", f.get("topic"))) if f.get("topic") else None
+    views = ""
+    if shot or tshot:
+        left = (f'<img src="{html.escape(shot)}" alt="PDF page {f.get("page")}">' if shot else _EMPTY)
+        right = (f'<img src="{html.escape(tshot)}" alt="topic render">' if tshot else _EMPTY)
+        views = f'''<div class="pair views">
+            <div class="side"><h4>PDF <span>{f"p.{f['page']}" if f.get("page") else ""} - as printed</span></h4>
+              <div class="shotbody">{left}</div></div>
+            <div class="side"><h4>Topic <span>(ditamap) - as its markup declares</span></h4>
+              <div class="shotbody">{right}</div></div>
+          </div>'''
+    # The complete lists, every word named.
+    lists = _chips(f.get("missing_words") or [], "pdf", "In the PDF, missing from the topic", html)
+    lists += _chips(f.get("extra_words") or [], "topic", "In the topic, not printed in the PDF", html)
+    if f.get("phrases"):
+        where = "rendered by the PDF, not marked up in the topic" if f.get("in_pdf_only") \
+            else f"marked <{f.get('role')}> in the topic, rendered plain by the PDF"
+        lists += _chips(f["phrases"], "pdf" if f.get("in_pdf_only") else "topic", where, html)
+    left_words = _marked(f.get("pdf_parts"))
+    right_words = _marked(f.get("topic_parts"))
+    words = ""
+    if left_words or right_words:
+        words = f'''<details class="words"><summary>read the two texts side by side</summary>
+          <div class="pair">
+            <div class="side"><h4>PDF <span>{f"p.{f['page']}" if f.get("page") else ""}</span></h4>
+              <div class="body">{left_words or _EMPTY}</div></div>
+            <div class="side"><h4>Topic <span>(ditamap)</span></h4>
+              <div class="body">{right_words or _EMPTY}</div></div>
+          </div></details>'''
+    return f"""
+        <article class="f {html.escape(f['severity'])}">
+          <header><span class="n">{n}</span>
+            <span class="kind">{html.escape(_KIND_LABEL.get(f['kind'], f['kind']))}</span>
+            <span class="where">{html.escape(f.get('title') or '')}
+              {f'&middot; PDF p.{f["page"]}' if f.get('page') else ''}</span></header>
+          <p class="detail">{html.escape(f['detail'])}</p>
+          {lists}{views}{words}
+        </article>"""
 
 
 _EMPTY = '<span class="none">\u2014 nothing here \u2014</span>'
@@ -633,6 +679,23 @@ h1 {{ font-size:20px; margin:0 0 4px }}
 .side .body {{ padding:9px 11px; max-height:340px; overflow:auto; font-size:13px; overflow-wrap:anywhere }}
 mark {{ background:#fde0de; color:#8a1711; font-weight:600; border-radius:2px; padding:0 2px }}
 .none {{ color:#aab }}
+/* Per-topic blocks: a reviewer opens one topic, fixes it, opens the next. */
+.topic-block {{ margin:0 0 22px }}
+.topic-block h2 {{ font-size:16px; margin:0 0 2px; display:flex; gap:10px; align-items:center }}
+.topic-block.clean h2 {{ color:var(--muted) }}
+.verdict {{ font-size:11px; font-weight:700; border-radius:999px; padding:2px 9px }}
+.verdict.bad {{ background:#fdecec; color:var(--high) }}
+.verdict.ok {{ background:#e7f6ec; color:#1a7a34 }}
+.path {{ color:var(--muted); font-size:11px; font-family:ui-monospace,Menlo,monospace;
+        overflow-wrap:anywhere; margin:0 0 8px }}
+/* Every differing word named - the list IS the finding, never a sample. */
+.chips {{ margin:6px 0 10px; line-height:2.1 }}
+.chip-label {{ font-size:11px; color:var(--muted); text-transform:uppercase;
+              letter-spacing:.04em; margin-right:8px }}
+.chip {{ display:inline-block; border-radius:4px; padding:1px 7px; margin:0 4px 3px 0;
+        font-size:12px; font-weight:600 }}
+.chip.pdf {{ background:#fde0de; color:#8a1711 }}
+.chip.topic {{ background:#fff0d6; color:#7a4a00 }}
 .views {{ margin:10px 0 }}
 .shotbody {{ padding:8px; background:#fff; max-height:520px; overflow:auto }}
 .shotbody img {{ width:100%; border:1px solid var(--line); border-radius:4px; display:block }}
@@ -693,7 +756,8 @@ def run(pdf_path: str, ditamap: str, out_dir: str, base: str = "", user: str = "
         rel = topic_render_shot(topic, out_dir, f"topic_{n}")
         if rel:
             shots[("topic", topic.path)] = rel
-    path = write_report(findings, out_dir, pdf_path, ditamap, len(topics), len(sections), shots)
+    path = write_report(findings, out_dir, pdf_path, ditamap, len(topics), len(sections),
+                        shots, topic_list=topics)
     progress(f"report: {path}")
     return path
 
@@ -892,6 +956,7 @@ def _role_finding(topic, section: dict, role: str, phrases: list, published: boo
         "kind": f"style-{role}", "severity": "high" if role != "link" else "medium",
         "topic": topic.path, "title": section["title"], "page": section["page"],
         "detail": detail, "topic_parts": [], "pdf_parts": [],
+        "phrases": list(phrases), "role": role, "in_pdf_only": published,
     }
 
 
