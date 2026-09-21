@@ -286,7 +286,10 @@ import difflib  # noqa: E402
 
 TITLE_MATCH = 0.72   # below this two titles are not the same section
 WORDS_SHOWN = 15     # of the words only one side has, before "and N more"
-_WORD_RE = re.compile(r"[\wÀ-￿]+", re.UNICODE)
+# Letters and digits only, plus an inner apostrophe. A quote or bracket
+# carried along with a word produced chips like `"the` - two spellings of
+# the same word, and a difference that is not one.
+_WORD_RE = re.compile(r"[^\W_]+(?:[\u2019'][^\W_]+)*", re.UNICODE)
 _MIN_WORD = 3        # shorter tokens are markers and noise, not content
 
 
@@ -461,8 +464,19 @@ SHOTS = "shots"
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
 
-def pdf_shot(pdf_path: str, page: int, out_dir: str, name: str) -> str | None:
-    """The PDF page a finding is on, as an image beside the finding."""
+HIGHLIGHT_WORDS = 30   # marked on one page before the page is all red anyway
+HIGHLIGHT_MIN = 4      # shorter words match everywhere and mark nothing useful
+
+
+def pdf_shot(pdf_path: str, page: int, out_dir: str, name: str,
+             words: list | None = None) -> str | None:
+    """The PDF page a finding is on, with the differing words marked ON it.
+
+    A picture of a page says nothing by itself - the reviewer still has to
+    hunt through it for the problem. Marking the words this finding is about
+    where they are actually printed is the difference between showing a page
+    and showing a finding.
+    """
     import fitz
 
     if not page:
@@ -471,9 +485,20 @@ def pdf_shot(pdf_path: str, page: int, out_dir: str, name: str) -> str | None:
         doc = fitz.open(pdf_path)
         if not (1 <= page <= doc.page_count):
             return None
+        pg = doc[page - 1]
+        for word in (words or [])[:HIGHLIGHT_WORDS]:
+            if len(word) < HIGHLIGHT_MIN:
+                continue
+            try:
+                for rect in pg.search_for(word)[:8]:
+                    ann = pg.add_highlight_annot(rect)
+                    ann.set_colors(stroke=(0.99, 0.72, 0.70))
+                    ann.update()
+            except Exception:
+                continue
         os.makedirs(os.path.join(out_dir, SHOTS), exist_ok=True)
         rel = f"{SHOTS}/{name}.png"
-        doc[page - 1].get_pixmap(matrix=fitz.Matrix(1.6, 1.6), alpha=False).save(
+        pg.get_pixmap(matrix=fitz.Matrix(1.7, 1.7), alpha=False).save(
             os.path.join(out_dir, rel))
         return rel
     except Exception:
@@ -570,6 +595,19 @@ def write_report(findings: list[dict], out_dir: str, pdf_path: str,
     return path
 
 
+def _finding_words(f: dict) -> list:
+    """The words THIS finding is about - what gets marked on both pictures."""
+    words = list(f.get("missing_words") or []) + list(f.get("extra_words") or [])
+    for phrase in f.get("phrases") or []:
+        words += [w for w in _WORD_RE.findall(phrase) if len(w) >= HIGHLIGHT_MIN]
+    seen, out = set(), []
+    for w in words:
+        if w.casefold() not in seen:
+            seen.add(w.casefold())
+            out.append(w)
+    return out
+
+
 def _chips(words: list, css: str, label: str, html) -> str:
     """Every word, named. Not a sample - the list is the finding."""
     if not words:
@@ -580,7 +618,7 @@ def _chips(words: list, css: str, label: str, html) -> str:
 
 def _finding_html(f: dict, n: int, shots: dict, html) -> str:
     shot = shots.get(id(f))
-    tshot = shots.get(("topic", f.get("topic"))) if f.get("topic") else None
+    tshot = shots.get(("topic", id(f)))
     views = ""
     if shot or tshot:
         left = (f'<img src="{html.escape(shot)}" alt="PDF page {f.get("page")}">' if shot else _EMPTY)
@@ -745,17 +783,22 @@ def run(pdf_path: str, ditamap: str, out_dir: str, base: str = "", user: str = "
     progress(f"{len(sections)} sections in the PDF")
     findings = compare(topics, sections, pdf_path)
     progress(f"{len(findings)} differences")
+    # Each finding's OWN words are marked on both of its pictures, so the two
+    # point at the same thing. A page picture and a topic picture that merely
+    # sit beside each other leave the reviewer to find the problem twice.
     shots = {}
+    by_path = {t.path: t for t in topics}
+    progress("drawing each finding on both sides")
     for n, f in enumerate(findings, start=1):
-        rel = pdf_shot(pdf_path, f.get("page"), out_dir, f"pdf_{n}")
+        words = _finding_words(f)
+        rel = pdf_shot(pdf_path, f.get("page"), out_dir, f"pdf_{n}", words)
         if rel:
             shots[id(f)] = rel
-    # One render per topic, shared by every finding against it.
-    progress("drawing each topic from its markup")
-    for n, topic in enumerate(topics, start=1):
-        rel = topic_render_shot(topic, out_dir, f"topic_{n}")
-        if rel:
-            shots[("topic", topic.path)] = rel
+        topic = by_path.get(f.get("topic"))
+        if topic is not None:
+            rel = topic_render_shot(topic, out_dir, f"topic_{n}", words)
+            if rel:
+                shots[("topic", id(f))] = rel
     path = write_report(findings, out_dir, pdf_path, ditamap, len(topics), len(sections),
                         shots, topic_list=topics)
     progress(f"report: {path}")
@@ -1017,8 +1060,10 @@ _BLOCK_AS = {"p": "p", "li": "li", "ul": "ul", "ol": "ol", "sl": "ul", "sli": "l
              "xref": "span", "i": "i", "codeph": "code"}
 
 
-def render_topic_html(topic) -> str:
-    """The topic drawn as what its markup declares it to be."""
+def render_topic_html(topic, words: list | None = None) -> str:
+    """The topic drawn as what its markup declares it to be, with the words a
+    finding is about marked - the same marking the PDF picture carries, so
+    the two pictures point at the same thing."""
     import html as _h
 
     try:
@@ -1052,11 +1097,19 @@ def render_topic_html(topic) -> str:
         return inner
 
     body = walk(root)
+    if words:
+        pattern = "|".join(re.escape(w) for w in sorted(
+            {w for w in words if len(w) >= HIGHLIGHT_MIN}, key=len, reverse=True)[:HIGHLIGHT_WORDS])
+        if pattern:
+            # Only text, never inside a tag, or the markup is rewritten too.
+            body = re.sub(rf"(?<![<\w])({pattern})(?![\w>])",
+                          r"<mark>\1</mark>", body, flags=re.IGNORECASE)
     return (f"<!doctype html><meta charset=utf-8><title>{_h.escape(topic.title)}</title>"
-            f"<style>{_TOPIC_CSS}</style>{body}")
+            f"<style>{_TOPIC_CSS}mark{{background:#fde0de;color:#8a1711;"
+            f"border-radius:2px;padding:0 2px}}</style>{body}")
 
 
-def topic_render_shot(topic, out_dir: str, name: str) -> str | None:
+def topic_render_shot(topic, out_dir: str, name: str, words: list | None = None) -> str | None:
     """Render the topic to HTML and photograph it, so the report can show it."""
     if not os.path.exists(CHROME):
         return None
@@ -1065,7 +1118,7 @@ def topic_render_shot(topic, out_dir: str, name: str) -> str | None:
     os.makedirs(os.path.join(out_dir, SHOTS), exist_ok=True)
     html_path = os.path.join(out_dir, SHOTS, f"{name}.html")
     with open(html_path, "w", encoding="utf-8") as fh:
-        fh.write(render_topic_html(topic))
+        fh.write(render_topic_html(topic, words))
     rel = f"{SHOTS}/{name}.png"
     try:
         subprocess.run(
