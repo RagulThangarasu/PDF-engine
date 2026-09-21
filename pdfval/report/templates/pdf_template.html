@@ -17,7 +17,7 @@
              serious the finding is. */
           --c-content: #c0392b; --c-images: #2563eb; --c-links: #92400e;
           --c-lists: #92400e; --c-bold: #7c3aed; --c-tables: #7c3aed;
-          --c-formatting: #7c3aed; }
+          --c-formatting: #7c3aed; --c-sweep: #0f766e; }
   * { box-sizing: border-box; }
   [hidden] { display: none !important; }
   html, body { height: 100%; margin: 0; }
@@ -25,7 +25,11 @@
          display: flex; flex-direction: column; font-size: 14px; }
   .cat-content { --c: var(--c-content); } .cat-images { --c: var(--c-images); } .cat-links { --c: var(--c-links); }
   .cat-lists { --c: var(--c-lists); } .cat-bold { --c: var(--c-bold); } .cat-tables { --c: var(--c-tables); }
-  .cat-formatting { --c: var(--c-formatting); }
+  .cat-formatting { --c: var(--c-formatting); } .cat-sweep { --c: var(--c-sweep); }
+  /* An AI note is boxed where the sweep MEASURED the gap, never tinted: it
+     marks a region of the page - a panel, a picture - not words that changed. */
+  .box.cat-sweep { border: 2px solid var(--c-sweep) !important; background: transparent !important; opacity: 1; }
+  .box.cat-sweep.on { border-width: 3px !important; }
 
   .topbar { background: #fff; border-bottom: 1px solid var(--line); padding: 8px 14px; display: flex;
             flex-wrap: wrap; gap: 8px 14px; align-items: center; }
@@ -405,7 +409,7 @@ function buildPane(side, pages) {
       // A synthetic marker (`_marker_box`) is a PIN at roughly where the
       // content belongs - there is nothing wrong with the text it lands on,
       // usually the topic's heading, so it is never tinted like changed words.
-      const box = el('div', 'box ' + (b.marker ? 'pin ' : imageIssue ? 'imgbox ' : boxed || bigBox || absentHere ? 'ghost ' : 'fill ') + 'cat-' + it.category + (it.minor ? ' minor' : '') + (it.critical ? ' critical' : '') + (it.noise ? ' noise-' + it.noise : ''));
+      const box = el('div', 'box ' + (b.marker ? 'pin ' : imageIssue || it.category === 'sweep' ? 'imgbox ' : boxed || bigBox || absentHere ? 'ghost ' : 'fill ') + 'cat-' + it.category + (it.minor ? ' minor' : '') + (it.critical ? ' critical' : '') + (it.noise ? ' noise-' + it.noise : ''));
       box.style.left = ((x0 - pad) / pg.w * 100) + '%';
       box.style.top = ((y0 - pad) / pg.h * 100) + '%';
       box.style.width = ((x1 - x0 + 2 * pad) / pg.w * 100) + '%';

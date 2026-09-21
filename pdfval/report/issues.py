@@ -792,6 +792,19 @@ def _page_level_issues(expected: fitz.Document, actual: fitz.Document, start: in
                           page_box(doc, i) if name == "Production" else [],
                           page_box(doc, i) if name == "Staging" else []))
     chapter_id = chapter_rows[0]["id"] if chapter_rows else ""
+    # A typeface one document prints with and the other never does. Not a
+    # named rule about wording, spacing or pictures - it is found by taking an
+    # inventory of both documents and comparing it, which is the only way a
+    # difference nobody wrote a rule for gets found at all. Said once for the
+    # whole document: a substituted face shows up on every page that uses it.
+    try:
+        from pdfval.validators.inventory import font_changes, heading_style_changes
+
+        for f in font_changes(expected, actual) + heading_style_changes(expected, actual):
+            found.append((f["type"], f["title"], f["description"], [], []))
+    except Exception:  # noqa: BLE001 - a sweep must never cost the run its report
+        pass
+
     out = []
     for k, (kind, title, description, prod_boxes, stage_boxes) in enumerate(found):
         out.append({
@@ -804,9 +817,134 @@ def _page_level_issues(expected: fitz.Document, actual: fitz.Document, start: in
             "prod_boxes": prod_boxes, "stage_boxes": stage_boxes,
             "comment_prod": "", "comment_stage": "", "occurrences": 1,
             "prod_parts": [], "stage_parts": [], "changes": [],
-            "noise": "", "minor": kind == "scanned-page", "critical": kind != "scanned-page",
+            # A font-set difference is shown for review, not failed on: which
+            # face a rebuild embeds is often its own choice, and it matters
+            # only where it changes what is drawn.
+            "noise": "styling" if kind in ("font-set", "heading-style") else "",
+            "minor": kind in ("scanned-page", "font-set", "heading-style"),
+            "critical": kind not in ("scanned-page", "font-set", "heading-style"),
         })
     return out
+
+
+def ai_issues(notes: list[dict], start_id: int) -> list[dict]:
+    """The AI review's notes as issues the viewer can draw.
+
+    The note is the model's; the BOXES are the sweep's, measured off the page
+    (see `pdfval.validators.inventory`). A note with nowhere to point is a
+    sentence the reader has to go hunting for, and a small local model cannot
+    be trusted to give coordinates - so it never has to.
+    """
+    out: list[dict] = []
+    for n, note in enumerate(notes or []):
+        prod_boxes = [{"page": b["page"], "bbox": b["bbox"]} for b in note.get("prod_boxes") or []]
+        stage_boxes = [{"page": b["page"], "bbox": b["bbox"]} for b in note.get("stage_boxes") or []]
+        text = " ".join((note.get("note") or "").split())
+        out.append({
+            "id": start_id + n, "category": "sweep", "type": "ai-note", "kind": "page",
+            "content_label": "", "title": f"AI review — Production p.{note['page']}"
+                                         + (f" \u2194 Staging p.{note['stage_page']}"
+                                            if note.get("stage_page") and note["stage_page"] != note["page"] else ""),
+            "description": text[:800], "detail": "", "help": "",
+            "chapter": "AI review", "chapter_id": "ai", "section": "",
+            "prod_anchor": None, "stage_anchor": None,
+            "prod_page": note["page"], "stage_page": note.get("stage_page") or note["page"],
+            "prod_boxes": prod_boxes, "stage_boxes": stage_boxes,
+            "comment_prod": "", "comment_stage": "",
+            "occurrences": 1, "prod_parts": [], "stage_parts": [],
+            # Each measured gap as its own line under the card.
+            "changes": list(note.get("gaps") or []),
+            "noise": "", "minor": True, "critical": False,
+        })
+    return out
+
+
+def _marker_spacing_issues(expected: fitz.Document, actual: fitz.Document,
+                           anchors: list[dict], start_id: int) -> list[dict]:
+    """A list item whose space after its marker changed, boxed on both sides.
+
+    Not a wording, bold or marker-style change - the marker is there on both
+    sides and the words are identical, only the space between them moved - so
+    no named rule sees it, and a reader sees it at once.
+    """
+    try:
+        from pdfval.ai_review import page_pairs
+        from pdfval.validators.inventory import marker_spacing_changes
+
+        found = marker_spacing_changes(expected, actual,
+                                       page_pairs(anchors, expected.page_count, actual.page_count))
+    except Exception:  # noqa: BLE001 - never cost the report its other findings
+        return []
+    out = []
+    for n, f in enumerate(found[:MAX_MARKER_SPACING]):
+        out.append({
+            "id": start_id + n, "category": "lists", "type": "marker-spacing", "kind": "text",
+            "content_label": "", "title": f["title"], "description": f["description"],
+            "detail": "", "help": "", "chapter": "Layout", "chapter_id": "layout", "section": "",
+            "prod_anchor": None, "stage_anchor": None,
+            "prod_page": f["prod_page"], "stage_page": f["stage_page"],
+            "prod_boxes": f["prod_boxes"], "stage_boxes": f["stage_boxes"],
+            "comment_prod": "Space after the marker here",
+            "comment_stage": "Wider or tighter than Production",
+            "occurrences": 1, "prod_parts": [], "stage_parts": [], "changes": [],
+            "noise": "layout", "minor": True, "critical": False,
+        })
+    return out
+
+
+MAX_MARKER_SPACING = 40  # a rebuild that re-spaced every list says so in 40 lines
+
+
+def _sweep_issues(expected: fitz.Document, actual: fitz.Document, anchors: list[dict],
+                  issues: list[dict], start_id: int) -> list[dict]:
+    """The completeness sweep, as findings of its own.
+
+    Every other check answers a named question, so a difference nobody wrote a
+    rule for is found by none of them. This measures each mirrored page pair
+    whole and reports what is on one and not the other. It runs in every
+    report, with or without the optional AI - the measuring is the engine's,
+    not the model's, and the model was never what found these.
+
+    A gap on a page a named rule already speaks about is dropped: the sweep is
+    the net underneath those rules, not a second, vaguer voice repeating them.
+    """
+    try:
+        from pdfval.ai_review import page_pairs
+        from pdfval.validators.inventory import COVERED_BY, REPORTABLE_KINDS, inventory_changes
+
+        covered: dict = {}
+        for it in issues:
+            for kind in COVERED_BY.get(it["category"], ()):
+                for box in it.get("prod_boxes") or ():
+                    covered[(box["page"], kind)] = True
+                if it.get("prod_page"):
+                    covered[(it["prod_page"], kind)] = True
+        found = inventory_changes(
+            expected, actual,
+            page_pairs(anchors, expected.page_count, actual.page_count),
+            covered=covered, kinds=REPORTABLE_KINDS,
+        )
+    except Exception:  # noqa: BLE001 - never cost the report its other findings
+        return []
+    out = []
+    for n, f in enumerate(found[:MAX_SWEEP_ISSUES]):
+        out.append({
+            "id": start_id + n, "category": "sweep", "type": "page-sweep", "kind": "page",
+            "content_label": "Page-level differences", "title": f["title"],
+            "description": f["description"], "detail": "", "help": "",
+            "chapter": "Page sweep", "chapter_id": "sweep", "section": "",
+            "prod_anchor": None, "stage_anchor": None,
+            "prod_page": f["prod_page"], "stage_page": f["stage_page"],
+            "prod_boxes": [], "stage_boxes": [],
+            "comment_prod": "", "comment_stage": "",
+            "occurrences": 1, "prod_parts": [], "stage_parts": [],
+            "changes": list(f["gaps"]),
+            "noise": "", "minor": True, "critical": False,
+        })
+    return out
+
+
+MAX_SWEEP_ISSUES = 60  # one per page pair is already the ceiling that matters
 
 
 def build_issue_report(chapters: list, expected: fitz.Document, actual: fitz.Document,
@@ -978,20 +1116,6 @@ def build_issue_report(chapters: list, expected: fitz.Document, actual: fitz.Doc
             "prod_range": _range(chapter.exp_pages), "stage_range": _range(chapter.act_pages),
         })
 
-    issues.extend(_page_level_issues(expected, actual, len(issues), chapter_rows))
-
-    # Numbered in the order the nav lists them - by category, then as printed -
-    # so issue #12 is the twelfth line in the nav and the "#12" on the page.
-    issues.sort(key=lambda it: (_CATEGORY_KEYS.index(it["category"]), it["id"]))
-    for index, item in enumerate(issues):
-        item["id"], item["n"] = index, index + 1
-
-    counts = {key: 0 for key in _CATEGORY_KEYS}
-    noise_counts = {g["key"]: 0 for g in NOISE_GROUPS}
-    for item in issues:
-        counts[item["category"]] += 1
-        if item["noise"]:
-            noise_counts[item["noise"]] += 1
     anchors = _anchors(expected, actual, exp_entries, act_entries)
     if expected_path and actual_path:
         # Table waypoints on top of heading ones: a chapter that packs several
@@ -1008,6 +1132,27 @@ def build_issue_report(chapters: list, expected: fitz.Document, actual: fitz.Doc
     # way down. Added last and re-ordered, so a paragraph that would run the
     # Staging side backwards is dropped exactly like a table or heading.
     anchors = _order_anchors(anchors + content_anchors(chapters, expected, actual))
+
+    issues.extend(_page_level_issues(expected, actual, len(issues), chapter_rows))
+    # Uses the same page pairing the viewer scrolls by, so a spacing change is
+    # measured against the Staging page that really mirrors the Production one.
+    issues.extend(_marker_spacing_issues(expected, actual, anchors, len(issues)))
+    # Last, so it can see everything the named rules already found and stay
+    # quiet about those pages.
+    issues.extend(_sweep_issues(expected, actual, anchors, issues, len(issues)))
+
+    # Numbered in the order the nav lists them - by category, then as printed -
+    # so issue #12 is the twelfth line in the nav and the "#12" on the page.
+    issues.sort(key=lambda it: (_CATEGORY_KEYS.index(it["category"]), it["id"]))
+    for index, item in enumerate(issues):
+        item["id"], item["n"] = index, index + 1
+
+    counts = {key: 0 for key in _CATEGORY_KEYS}
+    noise_counts = {g["key"]: 0 for g in NOISE_GROUPS}
+    for item in issues:
+        counts[item["category"]] += 1
+        if item["noise"]:
+            noise_counts[item["noise"]] += 1
     return {
         "total": len(issues),
         "passed": not issues,

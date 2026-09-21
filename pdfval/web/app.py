@@ -272,8 +272,31 @@ def _queue_position(run_id: str) -> int:
             return 1
 
 
+def _add_ai_to_viewer(report, run_dir: str, notes: list) -> None:
+    """Put the AI's notes into pdf.html as boxed findings of their own."""
+    view = getattr(report, "issue_report", None)
+    if not view or not notes:
+        return
+    try:
+        from pdfval.report.html_report import write_pdf_html
+        from pdfval.report.issues import ai_issues
+
+        extra = ai_issues(notes, start_id=len(view["issues"]))
+        view["issues"] = [it for it in view["issues"] if it["type"] != "ai-note"] + extra
+        view["total"] = len(view["issues"])
+        for group in view.get("groups", []):
+            if group["key"] == "sweep":
+                group["ids"] = [it["id"] for it in extra]
+        for cat in view.get("categories", []):
+            if cat["key"] == "sweep":
+                cat["count"] = len(extra)
+        write_pdf_html(report, run_dir, view)
+    except Exception:  # noqa: BLE001 - the report already exists; never lose it
+        traceback.print_exc()
+
+
 def _run_ai_review(run_dir: str, run_id: str, expected_path: str, actual_path: str,
-                   anchors: list | None = None) -> None:
+                   anchors: list | None = None, report=None) -> None:
     """The optional AI pass - runs after the deterministic report is already
     written, and can never fail the run: any error here (Ollama not running,
     model missing, a page timing out) is swallowed and simply leaves no
@@ -283,8 +306,8 @@ def _run_ai_review(run_dir: str, run_id: str, expected_path: str, actual_path: s
         import fitz
         if not ai_review.available():
             return
-        exp_pages = fitz.open(expected_path).page_count
-        act_pages = fitz.open(actual_path).page_count
+        exp_doc, act_doc = fitz.open(expected_path), fitz.open(actual_path)
+        exp_pages, act_pages = exp_doc.page_count, act_doc.page_count
         page_count = min(exp_pages, act_pages)
         pdfview_dir = os.path.join(run_dir, "pdfview")
         # Which Staging page each Production page is really the counterpart of,
@@ -298,9 +321,16 @@ def _run_ai_review(run_dir: str, run_id: str, expected_path: str, actual_path: s
             _set_progress(run_dir, run_id, percent=98, label=f"AI visual review — page {i}/{n}")
 
         _set_progress(run_dir, run_id, percent=98, label="AI visual review starting…")
-        notes = ai_review.review_pages(pdfview_dir, page_count, progress_cb=cb, pairs=pairs)
+        notes = ai_review.review_pages(pdfview_dir, page_count, progress_cb=cb, pairs=pairs,
+                                       expected=exp_doc, actual=act_doc)
         with open(os.path.join(run_dir, "ai_review.json"), "w", encoding="utf-8") as f:
             json.dump({"model": ai_review.VISION_MODEL, "notes": notes}, f)
+        # The viewer is written before the AI runs, so its findings would
+        # otherwise live only in a list on the result page - words with nowhere
+        # to point. Merged in and the viewer written again, each note is boxed
+        # on both documents where the gap was measured, alongside every other
+        # finding, in the one place a reviewer is already looking.
+        _add_ai_to_viewer(report, run_dir, notes)
     except Exception:  # noqa: BLE001
         traceback.print_exc()
 
@@ -348,6 +378,7 @@ def _start_job(app, run_id, run_dir, expected_path, actual_path, exp_name, act_n
                 _run_ai_review(
                     run_dir, run_id, expected_path, actual_path,
                     anchors=(getattr(report, "issue_report", None) or {}).get("anchors"),
+                    report=report,
                 )
             _set_progress(run_dir, run_id, percent=100, label="Done", done=True)
         except Exception as exc:  # noqa: BLE001

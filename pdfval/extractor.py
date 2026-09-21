@@ -1,6 +1,8 @@
 """Helpers for pulling structured data out of a PDF using PyMuPDF/pdfplumber."""
 from __future__ import annotations
 
+from pdfval.docid import doc_key
+
 import os
 from dataclasses import dataclass, field
 from typing import Any
@@ -720,7 +722,7 @@ _mockup_cache: dict[tuple, bool] = {}
 
 
 def _looks_like_ui_mockup(doc: "fitz.Document", page_index: int, bbox: tuple) -> bool:
-    key = (id(doc), page_index, _round_bbox(bbox, 1))
+    key = (doc_key(doc), page_index, _round_bbox(bbox, 1))
     if key not in _mockup_cache:
         _mockup_cache[key] = _measure_dark_coverage(doc, page_index, bbox) >= _MOCKUP_MIN_COVERAGE
     return _mockup_cache[key]

@@ -5,6 +5,8 @@ deletions shift later pages), so headings are matched by title text only.
 """
 from __future__ import annotations
 
+from pdfval.docid import doc_key
+
 from pdfval import ocr as _ocr
 
 import difflib
@@ -364,10 +366,10 @@ def is_running_header_footer(doc: "fitz.Document", page_index: int, bbox, text: 
     short strip hugging the page bottom, e.g. a back-page copyright/version line
     that appears just once.
     """
-    sigs = _hf_cache.get(id(doc))
+    sigs = _hf_cache.get(doc_key(doc))
     if sigs is None:
         sigs = _scan_running_header_footer(doc)
-        _hf_cache[id(doc)] = sigs
+        _hf_cache[doc_key(doc)] = sigs
     try:
         rect = doc[page_index].rect
         h = rect.height or 1.0
@@ -579,7 +581,7 @@ def _heading_line_map(doc: fitz.Document, page_index: int) -> dict[str, list[tup
     """`squashed line text -> [(y0, set as a heading), ...]` for every text line
     on the page, plus each block's 2- and 3-line joins so a title the layout
     wrapped is still found whole. Sorted by y."""
-    key = (id(doc), page_index)
+    key = (doc_key(doc), page_index)
     cached = _HEADING_LINE_CACHE.get(key)
     if cached is not None:
         return cached

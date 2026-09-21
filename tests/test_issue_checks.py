@@ -146,7 +146,11 @@ def test_every_difference_is_filed_under_one_category():
     assert C.category_of({"type": "bold-missing"}) == "bold"
     assert C.category_of({"type": "table-header-repeat"}) == "content"
     assert C.category_of({"type": "shading"}) == "formatting"
-    assert {c["key"] for c in C.CATEGORIES} == {"content", "images", "links", "lists", "bold", "tables", "formatting"}
+    # "sweep" is the completeness sweep's own category - filled by measuring
+    # pages, not by any chapter diff, so no `category_of` case maps to it.
+    assert {c["key"] for c in C.CATEGORIES} == {
+        "content", "images", "links", "lists", "bold", "tables", "formatting", "sweep"}
+    assert C.category_of({"type": "page-sweep"}) != "sweep"
 
 
 # --- visual differences inside a matched figure (OpenCV) ------------------------

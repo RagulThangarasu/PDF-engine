@@ -20,6 +20,8 @@ Two questions the figure checks cannot answer from detected boxes alone:
 """
 from __future__ import annotations
 
+from pdfval.docid import doc_key
+
 import fitz
 
 RENDER_EDGE = 320            # px on the long edge both figures are compared at
@@ -93,7 +95,7 @@ def _gray(doc: fitz.Document, page_index: int, clip, zoom: float):
 def _page_gray(doc: fitz.Document, page_index: int, zoom: float):
     import cv2
 
-    key = (id(doc), page_index, zoom)
+    key = (doc_key(doc), page_index, zoom)
     if key not in _PAGE_CACHE:
         if len(_PAGE_CACHE) >= _PAGE_CACHE_MAX:
             _PAGE_CACHE.clear()

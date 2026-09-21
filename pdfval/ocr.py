@@ -10,6 +10,8 @@ rather than failing a run when it is missing.
 """
 from __future__ import annotations
 
+from pdfval.docid import doc_key
+
 import os
 import re
 import shutil
@@ -246,7 +248,7 @@ _SCANNED_CACHE: dict[tuple, bool] = {}
 
 
 def is_scanned_page(doc: fitz.Document, page: int) -> bool:
-    key = (id(doc), doc.page_count, page)
+    key = (doc_key(doc), doc.page_count, page)
     if key in _SCANNED_CACHE:
         return _SCANNED_CACHE[key]
     result = False
@@ -317,7 +319,7 @@ def page_text_dict(doc: fitz.Document, page: int) -> dict:
     estimated from the line's height; weight is unknown and left regular."""
     if not is_scanned_page(doc, page):
         return doc[page].get_text("dict")
-    key = (id(doc), doc.page_count, page)
+    key = (doc_key(doc), doc.page_count, page)
     if key in _TEXT_DICT_CACHE:
         return _TEXT_DICT_CACHE[key]
     blocks = []
