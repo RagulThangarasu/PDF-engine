@@ -367,8 +367,12 @@ def _covers(outer: dict, inner: dict) -> bool:
     return outer["start"] <= inner["start"] and inner["stop"] <= outer["stop"]
 
 
-def compare(topics: list, sections: list) -> list[dict]:
+_PDF_PATH = [""]   # the PDF the sections came from, for the style comparison
+
+
+def compare(topics: list, sections: list, pdf_path: str = "") -> list[dict]:
     """Every difference between the topics and the PDF built from them."""
+    _PDF_PATH[0] = pdf_path or _PDF_PATH[0]
     out: list[dict] = []
     pairs = match(topics, sections)
     matched = [sec for topic, sec in pairs if topic is not None and sec is not None]
@@ -418,6 +422,17 @@ def compare(topics: list, sections: list) -> list[dict]:
                             "topic": topic.path, "title": sec["title"], "page": sec["page"],
                             "detail": (f"The topic declares {a} {what}(s); the PDF section prints "
                                        f"{b}. One of them gained or lost {what}s in publishing.")})
+        # Styles: what the page renders against what the topic declares. Only
+        # where the PDF can actually be read - with no page to look at there
+        # is no evidence either way, and every <b> in the topic would read as
+        # markup the template dropped.
+        if _PDF_PATH[0]:
+            try:
+                out += compare_roles(topic, sec, _PDF_PATH[0])
+            except Exception as exc:  # noqa: BLE001 - never cost the report
+                # its other findings, but never hide the reason either: a
+                # silent `pass` here hid a NameError through a whole run.
+                print(f"  style check skipped for {topic.title}: {type(exc).__name__}: {exc}")
         for n, (rows_a, rows_b) in enumerate(zip(topic.tables, sec["tables"]), start=1):
             if rows_a != rows_b:
                 out.append({"kind": "structure", "severity": "medium",
@@ -645,7 +660,7 @@ def run(pdf_path: str, ditamap: str, out_dir: str, base: str = "", user: str = "
         progress(f"{len(topics)} topics read")
     sections = pdf_sections(pdf_path)
     progress(f"{len(sections)} sections in the PDF")
-    findings = compare(topics, sections)
+    findings = compare(topics, sections, pdf_path)
     progress(f"{len(findings)} differences")
     shots = {}
     for n, f in enumerate(findings, start=1):
@@ -689,6 +704,185 @@ def main(argv: list[str] | None = None) -> int:
         print(f"failed: {type(exc).__name__}: {exc}")
         return 1
     return 0
+
+
+
+
+# --- styles: what the PDF RENDERS against what the topic DECLARES -----------
+#
+# Comparing two PDFs means comparing inferred against inferred - both sides are
+# pixels, so bold is measured against bold and a note against a note. A topic
+# is not pixels. It DECLARES what a thing is (<b>, <note>, <xref>, <image>,
+# <li>) and says nothing about how it should look; the PDF is the evidence of
+# how the template rendered that declaration. So the question is not "do the
+# two look alike" but:
+#
+#     is every style the PDF renders justified by markup in the topic,
+#     and does every markup in the topic show up styled in the PDF?
+#
+# A phrase bold on the page and plain in the topic is styling with no source
+# behind it - it will vanish the next time the manual is rebuilt. A phrase
+# <b> in the topic and plain on the page is markup the template dropped. Both
+# are defects, and neither is visible to a word-by-word comparison, which sees
+# the same words on both sides and passes.
+_ROLE_TAGS = {
+    "bold": ("b", "uicontrol", "cmdname", "wintitle"),
+    "note": ("note",),
+    "link": ("xref",),
+    "image": ("image",),
+    "list item": ("li", "sli"),
+}
+_ROLE_MIN_CHARS = 2        # a one-character run is punctuation, not a phrase
+_ROLE_SHOWN = 8            # phrases named in a finding before "and N more"
+
+
+def topic_roles(topic_xml: str) -> dict:
+    """`{role: [phrase, ...]}` - what the topic DECLARES, by markup."""
+    out: dict = {r: [] for r in _ROLE_TAGS}
+    try:
+        root = _parse(topic_xml.encode("utf-8") if isinstance(topic_xml, str) else topic_xml)
+    except Exception:
+        return out
+    for el in root.iter():
+        tag = _tag(el)
+        for role, tags in _ROLE_TAGS.items():
+            if tag not in tags:
+                continue
+            if role == "image":
+                href = el.get("href") or ""
+                out[role].append(href.rsplit("/", 1)[-1])
+            else:
+                phrase = " ".join("".join(el.itertext()).split())
+                if len(phrase) >= _ROLE_MIN_CHARS:
+                    out[role].append(phrase)
+    return out
+
+
+def pdf_roles(pdf_path: str, section: dict) -> dict:
+    """`{role: [phrase, ...]}` - what the PDF section RENDERS.
+
+    Read the way the rest of the engine reads a page: bold from the font the
+    span is actually set in, notes from the callout label, links from the
+    page's own annotations, pictures from the artwork regions. Nothing here
+    trusts the topic - that is the whole point of comparing them.
+    """
+    import fitz
+
+    from pdfval.validators.inventory import page_inventory
+
+    doc = fitz.open(pdf_path)
+    start, stop = section.get("start"), section.get("stop")
+    out: dict = {r: [] for r in _ROLE_TAGS}
+    if not (start and stop):
+        return out
+    for page in range(start[0], min(stop[0] + 1, doc.page_count)):
+        try:
+            blocks = doc[page].get_text("dict").get("blocks", [])
+        except Exception:
+            continue
+        for b in blocks:
+            y = b.get("bbox", (0, 0, 0, 0))[1]
+            if (page == start[0] and y < start[1] - 2) or (page == stop[0] and y > stop[1]):
+                continue
+            for line in b.get("lines", []):
+                spans = line.get("spans", [])
+                text = "".join(s.get("text", "") for s in spans)
+                if _MARKER_LINE.match(text.strip()):
+                    out["list item"].append(clean(text))
+                if _NOTE_LABEL.search(text):
+                    out["note"].append(clean(text))
+                # Bold runs, joined where they sit next to each other: a
+                # phrase set bold across two spans is one phrase.
+                run: list[str] = []
+                for s in spans:
+                    if "bold" in (s.get("font") or "").casefold():
+                        run.append(s.get("text", ""))
+                    elif run:
+                        _add_run(out["bold"], run)
+                        run = []
+                _add_run(out["bold"], run)
+        try:
+            out["link"] += [(l.get("uri") or "internal") for l in doc[page].get_links()
+                            if l.get("kind") != 0]
+            out["image"] += [f"{round(r[0])}x{round(r[1])}"
+                             for r in page_inventory(doc, page)["images"]]
+        except Exception:
+            pass
+    return out
+
+
+def _add_run(bag: list, run: list) -> None:
+    phrase = " ".join("".join(run).split())
+    if len(phrase) >= _ROLE_MIN_CHARS:
+        bag.append(phrase)
+
+
+def _phrase_key(text: str) -> str:
+    """Two phrases are the same phrase when their words are."""
+    return " ".join(_WORD_RE.findall((text or "").casefold()))
+
+
+def compare_roles(topic, section: dict, pdf_path: str) -> list[dict]:
+    """Every style the PDF renders without markup behind it, and every markup
+    the topic declares that the PDF did not render."""
+    declared = topic_roles(topic.xml)
+    rendered = pdf_roles(pdf_path, section)
+    out: list[dict] = []
+    for role in ("bold", "note", "link"):
+        # Phrases, matched on their words. An <image> is matched by count
+        # instead (a GUID filename and a rendered size share nothing), and a
+        # list item's text is already compared word for word by the wording
+        # check - here only its COUNT says whether the marker survived.
+        d = {_phrase_key(p): p for p in declared[role] if _phrase_key(p)}
+        r = {_phrase_key(p): p for p in rendered[role] if _phrase_key(p)}
+        lost = [d[k] for k in d.keys() - r.keys()]
+        extra = [r[k] for k in r.keys() - d.keys()]
+        if lost:
+            out.append(_role_finding(topic, section, role, lost, published=False))
+        if extra:
+            out.append(_role_finding(topic, section, role, extra, published=True))
+    for role in ("image", "list item"):
+        a, b = len(declared[role]), len(rendered[role])
+        if a != b:
+            out.append({
+                "kind": "style-count", "severity": "medium",
+                "topic": topic.path, "title": section["title"], "page": section["page"],
+                "detail": (f"The topic declares {a} {role}(s); the PDF section renders {b}. "
+                           f"{'The template dropped some' if a > b else 'The page shows more than the topic declares'} - "
+                           f"check which."),
+                "topic_parts": [], "pdf_parts": [],
+            })
+    return out
+
+
+def _role_finding(topic, section: dict, role: str, phrases: list, published: bool) -> dict:
+    shown = "; ".join(f"“{_clip(p)}”" for p in phrases[:_ROLE_SHOWN])
+    more = f" and {len(phrases) - _ROLE_SHOWN} more" if len(phrases) > _ROLE_SHOWN else ""
+    if published:
+        detail = (f"The PDF renders these as {role} with no <{_ROLE_TAGS[role][0]}> behind them in the "
+                  f"topic: {shown}{more}. Styling with no source is lost the next time the manual is "
+                  f"rebuilt from these topics.")
+    else:
+        detail = (f"The topic marks these <{_ROLE_TAGS[role][0]}> and the PDF renders them plain: "
+                  f"{shown}{more}. The template did not carry the markup through.")
+    return {
+        "kind": f"style-{role}", "severity": "high" if role != "link" else "medium",
+        "topic": topic.path, "title": section["title"], "page": section["page"],
+        "detail": detail, "topic_parts": [], "pdf_parts": [],
+    }
+
+
+def _clip(text: str, limit: int = 60) -> str:
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+_KIND_LABEL.update({
+    "style-bold": "Bold differs from the topic's markup",
+    "style-note": "Note differs from the topic's markup",
+    "style-link": "Link differs from the topic's markup",
+    "style-count": "Styled element count differs",
+})
 
 
 if __name__ == "__main__":

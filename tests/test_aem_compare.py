@@ -133,3 +133,18 @@ def test_a_chapter_with_no_topic_at_all_is_still_a_gap():
                          start=(40, 0.0), stop=(50, 0.0))
     kinds = [f["kind"] for f in A.compare([t], [chapter, elsewhere])]
     assert "section-not-in-topics" in kinds
+
+
+def test_the_style_check_needs_a_pdf_to_look_at():
+    """With no page to read there is no evidence either way - asserting the
+    template dropped every <b> in the topic would be a guess."""
+    t = A.parse_topic("/x/t1.dita", _TOPIC)
+    sec = _section("Connecting the Receiver", t.text, notes=1, items=2, tables=[3])
+    assert not [f for f in A.compare([t], [sec]) if f["kind"].startswith("style-")]
+
+
+def test_markup_the_topic_declares_is_read_back_by_role():
+    roles = A.topic_roles(_TOPIC.decode())
+    assert roles["note"] == ["Use the supplied adapter."]
+    assert roles["list item"] == ["first", "second"]
+    assert roles["bold"] == [] and roles["link"] == []
