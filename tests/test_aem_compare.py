@@ -32,9 +32,9 @@ def test_the_title_and_metadata_are_not_counted_as_body_words():
     assert not t.text.startswith("Connecting the Receiver")
 
 
-def _section(title, text, notes=0, items=0, tables=()):
-    return {"title": title, "page": 7, "text": text, "notes": notes,
-            "list_items": items, "tables": list(tables)}
+def _section(title, text, notes=0, items=0, tables=(), start=(0, 0.0), stop=(0, 1e9)):
+    return {"title": title, "page": 7, "text": text, "notes": notes, "level": 1,
+            "start": start, "stop": stop, "list_items": items, "tables": list(tables)}
 
 
 def test_words_in_the_pdf_and_not_the_topic_are_reported():
@@ -92,3 +92,26 @@ def test_the_report_is_one_self_contained_file(tmp_path):
     assert os.path.basename(path) == "aem-vs-pdf.html"
     assert "Connecting the Receiver" in html and "manual.pdf" in html
     assert "<style>" in html          # no external assets to lose
+
+
+def test_a_sub_heading_inside_a_matched_chapter_is_not_a_gap():
+    """A topic is a whole chapter. The headings inside it belong to that
+    topic - reported separately, every sub-heading of the manual reads as
+    content nobody wrote."""
+    t = A.parse_topic("/x/t1.dita", _TOPIC)
+    chapter = _section("Connecting the Receiver", t.text, notes=1, items=2, tables=[3],
+                       start=(4, 0.0), stop=(9, 0.0))
+    inside = _section("Video input via HDMI", "connect the hdmi cable",
+                      start=(5, 100.0), stop=(6, 0.0))
+    kinds = [f["kind"] for f in A.compare([t], [chapter, inside])]
+    assert "section-not-in-topics" not in kinds
+
+
+def test_a_chapter_with_no_topic_at_all_is_still_a_gap():
+    t = A.parse_topic("/x/t1.dita", _TOPIC)
+    chapter = _section("Connecting the Receiver", t.text, notes=1, items=2, tables=[3],
+                       start=(4, 0.0), stop=(9, 0.0))
+    elsewhere = _section("Troubleshooting", "something else entirely",
+                         start=(40, 0.0), stop=(50, 0.0))
+    kinds = [f["kind"] for f in A.compare([t], [chapter, elsewhere])]
+    assert "section-not-in-topics" in kinds

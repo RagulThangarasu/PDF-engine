@@ -82,12 +82,18 @@ class AemClient:
         raw = self.get(ditamap)
         root = _parse(raw)
         base_dir = ditamap.rsplit("/", 1)[0]
+        by_guid = self.guid_index(ditamap)
         out: list[str] = []
         for el in root.iter():
             href = el.get("href")
             if not href or el.get("format") not in (None, "dita", "ditamap"):
                 continue
-            if href.startswith("/"):
+            # A GUID reference resolves through the index; anything else is an
+            # ordinary relative or absolute path.
+            guid = href.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            if guid in by_guid:
+                path = by_guid[guid]
+            elif href.startswith("/"):
                 path = href
             else:
                 path = _resolve(base_dir, href)
@@ -97,6 +103,36 @@ class AemClient:
 
     def topic(self, path: str) -> Topic:
         return parse_topic(path, self.get(path))
+
+    def guid_index(self, ditamap: str) -> dict:
+        """`{GUID: real path}` for every topic stored beside the map.
+
+        A map written by AEM Guides references its topics by GUID -
+        `GUID-2c1b1fe5-....dita` - and no file of that name exists anywhere:
+        the GUID is the topic's own `id`, and the file is called something
+        else entirely (`VS25_UM_V1.00_EN-5.dita`) in a sibling folder. So the
+        topics are listed and indexed by the id each one declares.
+        """
+        import json as _json
+
+        root = ditamap.rsplit("/", 2)[0]          # .../vs25/Maps/x.ditamap -> .../vs25
+        index: dict = {}
+        for folder in ("Topics", "topics", "Maps"):
+            try:
+                listing = _json.loads(self.get(f"{root}/{folder}.1.json"))
+            except Exception:
+                continue
+            for name in listing:
+                if not name.endswith((".dita", ".xml")):
+                    continue
+                path = f"{root}/{folder}/{name}"
+                try:
+                    guid = _parse(self.get(path)).get("id")
+                except Exception:
+                    continue
+                if guid:
+                    index.setdefault(guid, path)
+        return index
 
 
 def _resolve(base_dir: str, href: str) -> str:
@@ -170,9 +206,13 @@ def pdf_sections(pdf_path: str) -> list[dict]:
 
     doc = fitz.open(pdf_path)
     entries, _ = resolve_entries(doc, doc)
+    # A section runs to the next heading AT ITS OWN LEVEL OR ABOVE, so a
+    # chapter contains its sub-headings instead of stopping at the first one.
+    # A DITA topic is a whole chapter - compared against a chapter's opening
+    # paragraph it looks as if the publish dropped every list and note in it.
     spans = []
     for n, e in enumerate(entries):
-        end = entries[n + 1] if n + 1 < len(entries) else None
+        end = next((x for x in entries[n + 1:] if x.level <= e.level), None)
         spans.append((e, (e.page, e.y), (end.page, end.y) if end else (doc.page_count, 1e9)))
     out = []
     for entry, start, stop in spans:
@@ -202,6 +242,7 @@ def pdf_sections(pdf_path: str) -> list[dict]:
         joined = " ".join(" ".join(text).split())
         notes = len(_NOTE_LABEL.findall(joined))
         out.append({"title": entry.title, "page": entry.page + 1, "text": joined,
+                    "level": entry.level, "start": start, "stop": stop,
                     "notes": notes, "list_items": items, "tables": tables})
     return out
 
@@ -259,10 +300,19 @@ def _only_in(mine: str, theirs: str) -> str:
     return shown + (f" and {len(short) - WORDS_SHOWN} more" if len(short) > WORDS_SHOWN else "")
 
 
+def _covers(outer: dict, inner: dict) -> bool:
+    """`outer`'s span contains `inner`'s, and it is not the same section."""
+    if outer is inner or "start" not in outer or "start" not in inner:
+        return False
+    return outer["start"] <= inner["start"] and inner["stop"] <= outer["stop"]
+
+
 def compare(topics: list, sections: list) -> list[dict]:
     """Every difference between the topics and the PDF built from them."""
     out: list[dict] = []
-    for topic, sec in match(topics, sections):
+    pairs = match(topics, sections)
+    matched = [sec for topic, sec in pairs if topic is not None and sec is not None]
+    for topic, sec in pairs:
         if topic is not None and sec is None:
             out.append({"kind": "topic-not-published", "severity": "high",
                         "topic": topic.path, "title": topic.title, "page": None,
@@ -271,6 +321,11 @@ def compare(topics: list, sections: list) -> list[dict]:
                                    f"under a different heading.")})
             continue
         if topic is None and sec is not None:
+            # A heading INSIDE a chapter a topic already covers is part of
+            # that topic, not a section nobody wrote - only a chapter with no
+            # topic at all is a gap.
+            if any(_covers(m, sec) for m in matched):
+                continue
             out.append({"kind": "section-not-in-topics", "severity": "high",
                         "topic": None, "title": sec["title"], "page": sec["page"],
                         "detail": (f"The PDF prints “{sec['title']}” on page {sec['page']}, and no "
