@@ -516,9 +516,23 @@ def write_report(findings: list[dict], out_dir: str, pdf_path: str,
     rows = []
     for n, f in enumerate(findings, start=1):
         shot = shots.get(id(f))
-        img = (f'<details class="shot"><summary>PDF page {f.get("page")}</summary>'
-               f'<img src="{html.escape(shot)}" alt="PDF page {f.get("page")}"></details>'
-               if shot else "")
+        tshot = (shots.get(("topic", f.get("topic"))) if f.get("topic") else None)
+        # Both sides as PICTURES, side by side: the page as it prints, and the
+        # topic drawn as what its markup declares. A reviewer checks a page by
+        # looking at it, not by reading a list of words.
+        views = ""
+        if shot or tshot:
+            left = (f'<img src="{html.escape(shot)}" alt="PDF page {f.get("page")}">'
+                    if shot else _EMPTY)
+            right = (f'<img src="{html.escape(tshot)}" alt="topic render">' if tshot else _EMPTY)
+            views = f"""
+          <div class="pair views">
+            <div class="side"><h4>PDF <span>{f'p.{f["page"]}' if f.get('page') else ''} - as printed</span></h4>
+              <div class="shotbody">{left}</div></div>
+            <div class="side"><h4>Topic <span>(ditamap) - as its markup declares</span></h4>
+              <div class="shotbody">{right}</div></div>
+          </div>"""
+        img = views
         # The two sides in full, with ONLY what differs marked. A reviewer has
         # to read what is actually there; a list of loose words out of context
         # cannot be checked against the page.
@@ -543,7 +557,8 @@ def write_report(findings: list[dict], out_dir: str, pdf_path: str,
               {f'&middot; PDF p.{f["page"]}' if f.get('page') else ''}</span></header>
           <p class="detail">{html.escape(f['detail'])}</p>
           {f'<p class="topic">{html.escape(f["topic"])}</p>' if f.get('topic') else ''}
-          {pair}{img}
+          {img}
+          {f'<details class="words"><summary>the words, side by side</summary>{pair}</details>' if pair else ''}
         </article>""")
     summary = " ".join(
         f'<span class="pill">{html.escape(_KIND_LABEL.get(k, k))}: <b>{v}</b></span>'
@@ -618,6 +633,11 @@ h1 {{ font-size:20px; margin:0 0 4px }}
 .side .body {{ padding:9px 11px; max-height:340px; overflow:auto; font-size:13px; overflow-wrap:anywhere }}
 mark {{ background:#fde0de; color:#8a1711; font-weight:600; border-radius:2px; padding:0 2px }}
 .none {{ color:#aab }}
+.views {{ margin:10px 0 }}
+.shotbody {{ padding:8px; background:#fff; max-height:520px; overflow:auto }}
+.shotbody img {{ width:100%; border:1px solid var(--line); border-radius:4px; display:block }}
+details.words {{ margin-top:8px }}
+details.words summary {{ cursor:pointer; color:var(--muted); font-size:12px; margin-bottom:6px }}
 details.shot {{ margin-top:10px }}
 details.shot summary {{ cursor:pointer; color:var(--muted); font-size:12px }}
 details.shot img {{ max-width:100%; border:1px solid var(--line); border-radius:6px; margin-top:8px }}
@@ -667,9 +687,12 @@ def run(pdf_path: str, ditamap: str, out_dir: str, base: str = "", user: str = "
         rel = pdf_shot(pdf_path, f.get("page"), out_dir, f"pdf_{n}")
         if rel:
             shots[id(f)] = rel
-    if preview_shots and base and user:
-        for n, topic in enumerate(topics, start=1):
-            topic_shot(f"{base.rstrip('/')}{topic.path}", out_dir, f"topic_{n}", user, password)
+    # One render per topic, shared by every finding against it.
+    progress("drawing each topic from its markup")
+    for n, topic in enumerate(topics, start=1):
+        rel = topic_render_shot(topic, out_dir, f"topic_{n}")
+        if rel:
+            shots[("topic", topic.path)] = rel
     path = write_report(findings, out_dir, pdf_path, ditamap, len(topics), len(sections), shots)
     progress(f"report: {path}")
     return path
@@ -883,6 +906,111 @@ _KIND_LABEL.update({
     "style-link": "Link differs from the topic's markup",
     "style-count": "Styled element count differs",
 })
+
+
+# --- seeing both sides ------------------------------------------------------
+#
+# A list of differences in words is not enough to review a page by: a reviewer
+# has to SEE what is on it. So each finding carries two pictures - the PDF page
+# as it prints, and the topic rendered from its own markup - side by side.
+#
+# The topic render is NOT a screenshot of the AEM editor. That editor needs a
+# session login, and what it shows is mostly its own panels and toolbars. This
+# renders the markup itself: every <title>, <note>, <b>, <ul>, <table> drawn as
+# what it declares itself to be. Images resolve by UUID inside AEM and cannot
+# be fetched by path, so each one is drawn as a labelled placeholder - the
+# topic says a picture belongs there, and that is what can honestly be shown.
+
+_TOPIC_CSS = """
+body { margin:0; font:14px/1.6 -apple-system,Segoe UI,Roboto,Arial,sans-serif; color:#1a1a1a;
+       background:#fff; padding:26px 30px; }
+h1 { font:600 23px/1.3 Poppins,Segoe UI,Arial,sans-serif; color:#4b2e83; margin:0 0 14px }
+h2 { font:600 18px/1.3 Poppins,Segoe UI,Arial,sans-serif; color:#4b2e83; margin:20px 0 8px }
+h3 { font:600 15px/1.3 Poppins,Segoe UI,Arial,sans-serif; color:#4b2e83; margin:16px 0 6px }
+p { margin:0 0 10px }
+b, .uicontrol { font-weight:700 }
+.note { border:1px solid #cdddf7; background:#eef4fe; border-radius:6px; padding:9px 12px 9px 40px;
+        margin:10px 0; position:relative; font-size:13px }
+.note::before { content:"\270e"; position:absolute; left:12px; top:8px; width:20px; height:20px;
+        border-radius:50%; background:#4b2e83; color:#fff; text-align:center; line-height:20px;
+        font-size:12px }
+.note.warning::before { content:"!"; background:#a01515 } .note.warning { border-color:#e8a3a3; background:#fdf0f0 }
+ul, ol { margin:8px 0 12px 22px; padding:0 } li { margin:0 0 5px }
+a, .xref { color:#2d6cdf; text-decoration:underline }
+table { border-collapse:collapse; margin:10px 0; font-size:13px; width:100% }
+td, th { border:1px solid #d7dbe0; padding:5px 8px; text-align:left; vertical-align:top }
+th, .thead td { background:#efefef; font-weight:600 }
+.img { border:1px dashed #b9c0cc; border-radius:6px; background:#fafbfc; color:#7a8595;
+       padding:14px; margin:10px 0; text-align:center; font-size:11px;
+       font-family:ui-monospace,Menlo,monospace; overflow-wrap:anywhere }
+"""
+
+_BLOCK_AS = {"p": "p", "li": "li", "ul": "ul", "ol": "ol", "sl": "ul", "sli": "li",
+             "table": "table", "simpletable": "table", "row": "tr", "strow": "tr",
+             "entry": "td", "stentry": "td", "thead": "tbody", "tbody": "tbody",
+             "b": "b", "uicontrol": "b", "cmdname": "b", "wintitle": "b",
+             "xref": "span", "i": "i", "codeph": "code"}
+
+
+def render_topic_html(topic) -> str:
+    """The topic drawn as what its markup declares it to be."""
+    import html as _h
+
+    try:
+        root = _parse(topic.xml.encode("utf-8"))
+    except Exception:
+        return f"<!doctype html><meta charset=utf-8><style>{_TOPIC_CSS}</style><p>(topic could not be parsed)</p>"
+    depth = [0]
+
+    def walk(el) -> str:
+        tag = _tag(el)
+        if tag in _SKIP_TAGS:
+            return ""
+        inner = _h.escape(el.text or "")
+        for child in el:
+            inner += walk(child) + _h.escape(child.tail or "")
+        if tag == "title":
+            depth[0] += 1
+            return f"<h{min(depth[0], 3)}>{inner}</h{min(depth[0], 3)}>"
+        if tag == "note":
+            kind = (el.get("type") or "note").lower()
+            css = "note warning" if kind in ("warning", "caution", "danger", "important") else "note"
+            return f'<div class="{css}"><b>{kind.upper()}:</b> {inner}</div>'
+        if tag == "image":
+            href = (el.get("href") or "").rsplit("/", 1)[-1]
+            return f'<div class="img">&#128247; image declared by the topic<br>{_h.escape(href)}</div>'
+        if tag == "xref":
+            return f'<span class="xref">{inner}</span>'
+        as_tag = _BLOCK_AS.get(tag)
+        if as_tag:
+            return f"<{as_tag}>{inner}</{as_tag}>"
+        return inner
+
+    body = walk(root)
+    return (f"<!doctype html><meta charset=utf-8><title>{_h.escape(topic.title)}</title>"
+            f"<style>{_TOPIC_CSS}</style>{body}")
+
+
+def topic_render_shot(topic, out_dir: str, name: str) -> str | None:
+    """Render the topic to HTML and photograph it, so the report can show it."""
+    if not os.path.exists(CHROME):
+        return None
+    import subprocess
+
+    os.makedirs(os.path.join(out_dir, SHOTS), exist_ok=True)
+    html_path = os.path.join(out_dir, SHOTS, f"{name}.html")
+    with open(html_path, "w", encoding="utf-8") as fh:
+        fh.write(render_topic_html(topic))
+    rel = f"{SHOTS}/{name}.png"
+    try:
+        subprocess.run(
+            [CHROME, "--headless=new", "--disable-gpu", "--hide-scrollbars",
+             f"--screenshot={os.path.join(out_dir, rel)}", "--window-size=900,1300",
+             f"file://{os.path.abspath(html_path)}"],
+            capture_output=True, timeout=60, check=False)
+    except Exception:
+        return None
+    return rel if os.path.exists(os.path.join(out_dir, rel)) else None
 
 
 if __name__ == "__main__":
