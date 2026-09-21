@@ -794,13 +794,23 @@ def _check_broken_images(
         )
 
 
-def _broken_reason(doc: fitz.Document, page: int, img: ImageInfo) -> str | None:
+def _broken_reason(doc: fitz.Document, page: int, img: ImageInfo, stream_only: bool = False) -> str | None:
+    """Why this picture will not show, or None when it will.
+
+    `stream_only` keeps to the size-independent half of the test: an image
+    whose stream is empty or will not decode is broken whether it is a
+    full-page diagram or a 10pt icon. The render heuristics below are the
+    half that needs room to judge - a small icon legitimately paints as one
+    flat colour - so an icon is asked only the first question.
+    """
     if img.kind == "raster" and img.xref > 0:
         try:
             if not doc.extract_image(img.xref).get("image"):
                 return "embedded image stream is empty"
         except Exception:
             return "embedded image stream could not be decoded"
+    if stream_only:
+        return None
     try:
         rect = fitz.Rect(*img.bbox) & doc[page].rect
         if rect.is_empty:
@@ -1583,14 +1593,14 @@ def _attach(
     if exp_page is not None and _capturable(ctx.expected, exp_page, exp_bbox):
         prod = screenshots.capture_region(
             ctx.expected, exp_page, ctx.output_dir, f"image_{seq}_prod", exp_bbox,
-            screenshots.KIND_DIFF, label,
+            screenshots.KIND_IMAGE, label,
         )
         if prod:
             details["prod_screenshot"] = prod
     if act_page is not None and _capturable(ctx.actual, act_page, act_bbox):
         stage = screenshots.capture_region(
             ctx.actual, act_page, ctx.output_dir, f"image_{seq}_stage", act_bbox,
-            screenshots.KIND_DIFF, label,
+            screenshots.KIND_IMAGE, label,
         )
         if stage:
             details["stage_screenshot"] = stage

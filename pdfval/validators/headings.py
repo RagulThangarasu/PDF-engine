@@ -30,6 +30,8 @@ job is to check the embedded outline itself, so they must keep reading it raw.
 """
 from __future__ import annotations
 
+from pdfval import ocr as _ocr
+
 import collections
 import re
 
@@ -145,7 +147,7 @@ def synthesize_heading_entries(doc: fitz.Document) -> list[TocEntry]:
     for page_index in range(doc.page_count):
         table_boxes = _table_regions(doc, page_index)
         figure_boxes = _figure_regions(doc, page_index)
-        for b in doc[page_index].get_text("dict").get("blocks", []):
+        for b in _ocr.page_text_dict(doc, page_index).get("blocks", []):
             if b.get("type") != 0:
                 continue
             for line in b.get("lines", []):
@@ -190,6 +192,31 @@ def heading_line_index(doc: fitz.Document) -> dict[str, list[tuple[int, float, s
     body_size, body_heavy = body_style(doc)
     index: dict[str, list[tuple[int, float, str, bool]]] = {}
 
+    def join_spans(spans: list[dict]) -> str:
+        """Spans split by a style change mid-word (a font-size or weight
+        glitch on a single glyph, e.g. "VP8 decode" + "r") sit flush against
+        each other with no real gap; spans that are genuinely separate words
+        either already carry their own space or have a visible gap between
+        them. Always inserting a space at every span boundary glues a broken
+        word into two ("VP8 decoder" read back as "vp8 decode r"), which then
+        can never match its own title on the other side."""
+        out = ""
+        prev_x1 = None
+        for s in spans:
+            text = s.get("text", "")
+            if not text:
+                continue
+            x0 = s["bbox"][0]
+            if (
+                prev_x1 is not None and not out.endswith((" ", "\t"))
+                and not text.startswith((" ", "\t"))
+                and x0 - prev_x1 > 0.2 * (s.get("size") or 1.0)
+            ):
+                out += " "
+            out += text
+            prev_x1 = s["bbox"][2]
+        return out
+
     def add(text: str, page: int, y: float, styled: bool) -> None:
         text = " ".join(text.split())
         if not text or len(text) > _SEED_MAX_CHARS or looks_like_toc_listing(text):
@@ -199,7 +226,7 @@ def heading_line_index(doc: fitz.Document) -> dict[str, list[tuple[int, float, s
             index.setdefault(key, []).append((page, y, text, styled))
 
     for page_index in range(doc.page_count):
-        for b in doc[page_index].get_text("dict").get("blocks", []):
+        for b in _ocr.page_text_dict(doc, page_index).get("blocks", []):
             if b.get("type") != 0:
                 continue
             lines = [
@@ -208,13 +235,13 @@ def heading_line_index(doc: fitz.Document) -> dict[str, list[tuple[int, float, s
             ]
             for line in lines:
                 add(
-                    " ".join(s["text"] for s in line.get("spans", [])),
+                    join_spans(line.get("spans", [])),
                     page_index, line["bbox"][1],
                     _line_is_prominent(line, body_size, body_heavy),
                 )
             if 2 <= len(lines) <= 3:
                 whole = " ".join(
-                    " ".join(s["text"] for s in ln.get("spans", [])) for ln in lines
+                    join_spans(ln.get("spans", [])) for ln in lines
                 )
                 add(
                     whole, page_index, b["bbox"][1],

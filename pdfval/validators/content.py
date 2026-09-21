@@ -834,8 +834,6 @@ def _style_differences(exp_style: dict, act_style: dict) -> list[str]:
     diffs = []
     if exp_style["font"] != act_style["font"]:
         diffs.append("font family")
-    if exp_style["size"] != act_style["size"]:
-        diffs.append("font size")
     if exp_style["bold"] != act_style["bold"]:
         diffs.append("bold")
     if exp_style["italic"] != act_style["italic"]:

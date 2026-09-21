@@ -57,6 +57,7 @@ _CATEGORY_OF = {
     "table-header-repeat": "table", "figure-label-missing": "image", "figure-alignment": "image",
     "bold-missing": "bold",
     "underline-missing": "formatting", "underline-added": "formatting",
+    "italic-missing": "formatting", "italic-added": "formatting",
     "emphasis": "formatting", "size": "formatting", "colour": "formatting",
 }
 _CATEGORY_META = {
@@ -91,7 +92,8 @@ _TYPE_HELP = {
     "link-broken": "The link does not work in Staging.",
     "table-shape": "The table has a different number of rows or columns.",
     "table-merge": "Table cells are merged or split differently.",
-    "table-header-repeat": "A table that continues onto another page does not repeat its header row there.",
+    "table-header-repeat": "A table continues onto another page in Staging without printing its head row "
+                           "again, so the rows there have no column headings.",
     "icon-missing": "An inline icon printed beside these words in Production is not printed in Staging.",
     "icon-added": "Staging prints an inline icon beside these words that Production does not.",
     "icon-colour": "The same inline icon is printed in a clearly different colour in Staging.",
@@ -111,6 +113,8 @@ _TYPE_HELP = {
     "bold-added": "Words set regular in Production are bold in Staging.",
     "underline-missing": "Words underlined in Production are printed plain in Staging.",
     "underline-added": "Words printed plain in Production are underlined in Staging.",
+    "italic-missing": "Words set in italic in Production are upright in Staging.",
+    "italic-added": "Words set upright in Production are italic in Staging.",
 }
 
 # Unchanged words kept either side of a difference in the issue table - enough
@@ -302,6 +306,9 @@ def build_chapter_report(
             # among a dozen boxes round text that reads identically.
             level = diff.get("severity") or 1
             kind = _shots.KIND_DIFF if level <= FAILING_SEVERITY else _shots.KIND_CONTEXT
+            # A figure difference is boxed, not tinted - see KIND_IMAGE.
+            if kind == _shots.KIND_DIFF and _CATEGORY_OF.get(diff["type"]) == "image":
+                kind = _shots.KIND_IMAGE
             # A change repeated across the chapter is one finding, but every
             # place it occurs is still boxed - under the same number.
             occurrences = [(a, b)] + list(diff.get("repeats") or [])
@@ -445,6 +452,8 @@ def build_chapter_report(
         groups: dict[int, list[dict]] = {}
         for d in diffs:
             kind = _shots.KIND_DIFF if d["severity"] <= FAILING_SEVERITY else _shots.KIND_CONTEXT
+            if kind == _shots.KIND_DIFF and d.get("category") == "image":
+                kind = _shots.KIND_IMAGE
             d["prod_crop"] = _issue_shot(expected, d.pop("_exp"), output_dir, f"ch{n}_issue{d['n']}_prod", str(d["n"]), kind)
             d["stage_crop"] = _issue_shot(actual, d.pop("_act"), output_dir, f"ch{n}_issue{d['n']}_stage", str(d["n"]), kind)
             groups.setdefault(d["severity"], []).append(d)

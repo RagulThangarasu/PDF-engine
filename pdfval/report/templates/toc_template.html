@@ -30,31 +30,34 @@
   .toggle button.on { background: #2d6cdf; color: #fff; }
   .filter-search { margin-left: 10px; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; font-size: 12px; min-width: 200px; }
 
-  table.toc { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  /* The two tables of contents printed SIDE BY SIDE, each nested as its own
+     document nests it, with the structural verdict between them - so the
+     question "does Staging have the same structure as Production" is answered
+     by reading straight across one row. */
+  table.toc { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; table-layout: fixed; }
+  table.toc col.side { width: 40%; }
+  table.toc col.mid { width: 20%; }
+  td.side { overflow-wrap: anywhere; }
+  td.side.empty { background: #fbfbfc; }
+  td.side .lv { display: inline-block; min-width: 20px; font-size: 10px; font-weight: 700; color: #fff;
+                background: #97a3b4; border-radius: 4px; padding: 0 4px; margin-right: 6px; vertical-align: 1px; }
+  td.side .lv.l1 { background: #33415a; } td.side .lv.l2 { background: #5b7091; } td.side .lv.l3 { background: #8ea3bf; }
+  td.side .pg { color: var(--muted); font-size: 11px; margin-left: 6px; white-space: nowrap; }
+  td.side .dash { color: #c3c8d0; }
+  td.verdict { text-align: center; white-space: normal; }
+  td.verdict .why { display: block; color: var(--muted); font-size: 10px; margin-top: 3px; }
+  .ind1 { padding-left: 0; } .ind2 { padding-left: 18px; } .ind3 { padding-left: 36px; } .ind4 { padding-left: 54px; }
+  .badge.yes { background: #e7f6ec; color: #1a7a34; }
+  .badge.no { background: #fdecec; color: #a01515; }
+  tr.bad td { background: #fdf6f6; }
+  body.diffs-only tr.ok { display: none; }
   table.toc th { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); background: #fafbfc; }
   table.toc td { padding: 7px 10px; border-bottom: 1px solid #f0f1f3; vertical-align: top; }
-  table.toc td.h { overflow-wrap: anywhere; }
-  table.toc td.num { text-align: center; white-space: nowrap; color: #3a4757; }
-  table.toc td.lvl { text-align: center; white-space: nowrap; }
-  tr.st-missing td.h { color: var(--prod); }
-  tr.st-extra td.h { color: var(--stage); }
-  tr.st-missing td { background: #fdf4f4; }
-  tr.st-extra td { background: #f3fbf5; }
-  tr.st-changed td { background: #fffaf0; }
-  .indent-2 { padding-left: 16px; } .indent-3 { padding-left: 32px; } .indent-4 { padding-left: 48px; }
   .badge { display: inline-block; font-size: 10px; font-weight: 700; border-radius: 9px; padding: 1px 7px; white-space: nowrap; }
-  .badge.matched { background: #e7f6ec; color: #1a7a34; }
-  .badge.missing { background: #fdecec; color: #a01515; }
-  .badge.extra { background: #fde8c8; color: #7a4a00; }
-  .badge.changed { background: #fdefcf; color: #8a5a00; }
-  .lvlchg { color: var(--prod); font-weight: 700; }
-  .pgdelta { color: var(--muted); font-size: 11px; }
-  .note { font-size: 11px; color: var(--muted); }
   .warn { background: #fff6e5; border: 1px solid #f2dca8; border-radius: 8px; padding: 10px 14px; font-size: 12px; color: #7a5a12; margin-bottom: 14px; }
   .warn-notoc { background: #fdf0f0; border: 2px solid #e8a3a3; border-radius: 8px; padding: 12px 16px; font-size: 13px; color: #7a1a1a; margin-bottom: 14px; }
   .warn-notoc b { font-size: 14px; }
   .warn-notoc a { color: #7a1a1a; }
-  body.diffs-only tr.st-matched { display: none; }
 </style>
 </head>
 <body>
@@ -85,56 +88,58 @@
   {% endif %}
 
   <div class="cards">
-    <div class="card"><div class="n">{{ toc.expected_headings }}</div><div class="l">Prod bookmarks</div></div>
-    <div class="card"><div class="n">{{ toc.actual_headings }}</div><div class="l">Stage bookmarks</div></div>
-    <div class="card ok"><div class="n">{{ toc.counts.matched }}</div><div class="l">Matched</div></div>
-    <div class="card missing"><div class="n">{{ toc.counts.missing }}</div><div class="l">Missing (prod only)</div></div>
-    <div class="card extra"><div class="n">{{ toc.counts.extra }}</div><div class="l">Extra (stage only)</div></div>
-    <div class="card changed"><div class="n">{{ toc.counts.level_changed }}</div><div class="l">Nesting changed</div></div>
+    <div class="card ok"><div class="n">{{ toc.matching }}</div><div class="l">Matching</div></div>
+    <div class="card missing"><div class="n">{{ toc.not_matching }}</div><div class="l">Not matching</div></div>
+    <div class="card"><div class="n">{{ toc.expected_headings }}</div><div class="l">Prod entries</div></div>
+    <div class="card"><div class="n">{{ toc.actual_headings }}</div><div class="l">Stage entries</div></div>
+    <div class="card missing"><div class="n">{{ toc.counts.missing }}</div><div class="l">Prod only</div></div>
+    <div class="card extra"><div class="n">{{ toc.counts.extra }}</div><div class="l">Stage only</div></div>
+    <div class="card changed"><div class="n">{{ toc.counts.level_changed }}</div><div class="l">Level changed</div></div>
     <div class="card"><div class="n">{{ toc.counts.page_shifted }}</div><div class="l">Page moved</div></div>
   </div>
   <div class="warn">
-    <b>Every section is fully checked, sentence by sentence, by Content Validation</b> — this page only compares
-    the two PDFs' own embedded bookmark lists (whether a heading exists, its nesting level, its page), not the
-    wording or amount of content under it.
-  </div>
+    <b>“Matching” means the same heading at the same nesting level (L1 / L2 / L3) on both sides.</b>
+    A heading whose page number moved still matches — the two documents paginate differently by design, and
+    the page each one lands on is shown beside it. Every section's actual wording is checked separately, by
+    <a href="pdf.html">Content Validation</a>; this page compares structure only.
   </div>
 
   <div class="toggle">
-    <button id="btn-all" class="on" onclick="setMode('all')">All bookmarks</button>
-    <button id="btn-diff" onclick="setMode('diffs')">Differences only</button>
+    <button id="btn-all" class="on" onclick="setMode('all')">Whole structure</button>
+    <button id="btn-diff" onclick="setMode('diffs')">Not matching only</button>
   </div>
   <input class="filter-search" type="search" placeholder="Filter headings…" oninput="filterRows(this.value)">
 
   {% if toc.rows %}
   <table class="toc" id="toctable">
+    <colgroup><col class="side"><col class="mid"><col class="side"></colgroup>
     <thead><tr>
-      <th>Heading (bookmark)</th>
-      <th style="width:70px;text-align:center">Prod lvl</th>
-      <th style="width:70px;text-align:center">Stage lvl</th>
-      <th style="width:70px;text-align:center">Prod pg</th>
-      <th style="width:70px;text-align:center">Stage pg</th>
-      <th style="width:90px">Status</th>
-      <th style="width:230px">What changed</th>
+      <th>Production — table of contents</th>
+      <th style="text-align:center">Same structure?</th>
+      <th>Staging — table of contents</th>
     </tr></thead>
     <tbody>
     {% for r in toc.rows %}
-      <tr class="st-{{ r.status|lower }}" data-heading="{{ r.heading|lower }}">
-        {% set lvl = r.expected_level or r.actual_level or 1 %}
-        <td class="h indent-{{ lvl if lvl <= 4 else 4 }}">{{ r.heading }}</td>
-        <td class="lvl">{{ r.expected_level if r.expected_level is not none else '—' }}</td>
-        <td class="lvl">
-          {%- if r.level_changed -%}<span class="lvlchg">{{ r.actual_level }}</span>
-          {%- elif r.actual_level is not none -%}{{ r.actual_level }}
-          {%- else -%}—{%- endif -%}
+      <tr class="{{ 'ok' if r.match else 'bad' }}" data-heading="{{ r.heading|lower }}">
+        {% if r.prod %}
+        <td class="side ind{{ r.prod.level if r.prod.level <= 4 else 4 }}">
+          <span class="lv l{{ r.prod.level if r.prod.level <= 3 else 3 }}">L{{ r.prod.level }}</span>{{ r.prod.title }}<span class="pg">p.{{ r.prod.page }}</span>
         </td>
-        <td class="num">{{ r.expected_page if r.expected_page is not none else '—' }}</td>
-        <td class="num">{{ r.actual_page if r.actual_page is not none else '—' }}</td>
-        <td><span class="badge {{ r.status|lower }}">{{ r.status }}</span></td>
-        <td class="note">
-          {{ r.note }}
-          {%- if r.page_delta and not r.level_changed %} <span class="pgdelta">({{ '%+d'|format(r.page_delta) }} pages)</span>{% endif %}
+        {% else %}
+        <td class="side empty"><span class="dash">— not in Production —</span></td>
+        {% endif %}
+        <td class="verdict">
+          <span class="badge {{ 'yes' if r.match else 'no' }}">{{ 'Matching' if r.match else 'Not matching' }}</span>
+          {%- if r.reason %}<span class="why">{{ r.reason }}</span>{% endif -%}
+          {%- if r.match and r.page_delta %}<span class="why">page {{ '%+d'|format(r.page_delta) }}</span>{% endif -%}
         </td>
+        {% if r.stage %}
+        <td class="side ind{{ r.stage.level if r.stage.level <= 4 else 4 }}">
+          <span class="lv l{{ r.stage.level if r.stage.level <= 3 else 3 }}">L{{ r.stage.level }}</span>{{ r.stage.title }}<span class="pg">p.{{ r.stage.page }}</span>
+        </td>
+        {% else %}
+        <td class="side empty"><span class="dash">— not in Staging —</span></td>
+        {% endif %}
       </tr>
     {% endfor %}
     </tbody>

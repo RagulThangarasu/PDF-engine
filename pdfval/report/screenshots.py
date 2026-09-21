@@ -25,6 +25,10 @@ BOX_WIDTH = 4  # px
 # Both carry the same number badge, so box 3 on the left is box 3 on the right.
 KIND_DIFF = "diff"
 KIND_CONTEXT = "context"
+# A picture that differs is BOXED, never tinted: a fill over artwork hides the
+# very thing the reader is being asked to compare. Same bold red as a text
+# difference, so one document's findings still read as one set.
+KIND_IMAGE = "image"
 DIFF_COLOR = (210, 20, 20)
 CONTEXT_COLOR = (230, 130, 0)
 DIFF_FILL = (255, 70, 70, 40)
@@ -89,6 +93,8 @@ def draw_highlight(draw, img, rect: tuple, kind: str, label: str | None) -> None
     color = CONTEXT_COLOR if context else DIFF_COLOR
     if context:
         draw.rectangle([x0, y0, x1, y1], outline=color + (255,), width=CONTEXT_WIDTH)
+    elif kind == KIND_IMAGE:
+        draw.rectangle([x0, y0, x1, y1], outline=color + (255,), width=BOX_WIDTH - 1)
     else:
         draw.rectangle([x0, y0, x1, y1], fill=DIFF_FILL, outline=color + (255,), width=BOX_WIDTH - 1)
     if label:

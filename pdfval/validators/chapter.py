@@ -57,6 +57,7 @@ import itertools
 import re
 from collections import Counter
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 import fitz
 from diff_match_patch import diff_match_patch
@@ -203,12 +204,15 @@ class Element:
     spans: tuple = ()              # merged cells per table row (cells a merge swallowed)
     bold_words: tuple = ()         # the words of this element that are set bold, in order
     underline_words: tuple = ()    # the words of this element drawn with an underline rule, in order
+    italic_words: tuple = ()       # the words of this element set italic, in order
+    wraps: tuple = ()              # (last word, first word) around each line/page break joined into the text
     grid: tuple = ()               # table cell columns per row: ((x0, x1) | None, ...)
     row_boxes: tuple = ()          # table rows: ((page, bbox), ...), one per row of `cells`
     section: str = ""              # the nearest heading above it that BOTH documents have (normalised)
     icon_column: bool = False      # a table printing its icons in a column of their own
     drawn: bool = False            # a figure drawn as vector shapes rather than an embedded image
     headers: tuple = ()            # a table's header cells, as printed
+    ocr: bool = False              # text read by OCR off a scanned page (no text layer there)
 
     @property
     def page(self) -> int:
@@ -265,8 +269,25 @@ _PAGE_REF_RE = re.compile(
 # 2. Power input" on one side and "1. Speakers Power input" on the other while
 # printing the same thing. Marker STYLE is compared by Alignment Validation;
 # here only the words count.
+# An inline reference to a numbered callout on the facing diagram - "press the
+# release button (1), detach the stand (2 and 3)". One export draws those
+# numbers as circled vector glyphs and the other sets them as text, so the very
+# same sentence reads "release button ( ), detach" here and "release button ( 1
+# ), detach" there. Taken out of the comparison on BOTH sides: the numbers are
+# printed either way, and which glyph draws them is the figure check's
+# business, not the wording's. Only bare digits joined by "and"/"," qualify -
+# and the empty pair a dropped glyph leaves behind.
+_INLINE_CALLOUT_RE = re.compile(r"\((?:[\s,]|\d{1,2}|and\b)*\)", re.IGNORECASE)
+
 _LIST_MARKER_TOKEN_RE = re.compile(
     r"(?:(?<=\s)|^)(?:\((?:\d{1,2}|[a-z]|[ivx]{2,4})\)|(?:\d{1,2}|[a-z]|[ivx]{2,4}) ?[.)])(?=\s|$)"
+    # The same marker with NO space after it: Production typesets the step as
+    # "2.Remove the monitor stand." where Staging prints "2. Remove the monitor
+    # stand." - the same words, the number just set tight against them. Taken
+    # out on one side only, it read as a changed heading on every numbered step
+    # in the manual. Digits only: a single letter would swallow "e.g." and a
+    # roman numeral "i.e.".
+    r"|(?:(?<=\s)|^)\d{1,2}[.)](?=[^\W\d_])"
     r"|[\u2022\u25e6\u25aa\u25b8\u2023\u2043\u00b7\u2219]",
     re.IGNORECASE,
 )
@@ -286,6 +307,7 @@ def _normalise(text: str, fold_case: bool = True) -> str:
     text = i18n.fold_cjk_spaces(i18n.fold_width(i18n.fold_digits(_CONTROL_RE.sub("", text or ""))))
     text = _SOFT_HYPHEN_RE.sub(r"\1\2", text)
     text = _PAGE_REF_RE.sub(" ", text)
+    text = _INLINE_CALLOUT_RE.sub(" ", text)
     # "5)" closing an open bracket is text, not a list marker: "HEVC(H26 5)".
     text = _LIST_MARKER_TOKEN_RE.sub(
         lambda m: m.group(0) if m.group(0).endswith(")") and text[:m.start()].count("(") > text[:m.start()].count(")")
@@ -377,13 +399,17 @@ def _furniture(doc: fitz.Document) -> tuple[set, set]:
                     continue  # body text, not an edge line
                 if ceiling and _line_style(line)[0] > ceiling:
                     continue  # a heading printed at the top of its page
-                texts.setdefault(_furniture_key(text), set()).add(page_index)
+                # Keyed by edge: a running head repeats at the SAME edge. A body
+                # line that merely spills to the top of one page ("Channels: 8")
+                # and another at the bottom of a later one ("Channels: 2") is
+                # content, and dropping it reported the line missing.
+                texts.setdefault((_furniture_key(text), y0 < top), set()).add(page_index)
                 if _at_edge((0.0, y0, 0.0, y1), rect):
                     bands.setdefault(_band_of(y0, rect), set()).add(page_index)
 
     pages = max(1, doc.page_count)
     out = (
-        {t for t, seen in texts.items() if len(seen) >= _FURNITURE_MIN_PAGES},
+        {t for (t, _), seen in texts.items() if len(seen) >= _FURNITURE_MIN_PAGES},
         {b for b, seen in bands.items() if len(seen) / pages >= _FURNITURE_BAND_SHARE},
     )
     _FURNITURE_CACHE[key] = out
@@ -396,6 +422,8 @@ def _band_of(y0: float, rect) -> int:
 
 def reset_furniture_cache() -> None:
     _FURNITURE_CACHE.clear()
+    _SQUASHED_PAGES.clear()
+    _TABLE_BOX_CACHE.clear()
     _NAMES_CACHE.clear()
     _FIG_INDEX.clear()
     _MARGIN_CACHE.clear()
@@ -423,6 +451,11 @@ def _is_furniture(
     bottom = rect.y1 - rect.height * _FURNITURE_BAND
     if bbox[3] > top and bbox[1] < bottom:
         return False  # inside the body of the page
+    # A table's own cell - a row printed low on the page, or a value wrapped
+    # onto a line of its own ("720(1440) x" / "480") - is never a page number
+    # or running footer, however much it looks like one.
+    if _inside_table(doc, page_index, bbox):
+        return False
     texts, bands = _furniture(doc)
     key = _furniture_key(text)
     # Repeated text is furniture only in the outermost strip - or anywhere in
@@ -430,7 +463,8 @@ def _is_furniture(
     # opens "1. Open the System Settings menu." near the top of page after page
     # repeats too, and dropping it as a running header left every such
     # procedure one step short in Staging.
-    if key in texts and (_at_edge(bbox, rect) or _PAGE_NUMBER_KEY_RE.match(key)):
+    if key in texts and (_at_edge(bbox, rect) or (_PAGE_NUMBER_KEY_RE.match(key)
+                                                   and _alone_on_row(doc, page_index, bbox))):
         return True
     # A band holding text on most pages is where running headers sit - but in a
     # document set tight to the top of its pages it is also where every page's
@@ -438,6 +472,35 @@ def _is_furniture(
     # 2014/35/EU"). A running header stands apart from the body; a first line
     # runs straight on into the next one.
     return _at_edge(bbox, rect) and _band_of(bbox[1], rect) in bands and _stands_apart(doc, page_index, bbox)
+
+
+_TABLE_BOX_CACHE: dict[tuple, list] = {}
+
+
+def _inside_table(doc: fitz.Document, page_index: int, bbox: tuple) -> bool:
+    """This line sits inside a ruled table detected on the page."""
+    key = (id(doc), page_index)
+    if key not in _TABLE_BOX_CACHE:
+        from pdfval.extractor import _page_table_bboxes
+        try:
+            _TABLE_BOX_CACHE[key] = [tuple(b) for b in _page_table_bboxes(doc, page_index)]
+        except Exception:
+            _TABLE_BOX_CACHE[key] = []
+    cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+    return any(b[0] <= cx <= b[2] and b[1] <= cy <= b[3] for b in _TABLE_BOX_CACHE[key])
+
+
+def _alone_on_row(doc: fitz.Document, page_index: int, bbox: tuple) -> bool:
+    """No other text shares this line's row: a page number prints by itself,
+    a table's "150" has its row's other cells ("3810", "3321") beside it."""
+    height = max(1.0, bbox[3] - bbox[1])
+    for lb, _ in _text_lines(doc, page_index):
+        if abs(lb[0] - bbox[0]) < 0.5 and abs(lb[1] - bbox[1]) < 0.5:
+            continue  # the line itself
+        overlap = min(lb[3], bbox[3]) - max(lb[1], bbox[1])
+        if overlap >= 0.5 * height:
+            return False
+    return True
 
 
 def _stands_apart(doc: fitz.Document, page_index: int, bbox: tuple) -> bool:
@@ -570,6 +633,29 @@ def _line_underlined(doc: fitz.Document, page_index: int, bbox: tuple) -> bool:
     return False
 
 
+_RAISED_MARKS = {"tm": "\u2122", "sm": "\u2120", "r": "\u00ae", "(r)": "\u00ae"}
+
+
+def _raised_marks(spans: list[dict]) -> list[dict]:
+    """A trademark mark set as small raised letters ("Google TV" + a raised
+    "TM") read as the mark itself ("Google TV™"), glued to the word before it
+    - the way the other document prints it with the ™ character."""
+    body = max((float(sp.get("size") or 0) for sp in spans), default=0.0)
+    out: list[dict] = []
+    for sp in spans:
+        text = (sp.get("text") or "").strip()
+        mark = _RAISED_MARKS.get(text.casefold())
+        base = (sp.get("origin") or (0.0, 0.0))[1]
+        others = [(o.get("origin") or (0.0, 0.0))[1] for o in spans if o is not sp and (o.get("text") or "").strip()]
+        if mark and body and float(sp.get("size") or 0) < 0.8 * body and others and base < max(others) - 1.0:
+            if out:
+                out[-1] = {**out[-1], "text": (out[-1].get("text") or "").rstrip() + mark}
+                continue
+            sp = {**sp, "text": mark}
+        out.append(sp)
+    return out
+
+
 def _footnote_ref(span: dict) -> bool:
     return bool(span.get("flags", 0) & _SUPERSCRIPT_FLAG) and bool(_FOOTNOTE_REF_RE.match(span.get("text") or ""))
 
@@ -582,6 +668,9 @@ def _page_lines(
     order, with its geometry and styling - minus the page furniture."""
     page = doc[page_index]
     out: list[dict] = []
+    from pdfval import ocr
+    if ocr.is_scanned_page(doc, page_index):
+        return _scanned_page_lines(doc, page_index, y0, y1, body_size)
     try:
         data = page.get_text("dict")
     except Exception:
@@ -596,6 +685,7 @@ def _page_lines(
             # as "jack" -> "jack1", a content change that isn't one.
             line = {**line, "spans": [{**sp, "text": _CONTROL_RE.sub("", sp.get("text") or "")}
                                       for sp in line.get("spans", []) if not _footnote_ref(sp)]}
+            line["spans"] = _raised_marks(line["spans"])
             text = "".join(s.get("text", "") for s in line.get("spans", [])).strip()
             if not text:
                 continue
@@ -629,8 +719,48 @@ def _page_lines(
                     tuple(_TOKEN_RE.findall(text.casefold()))
                     if _line_underlined(doc, page_index, (bx0, by0, bx1, by1)) else ()
                 ),
+                "italic_words": tuple(
+                    w for sp in line.get("spans", []) if _span_italic(sp)
+                    for w in _TOKEN_RE.findall((sp.get("text") or "").casefold())
+                ),
             })
-    out.sort(key=lambda ln: (round(ln["bbox"][1], 1), ln["bbox"][0]))
+    # Reading order by baseline, left to right along each printed line: a
+    # superscript ("Google TV" + raised "TM brings together") tops out above
+    # the rest of its line, and ordering by the top edge put that fragment
+    # first - "TM brings together 6. When prompted..." - a sentence neither
+    # document prints.
+    out.sort(key=lambda ln: (ln["base"], ln["bbox"][0]))
+    rows: list[list[dict]] = []
+    for ln in out:
+        if rows and abs(ln["base"] - rows[-1][0]["base"]) <= _SAME_BASELINE:
+            rows[-1].append(ln)
+        else:
+            rows.append([ln])
+    return [ln for row in rows for ln in sorted(row, key=lambda ln: ln["bbox"][0])]
+
+
+def _scanned_page_lines(
+    doc: fitz.Document, page_index: int, y0: float, y1: float, body_size: float,
+) -> list[dict]:
+    """A scanned page's lines, read by OCR. The page has no text layer, so
+    without this every word on it would silently go uncompared. Style is not
+    knowable from pixels - bold/italic/colour are left neutral so no style
+    finding is ever raised from a guess."""
+    from pdfval import ocr
+    out: list[dict] = []
+    for bbox, text in ocr.ocr_lines(_page_words(doc).ocr_words(page_index)):
+        text = _CONTROL_RE.sub("", text).strip()
+        centre = (bbox[1] + bbox[3]) / 2
+        if not text or centre < y0 - 1 or centre > y1 + 1:
+            continue
+        size = max(1.0, (bbox[3] - bbox[1]) * 0.8)
+        if _is_furniture(doc, page_index, text, bbox, size, body_size):
+            continue
+        out.append({
+            "text": text, "bbox": bbox, "page": page_index, "base": bbox[3],
+            "size": size, "bold": 0.0, "italic": 0.0, "color": 0,
+            "bold_words": (), "underline_words": (), "italic_words": (), "ocr": True,
+        })
     return out
 
 
@@ -675,7 +805,7 @@ def _merge_rows(lines: list[dict]) -> list[dict]:
             if height > 0 and overlap >= 0.6 * height and -2.0 <= gap <= reach and not side_by_side_columns:
                 a_len, b_len = len(prev["text"]), len(line["text"])
                 total = (a_len + b_len) or 1
-                joiner = "" if line["text"][:1] in ".,;:)!?" else " "
+                joiner = "" if line["text"][:1] in ".,;:)!?\u2122\u2120\u00ae" else " "
                 prev.update({
                     "text": prev["text"] + joiner + line["text"],
                     "bbox": (
@@ -688,13 +818,18 @@ def _merge_rows(lines: list[dict]) -> list[dict]:
                     "color": prev["color"] if a_len >= b_len else line["color"],
                     "bold_words": tuple(prev.get("bold_words", ())) + tuple(line.get("bold_words", ())),
                     "underline_words": tuple(prev.get("underline_words", ())) + tuple(line.get("underline_words", ())),
+                    "italic_words": tuple(prev.get("italic_words", ())) + tuple(line.get("italic_words", ())),
+                    "ocr": bool(prev.get("ocr") or line.get("ocr")),
                 })
                 continue
         out.append(dict(line))
     return out
 
 
-def _paragraphs(lines: list[dict], heading_titles: set[str] | None = None) -> list[Element]:
+def _paragraphs(
+    lines: list[dict], heading_titles: set[str] | None = None,
+    doc: fitz.Document | None = None,
+) -> list[Element]:
     """Merge lines into paragraphs.
 
     This is where "the same paragraph wrapped differently" stops being a
@@ -707,10 +842,19 @@ def _paragraphs(lines: list[dict], heading_titles: set[str] | None = None) -> li
         if not run:
             return
         text = " ".join(ln["text"] for ln in run)
+        clean = _WS_RE.sub(" ", text).strip()
+        if doc is not None and _looks_like_extraction_garbage(clean):
+            box = (
+                min(ln["bbox"][0] for ln in run), min(ln["bbox"][1] for ln in run),
+                max(ln["bbox"][2] for ln in run), max(ln["bbox"][3] for ln in run),
+            )
+            recovered = _ocr_recover_text(doc, run[0]["page"], box)
+            if recovered and not _looks_like_extraction_garbage(recovered):
+                text = clean = recovered
         chars = sum(len(ln["text"]) for ln in run) or 1
         out.append(((round(run[0]["bbox"][1], 1), run[0]["bbox"][0]), Element(
             kind=KIND_TEXT,
-            text=_WS_RE.sub(" ", text).strip(),
+            text=clean,
             key=_normalise(text),
             boxes=[(run[0]["page"], (
                 min(ln["bbox"][0] for ln in run), min(ln["bbox"][1] for ln in run),
@@ -722,6 +866,9 @@ def _paragraphs(lines: list[dict], heading_titles: set[str] | None = None) -> li
             color=run[0]["color"],
             bold_words=tuple(w for ln in run for w in ln.get("bold_words", ())),
             underline_words=tuple(w for ln in run for w in ln.get("underline_words", ())),
+            italic_words=tuple(w for ln in run for w in ln.get("italic_words", ())),
+            wraps=tuple(_wrap_pairs([ln["text"] for ln in run])),
+            ocr=any(ln.get("ocr") for ln in run),
         )))
 
     def same_column(prev: dict, line: dict) -> bool:
@@ -813,6 +960,14 @@ _BARE_CALLOUT_RE = re.compile(
     r"^\s*(" + "|".join(sorted({re.escape(w) for w in i18n._CALLOUT_WORDS}, key=len, reverse=True)) + r")\s*[:：]?\s*$",
     re.IGNORECASE,
 )
+# The same label word, but leading a sentence it was never split apart from
+# ("Note Refer to..." - one printed line, no colon) rather than standing
+# alone on its own. Stripped, not matched-and-discarded: what is left of the
+# sentence is still worth comparing on its own honest terms.
+_LEADING_CALLOUT_RE = re.compile(
+    r"^\s*(?:" + "|".join(sorted({re.escape(w) for w in i18n._CALLOUT_WORDS}, key=len, reverse=True)) + r")\s*[:：]?\s+",
+    re.IGNORECASE,
+)
 
 
 def _is_fragment(el: Element) -> bool:
@@ -824,15 +979,36 @@ def _is_fragment(el: Element) -> bool:
     return len(text) <= 3 and not any(ch.isalpha() for ch in text)
 
 
-def _table_element(table: dict, page_index: int) -> Element:
+def _ocr_recover_text(doc: fitz.Document, page_index: int, bbox) -> str:
+    """Best-effort reading of a region whose text layer came back unreadable -
+    a subset font with no (or a broken) ToUnicode map, most often on a
+    multi-language compliance/RoHS table. OCR reads the rendered glyphs
+    directly, bypassing the font's character map entirely, so it still works
+    where the text layer cannot. Empty wherever Tesseract is unavailable or
+    the region genuinely has no legible text; the caller keeps the original
+    (unreadable) extraction in that case rather than losing the row."""
+    from pdfval import ocr
+
+    try:
+        words = ocr.words_in(_page_words(doc).ocr_words(page_index), tuple(float(v) for v in bbox), margin=2)
+    except Exception:
+        return ""
+    return " ".join(words)
+
+
+def _table_element(table: dict, page_index: int, doc: fitz.Document | None = None) -> Element:
     rows = [[_normalise(c or "") for c in row] for row in (table.get("rows") or [])]
-    text = " | ".join(" ".join(c for c in row if c) for row in rows if any(row))
+    text = " | ".join(
+        " ".join((c or "").strip() for c in row if (c or "").strip())
+        for row in (table.get("rows") or []) if any((c or "").strip() for c in row)
+    )
+    if doc is not None and _looks_like_extraction_garbage(text):
+        recovered = _ocr_recover_text(doc, page_index, table["bbox"])
+        if recovered and not _looks_like_extraction_garbage(recovered):
+            text = recovered
     return Element(
         kind=KIND_TABLE,
-        text=" | ".join(
-            " ".join((c or "").strip() for c in row if (c or "").strip())
-            for row in (table.get("rows") or []) if any((c or "").strip() for c in row)
-        ),
+        text=text,
         key=_normalise(text),
         boxes=[(page_index, tuple(float(v) for v in table["bbox"]))],
         rows=len(rows),
@@ -871,7 +1047,7 @@ def _document_tables(doc: fitz.Document, pdf_path: str) -> list[Element]:
         except Exception:
             continue
         for t in regions:
-            el = _table_element(t, page_index)
+            el = _table_element(t, page_index, doc)
             if el.rows >= _TABLE_ANCHOR_MIN_ROWS and el.key:
                 out.append(el)
     out.sort(key=lambda e: (e.page, e.bbox[1]))
@@ -921,6 +1097,55 @@ def table_anchors(
             "prod": {"page": exp_el.page + 1, "y": _page_y_share(expected, exp_el.page, exp_el.bbox[1])},
             "stage": {"page": act_el.page + 1, "y": _page_y_share(actual, act_el.page, act_el.bbox[1])},
         })
+    return out
+
+
+# Paragraph-level scroll-sync waypoints. Headings and tables are landmarks a
+# chapter has a handful of; between two of them the viewer can only interpolate
+# by proportion, and two documents that paginate the same chapter differently
+# (59 pages against 52) drift apart in the middle of it - the reader sees
+# Production's page 53 beside Staging's 47. Every matched paragraph is a
+# landmark, and there are hundreds of them, so the two panes can track each
+# other line for line instead of chapter for chapter.
+_CONTENT_ANCHORS_PER_PAGE = 4    # more than this on one Production page is more than the eye needs
+_CONTENT_ANCHOR_GAP = 24.0       # pt: two waypoints closer than this are one place
+
+
+def content_anchors(chapters: list, expected: fitz.Document, actual: fitz.Document) -> list[dict]:
+    """A sync-only waypoint per matched paragraph, figure or table - anything
+    `pair_elements` paired up and both sides actually print.
+
+    Only genuinely matched pairs qualify: a group one side has alone says
+    nothing about where the other side is, and a pair marked "moved" says the
+    opposite of what a waypoint means.
+    """
+    out: list[dict] = []
+    per_page: Counter = Counter()
+    last_y: dict[int, float] = {}
+    for chapter in chapters or []:
+        for pair in getattr(chapter, "pairs", None) or []:
+            exp_group, act_group = pair[0], pair[1]
+            note = pair[2] if len(pair) > 2 else ""
+            if not exp_group or not act_group or note == "moved":
+                continue
+            a, b = exp_group[0], act_group[0]
+            if not getattr(a, "boxes", None) or not getattr(b, "boxes", None):
+                continue
+            exp_page, exp_bbox = a.boxes[0]
+            act_page, act_bbox = b.boxes[0]
+            if not (0 <= exp_page < expected.page_count and 0 <= act_page < actual.page_count):
+                continue
+            if per_page[exp_page] >= _CONTENT_ANCHORS_PER_PAGE:
+                continue
+            if abs(exp_bbox[1] - last_y.get(exp_page, -1e9)) < _CONTENT_ANCHOR_GAP:
+                continue
+            per_page[exp_page] += 1
+            last_y[exp_page] = exp_bbox[1]
+            out.append({
+                "title": (getattr(a, "text", "") or "")[:60], "level": 0, "sync_only": True,
+                "prod": {"page": exp_page + 1, "y": _page_y_share(expected, exp_page, exp_bbox[1])},
+                "stage": {"page": act_page + 1, "y": _page_y_share(actual, act_page, act_bbox[1])},
+            })
     return out
 
 
@@ -1277,6 +1502,60 @@ def _trim_figure(bbox: tuple, lines: list[dict]) -> tuple:
 _LEADING_ICON_GAP = 12.0  # pt: this close to where a line of text starts, it is that line's own icon
 
 
+def _piece_of_matched(fig: "Element", figs: list["Element"], matched: set[int]) -> bool:
+    """Is this "missing" picture only a slice of one already found?
+
+    One document builds an illustration out of strips - Production's OSD
+    screenshot is a title bar, a body and a footer, each its own image - where
+    the other prints the whole thing as one picture. The big piece matches and
+    the strips butted against it are left over, each reported missing though
+    every pixel of them is printed on the other side inside the picture that
+    did match."""
+    if not fig.boxes:
+        return False
+    page_index, bbox = fig.boxes[0]
+    mine = fitz.Rect(bbox) + (-3, -3, 3, 3)
+    for j in matched:
+        other = figs[j] if 0 <= j < len(figs) else None
+        if other is None or not other.boxes:
+            continue
+        page_other, bbox_other = other.boxes[0]
+        if page_other == page_index and mine.intersects(fitz.Rect(bbox_other)):
+            return True
+    return False
+
+
+def _note_badges(doc: fitz.Document, fig: "Element") -> bool:
+    """Is this "picture" really the small badge (or column of badges) that
+    marks a note, each one set immediately before a line of text?
+
+    Production draws its note icon as vector shapes, and two notes one under
+    the other cluster into a single tall, narrow figure that no longer looks
+    icon-sized to `_is_leading_icon`. Staging marks the same notes its own
+    way - its own icon and a printed "NOTE:" / "TIP:" heading - so reporting
+    the badge as a picture Staging is missing is just the two documents'
+    callout styling, which is never expected to match."""
+    if not fig.boxes or fig.width > _ICON_MAX_SIDE:
+        return False
+    page_index, (x0, y0, x1, y1) = fig.boxes[0]
+    try:
+        data = doc[page_index].get_text("dict")
+    except Exception:
+        return False
+    beside = 0
+    for block in data.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            if not "".join(sp.get("text", "") for sp in line.get("spans", [])).strip():
+                continue
+            lx0, ly0, lx1, ly1 = line["bbox"]
+            centre = (ly0 + ly1) / 2
+            if y0 - 2 <= centre <= y1 + 2 and 0 <= lx0 - x1 <= _LEADING_ICON_GAP:
+                beside += 1
+    return beside > 0
+
+
 def _is_leading_icon(doc: fitz.Document, page_index: int, bbox: tuple) -> bool:
     """A small image sitting immediately before a line of text - Production's
     pencil icon marking a NOTE it never spells out in words - is that line's
@@ -1454,9 +1733,15 @@ def _stitch_across_pages(elements: list[Element]) -> list[Element]:
             and el.page > prev.page
             and _ends_open(prev.text) and _starts_continuation(el.text)
         ):
+            prev.wraps = prev.wraps + tuple(_wrap_pairs([prev.text, el.text])) + el.wraps
             prev.text = f"{prev.text} {el.text}".strip()
             prev.key = _normalise(prev.text)
             prev.boxes = prev.boxes + el.boxes
+            # The continuation's own styling travels with its words: dropping
+            # it left bold or underline on the second page never compared.
+            prev.bold_words = prev.bold_words + el.bold_words
+            prev.underline_words = prev.underline_words + el.underline_words
+            prev.italic_words = prev.italic_words + el.italic_words
             continue
         out.append(el)
     return out
@@ -1594,11 +1879,11 @@ def collect_elements(
         ]
 
         page_elements = [
-            el for el in _paragraphs(lines, heading_titles)
+            el for el in _paragraphs(lines, heading_titles, doc)
             if not _is_fragment(el) and not _BARE_CALLOUT_RE.match(el.text)
         ]
         for t in tables:
-            table_el = _table_element(t, page_index)
+            table_el = _table_element(t, page_index, doc)
             table_el.header_fill = _header_fill(doc, page_index, _header_bbox(t))
             page_elements.append(table_el)
         page_elements += [
@@ -1629,6 +1914,29 @@ def collect_elements(
 
 
 _TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
+
+
+def _wrap_pairs(lines: list[str]) -> list[tuple[str, str]]:
+    """(last word of a line, first word of the next) at each break between
+    `lines` joined into one text - where a space the joining put there is the
+    wrap's, not the text's."""
+    out: list[tuple[str, str]] = []
+    for before, after in zip(lines, lines[1:]):
+        tail, head = _TOKEN_RE.findall(before or ""), _TOKEN_RE.findall(after or "")
+        if tail and head:
+            out.append((tail[-1].casefold(), head[0].casefold()))
+    return out
+
+
+_ITALIC_FONT_RE = re.compile(r"italic|oblique|[-,]it$", re.IGNORECASE)
+
+
+def _span_italic(span: dict) -> bool:
+    """A span set in an italic or oblique face - by the font's flag, or by its
+    name when the flag is not set (many embedded subsets leave it off)."""
+    if not (span.get("text") or "").strip():
+        return False
+    return bool(span.get("flags", 0) & _ITALIC_FLAG) or bool(_ITALIC_FONT_RE.search(span.get("font") or ""))
 
 
 def _tokens(text: str) -> "Counter[str]":
@@ -1829,6 +2137,9 @@ def merge_elements(elements: list[Element]) -> Element | None:
         color=elements[0].color,
         bold_words=tuple(w for e in elements for w in e.bold_words),
         underline_words=tuple(w for e in elements for w in e.underline_words),
+        italic_words=tuple(w for e in elements for w in e.italic_words),
+        wraps=tuple(w for e in elements for w in e.wraps)
+        + tuple(_wrap_pairs([e.text for e in elements if e.text])),
         label=next((e.label for e in elements if e.label), ""),
         rows=len(table_rows) if table_rows is not None else sum(e.rows for e in elements),
         cols=max((e.cols for e in elements), default=0),
@@ -1839,6 +2150,7 @@ def merge_elements(elements: list[Element]) -> Element | None:
         header_fill=next((e.header_fill for e in elements if e.header_fill is not None), None),
         icon_column=any(e.icon_column for e in elements),
         headers=next((e.headers for e in elements if e.headers), ()),
+        ocr=any(e.ocr for e in elements),
         grid=grid,
         spans=spans,
         row_boxes=row_boxes,
@@ -1873,6 +2185,7 @@ def _group_score(left: list[Element], right: list[Element]) -> float:
 
 
 _MAX_MERGE = 3  # how many of one side's elements may answer to one of the other's
+_ABSORB_MIN = 0.85  # share of a further piece's words the other side's group must hold to take it in
 _MEMBER_MIN = 0.5  # share of each group member's words the other side must carry
 
 
@@ -1897,6 +2210,28 @@ def _column_ok(group: list[Element]) -> bool:
         return True
     lo, hi = max(r[0] for r in ranges), min(r[1] for r in ranges)
     return hi - lo >= -_PARAGRAPH_COLUMN_SLACK
+
+
+_FUTURE_REACH = 30  # how far down the other run an element's counterpart is looked for
+
+
+def _has_future(el: Element, other: list[Element], start: int) -> bool:
+    """`el` answers to something further down `other`, from `start` on."""
+    floor = _FIGURE_PAIR_MIN if el.kind == KIND_FIGURE else _PAIR_MIN_RATIO
+    return any(_family(o) == _family(el) and _pairable(el, o) >= floor
+               for o in other[start + 1:start + 1 + _FUTURE_REACH])
+
+
+def _unused_share(piece: Element, whole: list[Element], taken: list[Element]) -> float:
+    """Share of `piece`'s words that `whole` prints and `taken` has not
+    already answered for - a sentence printed a second time is not part of
+    the paragraph its first copy already matched."""
+    want = Counter(_TOKEN_RE.findall(piece.key))
+    if not want:
+        return 0.0
+    left_over = Counter(_TOKEN_RE.findall(" ".join(e.key for e in whole))) \
+        - Counter(_TOKEN_RE.findall(" ".join(e.key for e in taken)))
+    return sum((want & left_over).values()) / sum(want.values())
 
 
 def _align_run(left: list[Element], right: list[Element]) -> list[tuple]:
@@ -1958,7 +2293,21 @@ def _align_run(left: list[Element], right: list[Element]) -> list[tuple]:
                 if best_key is None or key > best_key:
                     best, best_key = (m, n), key
         if best is None:
-            # Whichever side's next element has no future here at all moves on.
+            # Whichever side's next element has no future here at all moves on:
+            # a run of diagram labels only Production prints must not push
+            # Staging's next paragraph out as "added" when that paragraph's
+            # own counterpart is only a few labels further down Production's
+            # run - it was then re-paired as "moved", though in its place.
+            future_left = _has_future(left[i], right, j)
+            future_right = _has_future(right[j], left, i)
+            if future_right and not future_left:
+                pairs.append(([left[i]], []))
+                i += 1
+                continue
+            if future_left and not future_right:
+                pairs.append(([], [right[j]]))
+                j += 1
+                continue
             ahead_left = max(
                 (_group_score([left[i]], right[j:j + n]) for n in range(1, min(_MAX_MERGE, len(right) - j) + 1)),
                 default=0.0,
@@ -1975,6 +2324,16 @@ def _align_run(left: list[Element], right: list[Element]) -> list[tuple]:
                 i += 1
             continue
         m, n = best
+        # A paragraph one side prints as more pieces than `_MAX_MERGE` allows
+        # (Production's one "You can set..." block against Staging's six lines
+        # and bullets): keep taking the next piece while it is plainly part of
+        # the other side's text, rather than leaving the tail "only in Staging".
+        while j + n < len(right) and _family(right[j + n]) == _family(left[i]) and _column_ok(right[j:j + n + 1]) \
+                and _unused_share(right[j + n], left[i:i + m], right[j:j + n]) >= _ABSORB_MIN:
+            n += 1
+        while i + m < len(left) and _family(left[i + m]) == _family(right[j]) and _column_ok(left[i:i + m + 1]) \
+                and _unused_share(left[i + m], right[j:j + n], left[i:i + m]) >= _ABSORB_MIN:
+            m += 1
         pairs.append((left[i:i + m], right[j:j + n]))
         i += m
         j += n
@@ -2050,7 +2409,13 @@ def pair_elements(exp: list[Element], act: list[Element]) -> list[tuple]:
                 best, best_score = kj, score
         if best is not None:
             used.add(best)
-            pairs[ki] = ([a], [pairs[best][1][0]], "moved")
+            # Out of sequence only when content both sides print in place sits
+            # between the two: with nothing matched in between, the element is
+            # where Production has it, however the runs around it were divided.
+            lo, hi = sorted((ki, best))
+            crossed = any(p is not None and p[0] and p[1] and (len(p) < 3 or p[2] != "moved")
+                          for p in pairs[lo + 1:hi])
+            pairs[ki] = ([a], [pairs[best][1][0]], "moved" if crossed else "")
             pairs[best] = None
     pairs = [p for p in pairs if p is not None]
     return [(p[0], p[1], p[2] if len(p) > 2 else "") for p in pairs]
@@ -2325,7 +2690,8 @@ _NEARBY_PICTURE = 60.0  # points around a paired block to look for the same pict
 _ICON_GAP_REACH = 30.0  # pt: how far a word may sit from an icon it anchors, matching `collect()`'s own reach
 
 
-def _unrendered_mark_nearby(doc: fitz.Document, group: list["Element"], word: str) -> bool:
+def _unrendered_mark_nearby(doc: fitz.Document, group: list["Element"], word: str,
+                            claimed: set | None = None) -> bool:
     """Whether the OTHER document draws ANY ink at all - no size, shape or
     primitive-count floor, unlike every other icon/figure detector in this
     file - beside the same word, in the block being compared.
@@ -2357,7 +2723,14 @@ def _unrendered_mark_nearby(doc: fitz.Document, group: list["Element"], word: st
             words = doc[p].get_text("words")
         except Exception:
             continue
-        known_icons = [fitz.Rect(b) for _, b in _page_icons(doc, p)]
+        # Only ink a DIFFERENT icon of this comparison already answers for is
+        # discounted. An icon this side prints but never offered up for
+        # comparison - its nearest word is a full stop, so it is anchored to
+        # nothing ("works the same with [icon].") - answers for nothing under
+        # the old rule, and the other side's copy of that very icon read as
+        # added. It is printed all the same, and it is what is being asked about.
+        known_icons = ([fitz.Rect(b) for _, b in claimed] if claimed is not None
+                       else [fitz.Rect(b) for _, b in _page_icons(doc, p)])
         for w in words:
             if _normalise(w[4]) != norm:
                 continue
@@ -2377,6 +2750,21 @@ def _unrendered_mark_nearby(doc: fitz.Document, group: list["Element"], word: st
             except Exception:
                 continue
     return False
+
+
+_ARTWORK_OVER_ICON = 4.0  # a region this many times the icon's area is a picture holding it
+
+
+def _inside_artwork(doc: fitz.Document, page_index: int, bbox: tuple) -> bool:
+    """Is this small shape a detail drawn inside a larger picture?"""
+    r = fitz.Rect(bbox)
+    area = max(1.0, _rect_area(r))
+    try:
+        boxes = _page_artwork_boxes(doc, page_index)
+    except Exception:
+        return False
+    return any(_rect_area(art) >= _ARTWORK_OVER_ICON * area and art.contains(r)
+               for art in boxes)
 
 
 def icon_changes(exp_group: list[Element], act_group: list[Element],
@@ -2410,6 +2798,16 @@ def icon_changes(exp_group: list[Element], act_group: list[Element],
                     if icon in seen or not (x0 - 30 <= cx <= x1 + 30 and y0 - 4 <= cy <= y1 + 4):
                         continue
                     seen.add(icon)
+                    # A detail DRAWN INSIDE an illustration - the sticker and
+                    # the rubber in the monitor diagram - is part of that
+                    # picture, not an icon beside the words. It can still fall
+                    # within reach of a text block set alongside the picture,
+                    # where it read as an icon "beside" whatever word was
+                    # nearest and was reported missing although the other side
+                    # prints the same illustration. The picture itself is
+                    # compared as a figure.
+                    if _inside_artwork(doc, page_index, (ix0, iy0, ix1, iy1)):
+                        continue
                     # A callout's own icon sits in the margin to the LEFT of
                     # its whole text block, beside the top of it - an inline
                     # icon ("System Settings [icon] menu") sits INSIDE a line
@@ -2535,8 +2933,12 @@ def icon_changes(exp_group: list[Element], act_group: list[Element],
         entries = [e for e in entries if mine[_normalise(e[1])] > theirs[_normalise(e[1])]]
         doc_mine, doc_other, other_blocks = ((expected, actual, act_group) if kind == "icon-missing"
                                              else (actual, expected, exp_group))
+        # Icons the other side DID offer for comparison, so their ink cannot
+        # excuse this one (see `_unrendered_mark_nearby`).
+        claimed_other = {ic for v in (icons_b if kind == "icon-missing" else icons_a).values()
+                         for ic, _ in v}
         entries = [e for e in entries if not _same_picture_nearby(doc_mine, e[0], doc_other, other_blocks)
-                   and not _unrendered_mark_nearby(doc_other, other_blocks, e[1])]
+                   and not _unrendered_mark_nearby(doc_other, other_blocks, e[1], claimed_other)]
         for (icon, word) in entries:
             where = f"beside “{word}”"
             verb = "missing in Staging" if kind == "icon-missing" else "added in Staging"
@@ -2625,8 +3027,20 @@ def marker_changes(exp_group: list[Element], act_group: list[Element],
             continue
         item = (prod_marker, stage_marker, b.key, a, b)
         if stage_marker and not prod_marker:
+            # The same callout restyling, the other way round: Production sets
+            # the note as plain lines beside its icon, Staging bullets them
+            # inside its "WARNING:" panel.
+            if _callout_restyled(a, b, expected, actual):
+                continue
             added.append(item)
         elif prod_marker and not stage_marker:
+            # Unless it is the two documents' own way of setting a note:
+            # Production bullets the lines of a note it marks with a small
+            # icon, Staging prints the same words in a labelled "NOTE:" /
+            # "TIP:" panel, where a bullet would be redundant. The same
+            # layout is never expected of the other document.
+            if _callout_restyled(a, b, expected, actual):
+                continue
             removed.append(item)
         elif _marker_kind(prod_marker) != _marker_kind(stage_marker):
             restyled.append(item)
@@ -2679,6 +3093,22 @@ def _page_fills(doc: fitz.Document, page_index: int) -> list["fitz.Rect"]:
             pass
         _FILL_CACHE[key] = fills
     return _FILL_CACHE[key]
+
+
+def _callout_restyled(own: Element, other: Element | None,
+                      own_doc: fitz.Document | None, other_doc: fitz.Document | None) -> bool:
+    """Is this "lost" list marker just the two documents' own way of setting a
+    note? Production marks one with a small icon beside the line and bullets
+    what follows; Staging redesigns it as a shaded box headed "NOTE:" or
+    "TIP:", where a bullet would be redundant. Either side's callout styling
+    answers for the other's - the layouts are not expected to match."""
+    if other is None or own_doc is None or other_doc is None:
+        return False
+    if other.kind == KIND_NOTE or other.label:
+        return True  # the other side heads it "NOTE:" / "TIP:" instead
+    if _on_shading(other_doc, other) and not _on_shading(own_doc, own):
+        return True  # set apart as a panel there, as a bulleted line here
+    return _has_note_icon(own_doc, own) or _has_note_icon(other_doc, other)
 
 
 def _on_shading(doc: fitz.Document, el: Element) -> bool:
@@ -2761,6 +3191,39 @@ def _has_note_icon(doc: fitz.Document, el: Element) -> bool:
     return False
 
 
+_NOTE_RUN_GAP = 8.0     # pt between two lines of one note's own run
+_NOTE_RUN_INDENT = 14.0  # pt their left edges may differ by
+
+
+def _in_icon_note(doc: fitz.Document, topic_elements: list[Element] | None, el: Element) -> bool:
+    """`el` belongs to a note Production marks with an icon: the icon sits
+    beside it, or beside an earlier line of the same unbroken run of lines -
+    a note of three bullets draws its icon beside the first one only, and the
+    third bullet is no less part of that note.
+    """
+    if _has_note_icon(doc, el):
+        return True
+    if not topic_elements:
+        return False
+    order = [e for e in topic_elements if e.boxes]
+    at = next((i for i, e in enumerate(order) if e is el), None)
+    if at is None:
+        return False
+    current = el
+    for prev in reversed(order[:at]):
+        page_prev, bbox_prev = prev.boxes[-1]
+        page_cur, bbox_cur = current.boxes[0]
+        # Two lines set tight can overlap their glyph boxes a little.
+        slack = 0.6 * max(1.0, bbox_cur[3] - bbox_cur[1])
+        if page_prev != page_cur or not (-slack <= bbox_cur[1] - bbox_prev[3] <= _NOTE_RUN_GAP) \
+                or abs(bbox_cur[0] - bbox_prev[0]) > _NOTE_RUN_INDENT:
+            return False
+        if _has_note_icon(doc, prev):
+            return True
+        current = prev
+    return False
+
+
 def _previous_element(topic_elements: list[Element], el: Element) -> Element | None:
     """Whatever comes right before `el` in this topic's own reading order."""
     for i, e in enumerate(topic_elements):
@@ -2831,6 +3294,7 @@ def shading_changes(exp_group: list[Element], act_group: list[Element],
             prev_act = _previous_element(act_topic, texts_b[0])
             if (prev_exp is not None and prev_act is not None
                     and _has_note_icon(expected, prev_exp)
+                    and not _in_icon_note(expected, exp_topic, texts_a[0])
                     and _same_shaded_region(actual, prev_act, texts_b[0])):
                 return [{
                     "type": "shading", "kind": texts_b[0].kind,
@@ -2838,6 +3302,12 @@ def shading_changes(exp_group: list[Element], act_group: list[Element],
                                 "as its own separate paragraph right after the note, but Staging's shaded "
                                 "note box has grown to cover it too."),
                     "detail": "",
+                    # Not a styling nuance like the other "shading" findings:
+                    # ordinary instructions are being presented to the reader as
+                    # part of a NOTE, which changes what the document tells them
+                    # to do. Flagged critical so it is drawn and ranked like
+                    # content lost outright, not filed under "how text is set".
+                    "critical": True,
                 }]
         return []
     if any(_has_note_icon(expected, e) for e in texts_a):
@@ -2847,7 +3317,9 @@ def shading_changes(exp_group: list[Element], act_group: list[Element],
                         "icon beside the text, Staging prints it as plain text with no shading or other "
                         "note styling to replace it."),
             "detail": "",
-            "minor": True,
+            # A note a reader can no longer tell from ordinary text is a real
+            # loss, not a styling nuance: drawn red, like missing content.
+            "critical": True,
         }]
     return []
 
@@ -3124,8 +3596,9 @@ def table_header_repeats(actual: fitz.Document, actual_path: str | None, pages: 
                             boxes=[(cont["page"], tuple(float(v) for v in cont["bbox"]))])
             out.append({
                 "type": "table-header-repeat", "kind": KIND_TABLE, "exp": None, "act": where,
-                "summary": (f"Table header missing on the continued page — the table that starts on Staging "
-                            f"p.{anchor_page + 1} continues onto p.{cont['page'] + 1} without repeating its header row."),
+                "summary": (f"Table head missing on the continued page — the table that starts on Staging "
+                            f"p.{anchor_page + 1} continues onto p.{cont['page'] + 1} and its head row is not "
+                            f"printed again there, so the continued rows have no column headings."),
                 "detail": (f"Header row: “{(t.get('header') or '')[:100]}” · first row on p.{cont['page'] + 1}: "
                            f"“{(cont.get('first_row') or '')[:100]}”"),
             })
@@ -3278,6 +3751,36 @@ def _marker_before(
     return None
 
 
+def _row_carries_marker(table: Element, key: str, marker: str, doc: fitz.Document | None = None) -> bool:
+    """A row of `table` whose own first cell is `marker` ("4." / "4") and
+    whose other cells open with the item's words. A first cell the table
+    reader left empty - the number set on the row's top rule - is read off
+    the page inside that cell."""
+    want = re.sub(r"[.)\s]+$", "", marker or "").casefold()
+    opening = _TOKEN_RE.findall(key)[:4]
+    if not want or not opening:
+        return False
+    for i, row in enumerate(table.cells or ()):
+        if not row:
+            continue
+        rest = [c for c in row[1:] if c and c.strip()]
+        if not rest or _TOKEN_RE.findall(" ".join(rest).casefold())[:len(opening)] != opening:
+            continue
+        first = (row[0] or "").strip()
+        if not first and doc is not None and i < len(table.row_boxes):
+            page_index, (x0, y0, x1, y1) = table.row_boxes[i]
+            cell = table.grid[i][0] if i < len(table.grid) and table.grid[i] and table.grid[i][0] else None
+            if cell:
+                x0, x1 = cell
+            try:
+                first = doc[page_index].get_textbox(fitz.Rect(x0, y0 - 4, x1, y1)).strip()
+            except Exception:
+                first = ""
+        if re.sub(r"[.)\s]+$", "", first).casefold() == want:
+            return True
+    return False
+
+
 def _icon_leads_line(doc: fitz.Document, page_index: int, r: "fitz.Rect") -> bool:
     """A real icon/figure (not a loose drawn shape) sits immediately left of
     this printed line, icon-sized and close enough to be its own leading
@@ -3299,25 +3802,36 @@ def _icon_leads_line(doc: fitz.Document, page_index: int, r: "fitz.Rect") -> boo
 
 def list_structure_changes(exp: list[Element], act: list[Element],
                            expected: fitz.Document | None = None,
-                           actual: fitz.Document | None = None) -> list[dict]:
+                           actual: fitz.Document | None = None,
+                           partners: dict[int, list[Element]] | None = None) -> list[dict]:
     """List items that stopped being list items, or started.
 
     An item Production prints as "• Keep the remote dry" whose words Staging
     prints with no marker at all has lost its list formatting (the <li> became
     a plain paragraph) - and the reverse. A marker that only changed STYLE is
     `numbering_changes`; an item whose words are gone is a content difference.
+
+    `partners` (element id -> the other side's elements it was paired with)
+    names each item's own counterpart; searching the other side for the
+    item's words is only the fallback for an item left unpaired.
     """
-    exp_items = {(it[3].section, it[2]): it for it in _list_items_in(exp)}
-    act_items = {(it[3].section, it[2]): it for it in _list_items_in(act)}
+    partners = partners or {}
+    # Kept copy by copy: a topic printing the same bulleted sentence twice
+    # has two items to check, not one.
+    exp_items = [((it[3].section, it[2]), it) for it in _list_items_in(exp)]
+    act_items = [((it[3].section, it[2]), it) for it in _list_items_in(act)]
     out: list[dict] = []
     restyled: dict[tuple, list] = {}
-    for items, other_items, other, kind, own_doc, other_doc in (
-        (exp_items, act_items, act, "list-marker-missing", expected, actual),
-        (act_items, exp_items, exp, "list-marker-added", actual, expected),
+    for items, other_items, own, other, kind, own_doc, other_doc in (
+        (exp_items, act_items, exp, act, "list-marker-missing", expected, actual),
+        (act_items, exp_items, act, exp, "list-marker-added", actual, expected),
     ):
         groups: dict[tuple, list] = {}
-        for (section, key), item in items.items():
-            if (section, key) in other_items or len(key) < _LIST_ITEM_MIN_KEY:
+        other_marked = Counter(k for k, _ in other_items)
+        seen: Counter = Counter()
+        for (section, key), item in items:
+            seen[(section, key)] += 1
+            if seen[(section, key)] <= other_marked[(section, key)] or len(key) < _LIST_ITEM_MIN_KEY:
                 continue
             # A numbered section heading ("2. Remove the back cover.") is not a
             # list item - its "2." is compared as a heading, not lost list
@@ -3331,7 +3845,21 @@ def list_structure_changes(exp: list[Element], act: list[Element],
             # Same kind of block only: a list item never answers to a heading
             # ("proxy settings" inside "Configuring proxy settings").
             candidates = [e for e in other if e.kind not in (KIND_FIGURE, KIND_HEADING) and e.section == section]
-            holder = next((e for e in candidates if key in e.key), None)
+            # The same sentence printed twice in a topic ("A special rear
+            # projection screen is required." as the Rear note and again as
+            # Rear Ceiling's bullet) answers copy for copy, in order - the
+            # first copy on the other side is not every copy's counterpart.
+            own_copies = [e for e in own if e.kind not in (KIND_FIGURE, KIND_HEADING)
+                          and e.section == section and key in e.key]
+            copies = [e for e in candidates if key in e.key]
+            nth = next((k for k, e in enumerate(own_copies) if e is item[3]), 0)
+            holder = copies[min(nth, len(copies) - 1)] if copies else None
+            paired = [e for e in partners.get(id(item[3]), ()) if e.kind not in (KIND_FIGURE, KIND_HEADING)]
+            if paired:
+                # The element the item was actually paired with - its first
+                # part holding the item's opening words, else its first part.
+                opening = " ".join(key.split()[:4])
+                holder = next((e for e in paired if opening in e.key), paired[0])
             if holder is None:
                 # The item's own wrapped sentence can be split, on the OTHER
                 # side, into its own element apart from its later lines (a
@@ -3355,7 +3883,8 @@ def list_structure_changes(exp: list[Element], act: list[Element],
             # care how element collection carved up the words above it - only
             # WHICH pages to look at is needed, and every element already
             # placed in this section between them cover it.
-            pages = holder.pages if holder is not None else sorted({p for e in candidates for p in e.pages})
+            pages = (sorted({p for e in paired for p in e.pages}) if paired
+                     else holder.pages if holder is not None else sorted({p for e in candidates for p in e.pages}))
             if not pages:
                 continue
             # Confirmed on the pages: a marker printed before the item on this
@@ -3370,6 +3899,21 @@ def list_structure_changes(exp: list[Element], act: list[Element],
             other_near = (holder.page, holder.bbox[1]) if holder is not None else None
             other_marker = _marker_before(other_doc, pages, key, near=other_near)
             if other_marker is None:
+                continue
+            if not other_marker and any(
+                    t.kind == KIND_TABLE and _row_carries_marker(t, key, own_marker, other_doc)
+                    for t in ([holder] if holder is not None else []) + candidates):
+                # A table printing the number in a column of its own, set above
+                # the item's line (Staging's "4." top-aligned in its cell) - the
+                # line read finds nothing beside the words, the row has it.
+                continue
+            # The two documents set their callouts differently: Production
+            # marks a note with a small icon and bullets its lines, Staging
+            # prints the same words in a labelled, shaded "NOTE:" / "TIP:"
+            # box, which needs no bullet. That is the note's styling on each
+            # side, not a marker Staging lost, so the same layout is never
+            # expected of it.
+            if _callout_restyled(item[3], holder, own_doc, other_doc):
                 continue
             if holder is None:
                 # Nothing to box precisely - anchor the finding at the section's
@@ -3660,8 +4204,17 @@ def _landing_heading(entries: list[TocEntry], page: int, y: float, anchor: str) 
     when it is printed on the landing page; otherwise the heading the landing
     point sits under, allowing for a destination placed a few points above it."""
     words = normalize_title(anchor)
+    # A link box over only the first line of a wrapped title ('"Wireless
+    # projection (screen') still names the heading its words begin.
     named = [e for e in entries if e.page == page and normalize_title(e.title)
-             and normalize_title(e.title) in words]
+             and (normalize_title(e.title) in words
+                  or (len(words.strip(" \"“”'‘’")) >= 12
+                      and normalize_title(e.title).startswith(words.strip(" \"“”'‘’"))))]
+    # "Wireless projection (screen casting)" names that heading, not the
+    # "Projection" chapter heading its words also contain on the same page.
+    named = [e for e in named if not any(
+        o is not e and normalize_title(e.title) != normalize_title(o.title)
+        and normalize_title(e.title) in normalize_title(o.title) for o in named)]
     if named:
         # A link drawn over a whole paragraph names more than one heading ("…select
         # Web Player. For more details, see Controlling the players"): the one it
@@ -3756,6 +4309,15 @@ def collect_links(doc: fitz.Document, pages: list[int], span: tuple, entries: li
                     el.boxes = [(page_index, tuple(float(v) for v in hits[0]))]
             out.append(el)
     return out
+
+
+def _same_address(x: str, y: str) -> bool:
+    """One web address written two ways ("http://support.benq.com." /
+    "https://Support.BenQ.com/") is one link target."""
+    def norm(u: str) -> str:
+        u = (u or "").strip().casefold().rstrip("./")
+        return re.sub(r"^https?://(www\.)?", "", u)
+    return bool(x) and norm(x) == norm(y)
 
 
 def _pair_links(exp_links: list[Element], act_links: list[Element]) -> list[tuple]:
@@ -3877,6 +4439,8 @@ def link_changes(exp_links: list[Element], act_links: list[Element],
             out.append({"type": "link-broken", "kind": KIND_LINK, "exp": a, "act": b,
                         "summary": f"Hyperlink not working in Staging — “{b.text[:80]}”: {b.detail}.",
                         "detail": f"Production link goes to: {a.label}"})
+        elif (_same_address(a.label, b.label)):
+            pass
         elif (a.label != b.label and _uri_authority(a.label) != _uri_authority(b.label)
               and not (a.label.startswith(("page ", "unresolved")) or b.label.startswith("page "))):
             # "https://www.benq.com" against the bare "www.benq.com", or against
@@ -3909,7 +4473,10 @@ def page_ref_dropped_changes(exp_group: list[Element], act_group: list[Element])
         "type": "link-page-ref-dropped", "kind": KIND_TEXT,
         "summary": (f"Hyperlink cross-reference drops “on page” in Staging — Production says "
                     f"“{a_ref.group(0).strip()}”, Staging does not name a page there."),
-        "detail": "",
+        # The exact phrase ("on page 32"), for the short box comment - never
+        # blank: a reader clicking this box needs to see AT A GLANCE which of
+        # the two sides is which, not re-read the whole summary sentence.
+        "detail": a_ref.group(0).strip(),
     }]
 
 
@@ -4034,6 +4601,85 @@ def stray_space_changes(exp_group: list[Element], act_group: list[Element]) -> l
                  "summary": f"Extra space in Production — “{a_stray}” has a stray space Staging does not.",
                  "detail": ""}]
     return []
+
+
+# A picture below this is an icon, not a figure: checked for a broken STREAM
+# (which breaks at any size) but not with the render heuristics, which need
+# room to tell a corrupt paint from an icon that is legitimately flat.
+_ICON_FIGURE_SIDE = 8.0
+# Below this there is nothing to show either way - a hairline rule, a bullet
+# drawn as a one-pixel image.
+_MIN_BROKEN_SIDE = 3.0
+
+
+def broken_image_changes(actual: fitz.Document, act_pages: list[int], section_at) -> list[dict]:
+    """Every picture on the chapter's Staging pages that will not show: its
+    image stream is empty or will not decode, or it renders blank/corrupt.
+
+    Icons count. The size floor here used to be the figure floor, so an ICON
+    whose PNG was empty or would not decode - the one thing that is broken
+    beyond doubt whatever its size - was skipped for being small, and a note
+    badge or a button glyph that would not display was never reported.
+    """
+    from types import SimpleNamespace
+    from pdfval.validators.image import _broken_reason
+    out: list[dict] = []
+    for page in sorted(set(act_pages)):
+        try:
+            infos = actual[page].get_image_info(xrefs=True)
+        except Exception:
+            continue
+        for info in infos:
+            bbox = tuple(float(v) for v in info.get("bbox") or ())
+            if len(bbox) != 4:
+                continue
+            width, height = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            if width < _MIN_BROKEN_SIDE or height < _MIN_BROKEN_SIDE:
+                continue  # a hairline or a one-pixel glyph image
+            icon = width < _ICON_FIGURE_SIDE or height < _ICON_FIGURE_SIDE
+            reason = _broken_reason(actual, page, SimpleNamespace(kind="raster", xref=int(info.get("xref") or 0),
+                                                                   bbox=bbox), stream_only=icon)
+            if not reason:
+                continue
+            place = Element(kind=KIND_FIGURE, text="", boxes=[(page, bbox)], section=section_at(page, bbox[1]),
+                            width=bbox[2] - bbox[0], height=bbox[3] - bbox[1])
+            what = "Icon" if icon else "Image"
+            out.append({
+                "type": "figure-broken", "kind": KIND_FIGURE, "exp": None, "act": place,
+                "section": place.section,
+                "summary": f"{what} broken in Staging — {reason}; it will not display.",
+                "detail": reason,
+            })
+    return out
+
+
+def page_ref_in_staging_changes(act_elements: list[Element], actual: fitz.Document) -> list[dict]:
+    """Staging turns every printed "on page N" into a hyperlink with no page
+    number - so one it drops is expected (never reported), and one it still
+    prints is an issue: boxed on the phrase itself."""
+    out: list[dict] = []
+    for el in act_elements:
+        if el.kind not in (KIND_TEXT, KIND_NOTE, KIND_TABLE, KIND_HEADING) or not el.text:
+            continue
+        for m in _PAGE_REF_RE.finditer(el.text):
+            phrase = " ".join(m.group(0).split())
+            boxes = []
+            for page, bbox in el.boxes:
+                try:
+                    hits = actual[page].search_for(phrase, clip=fitz.Rect(bbox) + (-2, -2, 2, 2))
+                except Exception:
+                    hits = []
+                boxes += [(page, tuple(float(v) for v in h)) for h in hits]
+            place = Element(kind=KIND_TEXT, text=phrase, key=_normalise(phrase),
+                            boxes=boxes[:1] or el.boxes[:1], section=el.section)
+            out.append({
+                "type": "page-ref-in-staging", "kind": KIND_TEXT, "exp": None, "act": place,
+                "section": el.section,
+                "summary": (f"Page reference present in Staging — “{phrase}” is printed in Staging; "
+                            f"Staging's cross-references are links and must not name a page number."),
+                "detail": el.text[:300],
+            })
+    return out
 
 
 def page_ref_consistency_changes(act_links: list[Element]) -> list[dict]:
@@ -4364,6 +5010,13 @@ def visual_figure_changes(a: Element, b: Element, name: str,
     `visual_diff`), boxed on both sides - shown for review, never a failure."""
     # Icons are compared by `icon_changes`; callout icons are styling, never spots.
     if not a.boxes or not b.boxes or min(a.width, a.height, b.width, b.height) <= _ICON_MAX_SIDE:
+        return []
+    # The picture is under the same heading on both sides, which is all that
+    # is asked of it (the user's rule): the two documents draw and scale their
+    # artwork their own way, so spots that "look different" inside a picture
+    # printed where it belongs are not reported. A picture that moved to
+    # another heading still is - by `figure-elsewhere`.
+    if a.section and a.section == b.section:
         return []
     found = visual_diff.differing_regions(expected, a.boxes[0], actual, b.boxes[0])
     if not found:
@@ -5027,6 +5680,10 @@ def figure_changes(
     for i, a in enumerate(exp_figs):
         if i in used_exp or beside_mixed_partner(a, "exp"):
             continue
+        if _note_badges(expected, a):
+            continue  # a column of note icons, not a picture - see `_note_badges`
+        if _piece_of_matched(a, exp_figs, used_exp):
+            continue  # a slice of a picture already matched whole on the other side
         name = _describe(a, exp_caps[i])
         here = _printed_in_band(a, actual, act_bands, taken_act, act_section_at) if act_bands else None
         if here is None:
@@ -5325,8 +5982,48 @@ def compare_group(
                        f"not where Production has it in the reading order.",
             "detail": (a.text or "")[:200], "minor": True,
         })
-    out.extend(_compare_merged(a, b, size_scale))
+    found = _compare_merged(a, b, size_scale)
+    found += paragraph_gap_changes(exp, act)
+    sides = [n for n, el in (("Production", a), ("Staging", b)) if el is not None and el.ocr]
+    for d in found:
+        if sides:
+            d["ocr_sides"] = sides
+    out.extend(found)
     return reportable(out)
+
+
+_PARAGRAPH_GAP_MIN = 0.5   # a gap this share of a line's height between two blocks is a paragraph space
+
+
+def paragraph_gap_changes(exp: list[Element], act: list[Element]) -> list[dict]:
+    """Production prints two paragraphs with a space between them where
+    Staging prints the same words as one block with no space: the paragraph
+    break is lost. Only same-page neighbours with a visible gap count, so a
+    paragraph Production merely continues on the next page is not one."""
+    texts_a = [e for e in exp if e.kind == KIND_TEXT and e.text]
+    texts_b = [e for e in act if e.kind == KIND_TEXT and e.text]
+    if len(texts_a) < 2 or len(texts_b) != 1:
+        return []
+    out: list[dict] = []
+    for first, second in zip(texts_a, texts_a[1:]):
+        (p1, b1), (p2, b2) = first.boxes[-1], second.boxes[0]
+        if p1 != p2:
+            continue  # continued over a page break: not a paragraph space
+        line = max(1.0, first.size or (b1[3] - b1[1]))
+        gap = b2[1] - b1[3]
+        if gap < _PARAGRAPH_GAP_MIN * line:
+            continue
+        joined = texts_b[0]
+        if _normalise(second.text)[:40] not in joined.key:
+            continue
+        out.append({
+            "type": "paragraph-gap", "kind": KIND_TEXT, "exp": second, "act": joined,
+            "summary": (f"Paragraph space missing in Staging — Production starts a new paragraph at "
+                        f"“{second.text[:60]}” with a space above it; Staging runs it on in the same "
+                        f"paragraph with no space."),
+            "detail": second.text[:200],
+        })
+    return out
 
 
 _BARE_MARKER_RE = re.compile(
@@ -5388,24 +6085,76 @@ def _artifact_set(text: str) -> set[str]:
     return out
 
 
+def _opposite_text(bad_text: str, a_text: str, b_text: str, from_a: bool) -> str:
+    """What the OTHER document prints where `bad_text`'s undecodable run sits.
+
+    An unreadable run says nothing on its own - the reader needs to see what
+    stands in its place on the other side, which is the whole point of the
+    comparison. The word diff of the two texts pairs them up: the deleted run
+    holding the artifact against the inserted run opposite it.
+    """
+    ops = _word_diff(a_text or "", b_text or "")
+    mine, theirs = ("del", "ins") if from_a else ("ins", "del")
+    found: list[str] = []
+    i = 0
+    while i < len(ops):
+        if ops[i]["type"] == "equal":
+            i += 1
+            continue
+        block = []
+        while i < len(ops) and ops[i]["type"] != "equal":
+            block.append(ops[i])
+            i += 1
+        # As many words as the unreadable run itself is long, not the whole
+        # opposite block: an unreadable entry sitting next to a genuinely
+        # missing one merges into one block, and quoting all of it names
+        # content that is not what stands in the unreadable run's place.
+        bad = [w for o in block if o["type"] == mine for w in o["text"].split() if _artifact_set(w)]
+        if not bad:
+            continue
+        opposite = [w for o in block if o["type"] == theirs for w in o["text"].split()]
+        if opposite:
+            found.append(" ".join(opposite[: len(bad)]))
+    return " ".join(found)[:80]
+
+
 def _encoding_regression(kind: str, a_text: str, b_text: str) -> dict | None:
-    """A character Staging's copy carries that Production's matching text does
-    not - a real regression in whatever produced the new export (a font
-    subset missing a glyph, a broken re-encoding), not a source artefact both
-    sides already share (a PUA glyph or "(cid:N)" already in Production's own
-    copy is the source document's own font, and reported here only once it is
-    new). Checked both ways: Staging can just as easily be the clean copy of
-    a character Production's own export garbled."""
+    """Characters one side's text layer cannot decode at all - a replacement
+    character, an unmapped Private-Use glyph, a bare "(cid:N)" - where the
+    other side's matching text decodes cleanly.
+
+    What this does NOT establish is which document is at fault, and the old
+    wording ("Text encoding issue in Production") asserted exactly that. An
+    unreadable text layer is not the same as a wrongly printed page: this
+    manual's Production copy cannot decode its Simplified Chinese menu entry
+    yet prints it perfectly, while Staging decodes to four real-but-wrong
+    codepoints and prints four wrong glyphs - so the side the old message
+    blamed was the side that was right. All the text layers can honestly say
+    is that the two documents disagree HERE and neither reading can be
+    trusted, so the finding now shows both readings and asks for the row to be
+    checked by eye, rather than failing one document on the strength of a
+    text layer that by its own admission could not be read.
+    """
     for lost, x_text, y_text in ((False, a_text, b_text), (True, b_text, a_text)):
         new = _artifact_set(y_text) - _artifact_set(x_text)
         if new:
             shown = ", ".join(sorted(f"“{ch}”" if ch != "(cid:N)" else ch for ch in new)[:6])
             side = "Staging" if not lost else "Production"
+            other = "Production" if not lost else "Staging"
+            opposite = _opposite_text(y_text, a_text, b_text, from_a=lost)
             return {
                 "type": "text-encoding", "kind": kind,
-                "summary": (f"Text encoding issue in {side} — {len(new)} character(s) do not decode "
-                            f"({shown})."),
+                "summary": (
+                    f"Characters cannot be read in {side} — {len(new)} character(s) have no usable "
+                    f"encoding ({shown}), so what {side} prints here cannot be compared by text"
+                    + (f", while {other} prints “{opposite}” in their place. Check this by eye: the two "
+                       f"documents disagree here and neither text layer can settle it."
+                       if opposite else ". Check by eye what each document prints here.")
+                ),
                 "detail": (y_text or "")[:200],
+                # Shown for a reviewer, never failed on: the evidence is a text
+                # layer that could not be read, which cannot prove a defect.
+                "review_only": True,
             }
     return None
 
@@ -5643,14 +6392,37 @@ def _compare_merged(a: Element | None, b: Element | None, size_scale: float) -> 
             # whitespace differs once the word-level check comes back empty;
             # `_word_diff` (word-tokenised, not the character key) confirms
             # it is real punctuation and not just quote-style folding.
-            wd = _word_diff(a.text, b.text)
-            if any(op["type"] != "equal" for op in wd):
-                out.append({
-                    "type": "punctuation", "kind": a.kind,
-                    "summary": "Punctuation changed — the wording is the same, only punctuation differs.",
-                    "detail": "",
-                    "word_diff": wd,
-                })
+            wd = _word_diff(_PAGE_REF_RE.sub("", a.text), _PAGE_REF_RE.sub("", b.text))
+            changed = [op for op in wd if op["type"] != "equal"]
+            if changed:
+                changed_text = " ".join(op["text"] for op in changed)
+                if _only_bullet_glyphs(changed_text):
+                    pass  # the list's own marker change - see _only_bullet_glyphs
+                elif _has_symbol(changed_text):
+                    out.append({
+                        "type": "symbol", "kind": a.kind,
+                        "summary": "Symbol changed — the wording is the same, but a symbol or mark differs.",
+                        "detail": "",
+                        "word_diff": wd,
+                    })
+                elif mark_changes(a.text, b.text, a.wraps, b.wraps):
+                    # named mark by mark by the punctuation pass just below
+                    pass
+
+    # Punctuation, quotes and spaces between the words both sides print -
+    # checked whatever else differs, so a sentence that changed a word AND lost
+    # its period reports both.
+    if a.kind in (KIND_TEXT, KIND_NOTE, KIND_HEADING) and a.text and b.text \
+            and not any(d.get("type") in ("punctuation", "symbol") for d in out):
+        marks = mark_changes(a.text, b.text, a.wraps, b.wraps)
+        if marks:
+            out.append({
+                "type": "punctuation", "kind": a.kind, "mark_notes": marks,
+                "summary": "Punctuation or spacing changed — " + "; ".join(marks[:6])
+                           + (f"; and {len(marks) - 6} more" if len(marks) > 6 else "") + ".",
+                "detail": "",
+                "word_diff": _word_diff(_PAGE_REF_RE.sub("", a.text), _PAGE_REF_RE.sub("", b.text)),
+            })
 
     if a.kind == KIND_NOTE and a.label != b.label:
         out.append({
@@ -5661,7 +6433,10 @@ def _compare_merged(a: Element | None, b: Element | None, size_scale: float) -> 
 
     # Neither direction is reported on headings or heading-like labels: their
     # styling is Staging's design (see `bold-added` below).
-    lost = [] if KIND_HEADING in (a.kind, b.kind) else _bold_missing(a, b)
+    # A callout's own label ("Tip", "NOTE:") is the callout's styling - Staging
+    # sets every label bold in its note box - never a bold change in the text.
+    lost = [] if KIND_HEADING in (a.kind, b.kind) else [
+        p for p in _bold_missing(a, b) if not _BARE_CALLOUT_RE.match(p)]
     if lost and _is_heading_style_label(a, lost):
         lost = []
     if lost:
@@ -5682,7 +6457,7 @@ def _compare_merged(a: Element | None, b: Element | None, size_scale: float) -> 
     # when it wasn't picked up as a heading (too small, or not on the TOC).
     gained = (
         [] if KIND_HEADING in (a.kind, b.kind)
-        else _bold_missing(b, a)
+        else [p for p in _bold_missing(b, a) if not _BARE_CALLOUT_RE.match(p)]
     )
     if gained and _is_heading_style_label(b, gained):
         gained = []
@@ -5713,6 +6488,48 @@ def _compare_merged(a: Element | None, b: Element | None, size_scale: float) -> 
             "summary": f"Underline added in Staging — {shown} is underlined in Staging and plain in Production.",
             "detail": "",
         })
+    # Italic the same way, from the font itself: an italic or oblique face
+    # (flag or font name), both directions, headings left to their own styling.
+    for own, other, kind, verb in ((a, b, "italic-missing", "italic in Production and upright in Staging"),
+                                   (b, a, "italic-added", "italic in Staging and upright in Production")):
+        slanted = [] if KIND_HEADING in (a.kind, b.kind) else _italic_missing(own, other)
+        if slanted:
+            shown = ", ".join(f"“{w}”" for w in slanted[:8]) + (" …" if len(slanted) > 8 else "")
+            is_are = "is" if len(slanted) == 1 else "are"
+            label = "Italic missing in Staging" if kind == "italic-missing" else "Italic added in Staging"
+            out.append({
+                "type": kind, "kind": own.kind, "phrases": slanted,
+                "summary": f"{label} — {shown} {is_are} {verb}.",
+                "detail": "",
+            })
+    return out
+
+
+def _italic_missing(a: Element, b: Element) -> list[str]:
+    """Phrases set italic in `a` whose words `b` prints, but not in italic -
+    the same walk as `_bold_missing`, over `italic_words`."""
+    a_italic, b_italic = Counter(a.italic_words), Counter(b.italic_words)
+    b_words = _tokens(b.key)
+    lost: Counter = Counter()
+    for word, count in a_italic.items():
+        if not b_words.get(word):
+            continue
+        shortfall = min(count, b_words[word]) - b_italic.get(word, 0)
+        if shortfall > 0:
+            lost[word] = shortfall
+    if not lost:
+        return []
+    out: list[str] = []
+    run: list[str] = []
+    for word in a.italic_words:
+        if lost.get(word, 0) > 0:
+            lost[word] -= 1
+            run.append(word)
+        elif run:
+            out.append(" ".join(run))
+            run = []
+    if run:
+        out.append(" ".join(run))
     return out
 
 
@@ -5761,8 +6578,31 @@ def _content_runs(a_key: str, b_key: str) -> tuple[list[str], list[str]]:
     return gone, extra
 
 
+_SPELLING_RATIO = 0.8   # two single words this alike are one word spelled differently
+
+
+def _spelling_pairs(gone: list[str], extra: list[str]) -> dict[str, str]:
+    """Single words Staging spells differently: Production's word -> Staging's."""
+    pairs: dict[str, str] = {}
+    free = [e for e in extra if " " not in e]
+    for g in gone:
+        if " " in g or len(g) < 4:
+            continue
+        best = max(free, key=lambda e: difflib.SequenceMatcher(a=g, b=e).ratio(), default=None)
+        if best is not None and difflib.SequenceMatcher(a=g, b=best).ratio() >= _SPELLING_RATIO:
+            pairs[g] = best
+            free.remove(best)
+    return pairs
+
+
 def _content_summary(kind: str, gone: list[str], extra: list[str]) -> str:
+    spelled = _spelling_pairs(gone, extra)
+    if spelled:
+        gone = [g for g in gone if g not in spelled]
+        extra = [e for e in extra if e not in spelled.values()]
     parts = []
+    if spelled:
+        parts.append("spelled differently in Staging: " + "; ".join(f"“{g}” → “{e}”" for g, e in list(spelled.items())[:4]))
     if gone:
         parts.append("missing in Staging: " + "; ".join(f"“{r[:90]}”" for r in gone[:4]) + (" …" if len(gone) > 4 else ""))
     if extra:
@@ -5941,6 +6781,19 @@ def _elsewhere(run: str, other_words: str) -> bool:
             and squashed in other_words.replace(" ", ""):
         return True
     return len(words) <= _SHORT_LABEL_TOKENS and len(squashed) >= 6 and f" {run} " in other_words
+
+
+def _elsewhere_counted(run: str, own_words: str, other_words: str) -> bool:
+    """`_elsewhere`, copy for copy: a phrase the other side prints elsewhere
+    in the topic still counts as lost when that side prints it fewer times
+    than this one - Production's "Power & Energy > Power & Energy" losing its
+    repeat in Staging is a real edit, though Staging still prints the phrase
+    once."""
+    if not _elsewhere(run, other_words):
+        return False
+    copies = re.compile(rf"(?<= ){re.escape(run)}(?= )")
+    own = len(copies.findall(own_words))
+    return not own or len(copies.findall(other_words)) >= own
 
 
 # --- tables, row by row ------------------------------------------------------
@@ -6350,29 +7203,78 @@ def table_row_changes(a: Element, b: Element, exp_units: Counter, act_units: Cou
     def page_of(el: Element, row: int) -> int | None:
         return el.row_boxes[row][0] if row < len(el.row_boxes) else None
 
+    def header_repeat(el: Element, units: list, r: int) -> bool:
+        return 0 < r < len(units) and units[r] == units[0]
+
+    def next_piece(el: Element, units: list, free: list[int], r: int) -> int | None:
+        """The next row that can continue row `r`: the very next one, or the
+        first after the header rows a new page repeats in between."""
+        k = r + 1
+        while k < len(units) and header_repeat(el, units, k) and page_of(el, k) != page_of(el, r):
+            k += 1
+        return k if k in free else None
+
+    def at_page_break(el: Element, units: list, r: int) -> bool:
+        """Row `r` is the last row before, or the first after, a page break -
+        where a row cut by the break reads as a split or merged row."""
+        page = page_of(el, r)
+        if page is None:
+            return False
+        before = r - 1
+        while before > 0 and header_repeat(el, units, before):
+            before -= 1
+        after = r + 1
+        while after < len(units) and header_repeat(el, units, after):
+            after += 1
+        return (0 < before and page_of(el, before) not in (None, page)) \
+            or (after < len(units) and page_of(el, after) not in (None, page))
+
     for i in list(free_a):
         for j in free_b:
-            if j + 1 in free_b and _similar(units_a[i], units_b[j] + units_b[j + 1]) >= _ROW_MERGE:
-                if page_of(b, j) != page_of(b, j + 1):
+            k = next_piece(b, units_b, free_b, j)
+            # A split needs BOTH pieces to make up Production's row: when one
+            # piece alone already is that row, the other is a separate row.
+            if k is not None and _similar(units_a[i], units_b[j] + units_b[k]) >= _ROW_MERGE \
+                    and _similar(units_a[i], units_b[j]) < _ROW_MERGE and _similar(units_a[i], units_b[k]) < _ROW_MERGE:
+                if page_of(b, j) != page_of(b, k) or at_page_break(a, units_a, i) \
+                        or at_page_break(b, units_b, j) or at_page_break(b, units_b, k):
                     # One row continued over a page break (its first cell left
-                    # empty under the repeated header) is still one row.
+                    # empty under the repeated header) is still one row - and
+                    # a row beside a break on either side is cut by where the
+                    # page ends (a wrap), not split in the table itself.
                     free_a.remove(i)
                     free_b.remove(j)
-                    free_b.remove(j + 1)
+                    free_b.remove(k)
                     break
                 out.append({
                     "type": "table-merge", "kind": KIND_TABLE,
                     "summary": (f"Table merge issue — Staging splits Production's row {i + 1} "
                                 f"(“{_clip_row(a.cells[i])}”) into two rows."),
-                    "detail": "", "exp": _row_element(a, [i]), "act": _row_element(b, [j, j + 1]),
+                    "detail": "", "exp": _row_element(a, [i]), "act": _row_element(b, [j, k]),
                 })
                 free_a.remove(i)
                 free_b.remove(j)
-                free_b.remove(j + 1)
+                free_b.remove(k)
                 break
     for j in list(free_b):
         for i in free_a:
-            if i + 1 in free_a and _similar(units_a[i] + units_a[i + 1], units_b[j]) >= _ROW_MERGE:
+            k = next_piece(a, units_a, free_a, i)
+            if k is not None and page_of(a, i) != page_of(a, k) \
+                    and _similar(units_a[i] + units_a[k], units_b[j]) >= _ROW_MERGE:
+                # Production's row continued over its own page break: one row.
+                free_b.remove(j)
+                free_a.remove(i)
+                free_a.remove(k)
+                break
+            if i + 1 in free_a and _similar(units_a[i] + units_a[i + 1], units_b[j]) >= _ROW_MERGE \
+                    and _similar(units_a[i], units_b[j]) < _ROW_MERGE and _similar(units_a[i + 1], units_b[j]) < _ROW_MERGE:
+                if at_page_break(a, units_a, i) or at_page_break(a, units_a, i + 1) \
+                        or at_page_break(b, units_b, j):
+                    # Rows cut apart by a page break on one side: a wrap.
+                    free_b.remove(j)
+                    free_a.remove(i)
+                    free_a.remove(i + 1)
+                    break
                 out.append({
                     "type": "table-merge", "kind": KIND_TABLE,
                     "summary": (f"Table merge issue — Staging merges Production's rows {i + 1} and {i + 2} "
@@ -6435,10 +7337,16 @@ def table_row_changes(a: Element, b: Element, exp_units: Counter, act_units: Cou
         reordered_row = any(_reordered_items(x, y) for x, y in zip(a.cells[i], b.cells[j]))
         if not reordered_row and (not left_a or _spilled(left_a, other_b)) and (not left_b or _spilled(left_b, other_a)):
             continue  # header or neighbouring text the extraction put in this row
+        # A word straddling a column boundary ("LED" read as "L" | "ED status")
+        # reads as one cell missing a word and its neighbour gaining one, even
+        # though the row prints the same characters either way - compare the
+        # row with cell boundaries erased before trusting a per-cell split.
+        if "".join(a.cells[i]).replace(" ", "") == "".join(b.cells[j]).replace(" ", ""):
+            continue
         changed = [(k, x, y) for k, (x, y) in enumerate(zip(a.cells[i], b.cells[j]))
                    # A pure reordering keeps the same words, so the same word
                    # COUNTS either way - `_cell_units` alone never flags it.
-                   if _cell_units(x) != _cell_units(y) or _reordered_items(x, y)]
+                   if _cell_units(_bare_xref(x)) != _cell_units(_bare_xref(y)) or _reordered_items(x, y)]
         # Same items, printed in a different order - not a missing/added/changed
         # word, so kept out of the ordinary "table-cell" diff and reported as
         # its own "the rows/options are sequenced differently" issue instead.
@@ -6481,28 +7389,10 @@ def table_row_changes(a: Element, b: Element, exp_units: Counter, act_units: Cou
             "detail": "", "exp": a, "act": b,
         })
     # A grid read one row out of step shows a "changed" cell in nearly every
-    # row - and short of that, several rows of the same table changing
-    # together is one thing to review (a header merged differently upstream
-    # cascading a row of offset down the whole grid, a column the two
-    # extractions split differently), not N separate "this row changed"
-    # findings that all repeat the same story. Reported once, on the whole
-    # table, as a layout issue - not dropped silently, and not left as a wall
-    # of near-identical per-row findings either.
-    shifted = len(pairs) >= 4 and len(cell_changes) > _CELL_SHIFT_SHARE * len(pairs)
-    if cell_changes and (shifted or len(cell_changes) >= _TABLE_CELL_CONSOLIDATE_MIN):
-        rows_shown = ", ".join(
-            (_clip_row(a.cells[i], 30) if i < len(a.cells) else f"row {i + 1}")
-            for i, _, _ in cell_changes[:8]
-        ) + (" …" if len(cell_changes) > 8 else "")
-        out.append({
-            "type": "table-cell-layout", "kind": KIND_TABLE,
-            "summary": (f"Table layout issue — {len(cell_changes)} rows read with different cell content "
-                        f"than Production ({rows_shown}). Likely how the table was read (a row shifted out "
-                        f"of step, a column split differently) rather than each row's content actually "
-                        f"changing - compare the two tables directly."),
-            "detail": "", "exp": a, "act": b,
-        })
-        cell_changes = []
+    # row - deliberately NOT consolidated into one "table layout issue" and
+    # dropped from the per-row report: row/cell content missing or changed
+    # matters more than the risk of it being a read/layout artefact, so every
+    # row still gets its own "table-cell" finding below.
     def _column_name(k: int) -> str:
         if a.headers and len(a.headers) == len(a.cells[0] if a.cells else ()) and k < len(a.headers):
             return f"“{a.headers[k]}”"
@@ -6546,6 +7436,11 @@ def table_row_changes(a: Element, b: Element, exp_units: Counter, act_units: Cou
         for pm, sm in sorted(swaps):
             pieces.append(f"list markers “{pm}” in Production, “{sm}” in Staging")
         if not pieces:
+            # Only punctuation or spacing differs: name the marks, not two
+            # clips of the same words.
+            marks = mark_changes(x, y)
+            if marks:
+                return f"{where}: " + "; ".join(marks[:4])
             return f"{where}: “{(x or '—')[:60]}” → “{(y or '—')[:60]}”"
         return f"{where}: " + "; ".join(pieces[:4]) + (" …" if len(pieces) > 4 else "")
 
@@ -6596,6 +7491,30 @@ def table_row_changes(a: Element, b: Element, exp_units: Counter, act_units: Cou
             "detail": "", "exp": a, "act": b,
         })
     return out
+
+
+# A cross-reference in brackets: "(See page 51)" - "( )" once its page number
+# is taken out - or Staging's "(See “Quick access to setting menu”)", the same
+# reference turned into a link naming its section instead of its page.
+_XREF_RE = re.compile(r"\(\s*(?:see\s*)?(?:[\"“”'‘’][^\"“”'‘’]*[\"“”'‘’])?\s*\)", re.IGNORECASE)
+
+
+_XREF_HEAD_RE = re.compile(r"\(\s*see\s*[\"“][^\"“”)]*$", re.IGNORECASE)   # an element ending inside one
+_XREF_TAIL_RE = re.compile(r"^[^\"“”()]*[\"”]\s*\)")                   # an element starting inside one
+
+
+def _bare_xref(cell: str) -> str:
+    """A cell with its bracketed cross-reference reduced to "()": Staging
+    naming the section where Production named the page is the expected
+    change of a page reference into a link, not new wording. A callout
+    label's own colon ("Note" / "Note:") is its styling and goes too."""
+    return _CALLOUT_COLON_RE.sub(r"\1", _XREF_RE.sub("()", cell or ""))
+
+
+_CALLOUT_COLON_RE = re.compile(
+    r"\b(" + "|".join(sorted({re.escape(w) for w in i18n._CALLOUT_WORDS}, key=len, reverse=True)) + r")\s*[:：]",
+    re.IGNORECASE,
+)
 
 
 _ICON_LABEL_MIN_SIDE = 10.0  # pt: a cell's printed artwork at least this big is an icon, not a bare glyph
@@ -6757,11 +7676,52 @@ def settle_content(diffs: list[dict], exp_words: str, act_words: str,
         # A callout's label ("Warning", "WARNING:", "Note") is its styling, not
         # its content: Staging sets it in its own callout box, often as a label
         # the text extraction keeps apart. Bullet glyphs are never words.
-        gone = [r for r in d.get("gone", []) if not _elsewhere(r, act_words) and r not in (act_keys or ())
-                and not _BARE_CALLOUT_RE.match(r)]
-        extra = [r for r in d.get("extra", []) if not _elsewhere(r, exp_words) and r not in (exp_keys or ())
-                 and not _BARE_CALLOUT_RE.match(r)]
+        # A misspelling on one side ("SmartRemoote" / "SmartRemote") is one
+        # changed word: both halves stay together, even when the correct
+        # spelling is printed elsewhere on the other side - filtering one half
+        # alone reported the typo as a word "missing".
+        spelled = _spelling_pairs(d.get("gone", []), d.get("extra", []))
+        gone = [r for r in d.get("gone", []) if r in spelled or (
+                not _elsewhere_counted(r, exp_words, act_words) and r not in (act_keys or ())
+                and not _BARE_CALLOUT_RE.match(r))]
+        extra = [r for r in d.get("extra", []) if r in spelled.values() or (
+                 not _elsewhere_counted(r, act_words, exp_words) and r not in (exp_keys or ())
+                 and not _BARE_CALLOUT_RE.match(r))]
         if not gone and not extra:
+            # Nothing of the sentence's own WORDING is genuinely lost once its
+            # callout label (never content on its own, just above) is taken
+            # out of the count - but the same sentence can still differ by
+            # more than wording: a cross-reference dropping the quote marks
+            # that set its target apart when it becomes a hyperlink, say.
+            # Neither `_content_runs`'s word-level view (quotes are not
+            # words) nor the label filter just above can see that, so it is
+            # worth one more look here - the label and any page-number cross-
+            # reference stripped from BOTH sides first, so what triggered
+            # this whole finding is not what gets re-reported by it - before
+            # the difference is lost for good along with the label word that
+            # brought it to this function in the first place.
+            if exp_el is not None and act_el is not None and exp_el.text and act_el.text:
+                exp_bare = _LEADING_CALLOUT_RE.sub("", _PAGE_REF_RE.sub(" ", exp_el.text))
+                act_bare = _LEADING_CALLOUT_RE.sub("", _PAGE_REF_RE.sub(" ", act_el.text))
+                wd2 = _word_diff(exp_bare, act_bare)
+                changed_text = " ".join(op["text"] for op in wd2 if op["type"] != "equal")
+                # Whole words in the change mean the sentence was split or moved
+                # into a neighbouring block - not a punctuation change; any word
+                # truly gone is the word checks' finding.
+                if changed_text and not _is_trivial_punct(changed_text) \
+                        and not _only_bullet_glyphs(changed_text) \
+                        and mark_changes(exp_bare, act_bare, exp_el.wraps, act_el.wraps):
+                    out.append({
+                        "type": "symbol" if _has_symbol(changed_text) else "punctuation",
+                        "kind": d.get("kind"),
+                        "summary": (
+                            "Symbol changed — the wording is the same, but a symbol or mark differs."
+                            if _has_symbol(changed_text) else
+                            "Punctuation changed — the wording is the same, only punctuation differs."
+                        ),
+                        "detail": "",
+                        "word_diff": wd2,
+                    })
             continue
         d["gone"], d["extra"] = gone, extra
         d["summary"] = _content_summary(d.get("kind"), gone, extra)
@@ -7150,6 +8110,15 @@ _COVERAGE_MIN_TOKENS = 2    # shorter runs are the text checks' own business
 # that its full word-for-word coverage elsewhere stops being a coincidence;
 # a shorter run must still clear the exact-phrase check just above it.
 _COVERAGE_BAG_MIN_TOKENS = 6
+_PAGE_REF_WORDS = {"on", "page", "see", "refer", "to"}
+_COVERAGE_REORDER_MAX_TOKENS = 8  # longer than this, reused words are not an excuse
+
+
+@lru_cache(maxsize=64)
+def _chapter_word_counts(doc: fitz.Document, pages: tuple) -> Counter:
+    """Every word printed on this side's copy of a chapter, counted."""
+    return Counter(_TOKEN_RE.findall(_normalise(
+        " ".join(doc[p].get_text("text") for p in pages if 0 <= p < doc.page_count))))
 
 
 def _topic_stream(elements: list[Element]) -> list[tuple[str, Element]]:
@@ -7160,11 +8129,21 @@ def _topic_stream(elements: list[Element]) -> list[tuple[str, Element]]:
     for el in sorted(elements, key=lambda e: e.order):
         if el.kind == KIND_FIGURE:
             continue
-        for token in _TOKEN_RE.findall(_normalise(el.text or "")):
+        for token in _TOKEN_RE.findall(_normalise(_xref_free(el.text))):
             if _BARE_CALLOUT_RE.match(token):
                 continue
             out.append((token, el))
     return out
+
+
+def _xref_free(text: str | None) -> str:
+    """Text with its cross-references taken out: Production's "(See page 47)"
+    and Staging's link naming the section instead ("(See “Optimizing image
+    quality by Auto Cinema mode”)") are the same reference - also when the
+    text ends or starts part-way through one, or its lines are split."""
+    text = _XREF_RE.sub(" ", _PAGE_REF_RE.sub(" ", text or ""))
+    text = "\n".join(_XREF_HEAD_RE.sub(" ", _XREF_TAIL_RE.sub(" ", line)) for line in text.split("\n"))
+    return _XREF_HEAD_RE.sub(" ", _XREF_TAIL_RE.sub(" ", text))
 
 
 def _phrase_boxes(doc: fitz.Document, el: Element, printed: str) -> list[tuple[int, tuple]]:
@@ -7282,6 +8261,691 @@ def coverage_changes(chapter: "Chapter", topic: str, exp_topic: list[Element], a
     return out
 
 
+def _span_lines(doc: fitz.Document, pages: list[int], span: tuple, body: float,
+                titles: set[str], skip: list[tuple] | None = None) -> list[dict]:
+    """Every printed line of a chapter's pages inside its span - figure
+    labels, table cells, callouts, fragments, all of it; a scanned page's
+    lines come from OCR (see `_page_lines`)."""
+    start, end = span
+    out: list[dict] = []
+    for p in sorted(set(pages)):
+        y0 = start[1] if start and p == start[0] else 0.0
+        y1 = end[1] - 0.5 if end and p == end[0] else 1e9
+        if y1 <= y0:
+            continue
+        out.extend(_page_lines(doc, p, y0, y1, body, titles))
+
+    def skipped(ln: dict) -> bool:  # table of contents / short Q&A: left out on purpose
+        at = (ln["page"], ln["bbox"][1])
+        return any(s_start <= at and (s_end is None or at < s_end) for s_start, s_end, *_ in (skip or []))
+    return [ln for ln in out if not skipped(ln)]
+
+
+_HEADER_REPEAT_TOKENS = 8     # a table header line is at most this many words
+_HEADER_REPEAT_REACH = 20.0   # pt below a table's top edge its header line sits
+_HEADER_REPEAT_BAND = 0.12    # share of the page's height from its top where a repeated header prints
+
+
+_ENDS_PAGE_RE = re.compile(r"\bpage\s*$", re.IGNORECASE)
+_STARTS_NUMBER_RE = re.compile(r"^\s*(\d{1,4})\b")
+
+
+def _rejoin_page_refs(lines: list[dict]) -> list[dict]:
+    """A page reference wrapped over two lines ("(See page" / "25 )") put back
+    on one, so the reference is recognised as one - in reading order the two
+    can sit apart, with a diagram callout ("11") printed between them."""
+    out = [dict(ln) for ln in lines]
+    for i, ln in enumerate(out):
+        if not _ENDS_PAGE_RE.search(ln["text"]):
+            continue
+        x0, _, _, y1 = ln["bbox"]
+        height = max(1.0, ln["bbox"][3] - ln["bbox"][1])
+        # Only the very next line of the same column continues it.
+        below = [n for n in out[i + 1:i + 12] if n["page"] == ln["page"] and abs(n["bbox"][0] - x0) <= 30
+                 and -0.5 * height <= n["bbox"][1] - y1 <= 1.2 * height]
+        if below:
+            nxt = min(below, key=lambda n: n["bbox"][1])
+            m = _STARTS_NUMBER_RE.match(nxt["text"])
+            if m:
+                ln["text"] = f"{ln['text']} {m.group(1)}"
+                nxt["text"] = nxt["text"][m.end():]
+    return out
+
+
+def _join_audit_lines(lines: list[dict]) -> str:
+    """The lines as one text, a word split by a hyphen at a line end rejoined
+    only with the line that continues it - the next line of the same column.
+    A table label wrapped as "User / HDR-" with the next column's "Accesses"
+    beside it read as "HDRAccesses"."""
+    parts: list[str] = []
+    for ln, nxt in zip(lines, lines[1:] + [None]):
+        parts.append(ln["text"])
+        if nxt is None:
+            break
+        x0, y0, x1, y1 = ln["bbox"]
+        continues = (nxt["page"] == ln["page"] and nxt["bbox"][1] >= y1 - 0.5 * (y1 - y0)
+                     and nxt["bbox"][0] < x1 and nxt["bbox"][2] > x0)
+        parts.append("\n" if continues else " | ")
+    return "".join(parts)
+
+
+_ENDS_HYPHEN_RE = re.compile(r"\w[-\u00ad]\s*$")
+_STARTS_WORD_RE = re.compile(r"^\s*([^\W\d_]+)")
+
+
+def _rejoin_hyphens(lines: list[dict]) -> list[str]:
+    """A word broken at a line end inside a table cell ("Receiv-" / "er.")
+    put beside the line that continues it - the next line of its own column,
+    which in reading order can sit several cells later. The two halves are
+    only brought together, not joined: the count check already cancels a pair
+    of adjacent words the other side prints as one ("receiv" + "er" against
+    "receiver"), and that keeps a real hyphen ("USB-" / "C") split as the
+    other side prints it too."""
+    out = [dict(ln) for ln in lines]
+    for i, ln in enumerate(out):
+        if not _ENDS_HYPHEN_RE.search(ln["text"]):
+            continue
+        x0, _, x1, y1 = ln["bbox"]
+        height = max(1.0, ln["bbox"][3] - ln["bbox"][1])
+        below = [n for n in out[i + 1:i + 12]
+                 if n["page"] == ln["page"] and abs(n["bbox"][0] - x0) <= 20
+                 and -0.5 * height <= n["bbox"][1] - y1 <= 1.6 * height]
+        if not below:
+            continue
+        nxt = min(below, key=lambda n: n["bbox"][1])
+        m = _STARTS_WORD_RE.match(nxt["text"])
+        if m:
+            ln["text"] = f"{ln['text'].rstrip()[:-1].rstrip()} {m.group(1)}"
+            nxt["text"] = nxt["text"][m.end():]
+    return out
+
+
+def _audit_tokens(text: str) -> list[str]:
+    # A cross-reference's page ("(See page 25)") and Staging's link naming the
+    # section in its place ("(“Microphone and remote control LED indicator”)")
+    # are the same reference, not words either side lost or gained.
+    text = _XREF_RE.sub(" ", _PAGE_REF_RE.sub(" ", text or ""))
+    return [t for t in _TOKEN_RE.findall(_normalise(text)) if len(t) > 1 or t.isdigit()]
+
+
+_CALLOUT_NUMBER_RE = re.compile(r"^\s*\(?\d{1,2}\)?[.:]?\s*$")
+
+
+# A label drawn ON a diagram, alongside the bare callout numbers: a dimension
+# ("3 cm"), a state ("ON"), an axis name. Short, because a caption or a line of
+# body text that happens to overlap the artwork is neither.
+_ARTWORK_LABEL_WORDS = 3
+_ARTWORK_LABEL_CHARS = 20
+# An "artwork box" that covers most of the page is a scanned page, not a
+# diagram: every line on it sits inside it, and dropping them all would leave
+# the page's whole text uncounted on that side alone.
+_ARTWORK_LABEL_MAX_PAGE_SHARE = 0.6
+
+
+def _is_artwork_callout(doc: "fitz.Document | None", line: dict) -> bool:
+    """Text printed ON a diagram - the "4" pointing at the TOUCH SCREEN port,
+    the "3 cm" beside a clearance arrow - rather than a word of the topic.
+    Production draws its diagrams as vectors, so this text is text and
+    countable; Staging prints the same diagram as one flat image, where it is
+    pixels too small for OCR to settle. Counting it reported every callout
+    number - and every dimension label - missing from Staging.
+
+    A bare number counts when it sits about where the artwork is; anything
+    else must be a SHORT label drawn wholly inside the artwork, so a caption
+    under the figure or a sentence beside it is never swallowed."""
+    text = (line.get("text") or "").strip()
+    if doc is None or not text:
+        return False
+    callout = bool(_CALLOUT_NUMBER_RE.match(text))
+    label = len(text) <= _ARTWORK_LABEL_CHARS and len(text.split()) <= _ARTWORK_LABEL_WORDS
+    if not (callout or label):
+        return False
+    if _inside_table(doc, line["page"], line["bbox"]):
+        return False  # a table's own cell ("50" in a screen-size column), not a callout
+    x0, y0, x1, y1 = line["bbox"]
+    try:
+        boxes = _page_artwork_boxes(doc, line["page"])
+    except Exception:
+        return False
+    if callout:
+        centre = fitz.Point((x0 + x1) / 2, (y0 + y1) / 2)
+        return any((r + (-8, -8, 8, 8)).contains(centre) for r in boxes)
+    if line.get("ocr"):
+        return False  # read off a scanned page: the whole page is "artwork"
+    try:
+        page_area = doc[line["page"]].rect.get_area() or 1.0
+    except Exception:
+        return False
+    return any(r.contains(fitz.Rect(x0, y0, x1, y1))
+               and r.get_area() <= _ARTWORK_LABEL_MAX_PAGE_SHARE * page_area
+               for r in boxes)
+
+
+_BLOCK_GRAM = 10      # words in the window matched against the other side
+_BLOCK_MIN_WORDS = 25
+_BLOCK_SURPLUS = 0.5   # this share of a run's words must be surplus on this side
+_BLOCK_SAID = 0.7      # this share already named by another finding: not reported again  # a run this long is a block of content, not a stock phrase
+
+
+def _topic_tokens(lines: list[dict], at) -> dict[str, list[tuple[str, dict]]]:
+    """`{topic: [(word, the line it was printed on), ...]}`, in reading order."""
+    out: dict[str, list[tuple[str, dict]]] = {}
+    for ln in lines:
+        topic = at(ln["page"], ln["bbox"][1])
+        if not topic or _BARE_CALLOUT_RE.match(ln["text"]):
+            continue
+        for token in _audit_tokens(ln["text"]):
+            out.setdefault(topic, []).append((token, ln))
+    return out
+
+
+def _extra_runs(mine: list[str], theirs: list[str]) -> list[tuple[int, int]]:
+    """Spans of `mine` this side prints MORE often than the other does.
+
+    Whole blocks, not loose words: a run of `_BLOCK_GRAM` words is "extra"
+    only where this side prints that exact run more times than the other side
+    does, so a procedure printed twice here and once there marks its second
+    copy and a phrase both sides use once marks nothing. Wrapping cannot
+    matter - the words are counted in reading order, with line breaks gone."""
+    grams = lambda seq: [tuple(seq[i:i + _BLOCK_GRAM]) for i in range(len(seq) - _BLOCK_GRAM + 1)]
+    budget = Counter(grams(theirs))
+    marked: set[int] = set()
+    for i, gram in enumerate(grams(mine)):
+        if budget[gram] > 0:
+            budget[gram] -= 1  # the other side's copy of this run - not extra
+        else:
+            marked.update(range(i, i + _BLOCK_GRAM))
+    runs: list[tuple[int, int]] = []
+    for i in sorted(marked):
+        if runs and i == runs[-1][1] + 1:
+            runs[-1] = (runs[-1][0], i)
+        else:
+            runs.append((i, i))
+    return [(a, b) for a, b in runs if b - a + 1 >= _BLOCK_MIN_WORDS]
+
+
+def _pictured_words(figs: list[Element] | None, doc: "fitz.Document | None") -> dict[str, Counter]:
+    """`{topic: words read by OCR off that topic's pictures}` - a word the
+    other side prints only inside its artwork (a figure label baked into
+    Staging's image, set as text in Production) is printed there to read, and
+    can settle a shortfall, never raise one."""
+    out: dict[str, Counter] = {}
+    if doc is None:
+        return out
+    from pdfval import ocr
+    for f in figs or []:
+        if not f.boxes or not f.section:
+            continue
+        page_index, bbox = f.boxes[0]
+        try:
+            read = ocr.words_in(_page_words(doc).ocr_words(page_index), bbox, margin=4)
+        except Exception:
+            continue
+        out.setdefault(f.section, Counter()).update(_audit_tokens(" ".join(read)))
+    return out
+
+
+def _named_words(diff: dict) -> tuple[list[str], list[str]]:
+    """`(what this finding says Production prints, what it says Staging does)` -
+    the words themselves, not the sentence built around them."""
+    prod, stage = [], []
+    for op in diff.get("word_diff") or []:
+        if op.get("type") == "del":
+            prod += _audit_tokens(op.get("text", ""))
+        elif op.get("type") == "ins":
+            stage += _audit_tokens(op.get("text", ""))
+    prod += [t for x in (diff.get("gone") or []) for t in _audit_tokens(str(x))]
+    stage += [t for x in (diff.get("extra") or []) for t in _audit_tokens(str(x))]
+    if diff.get("type") == "missing" and diff.get("exp") is not None:
+        prod += _audit_tokens(getattr(diff["exp"], "text", "") or "")
+    if diff.get("type") == "added" and diff.get("act") is not None:
+        stage += _audit_tokens(getattr(diff["act"], "text", "") or "")
+    return prod, stage
+
+
+def _hyphen_piece(token: str, others: set[str]) -> bool:
+    """Is this not a word at all, but a piece of one the other side prints?
+
+    A narrow table column hyphenates: Production's "Receiv-/er", "sup-/ply",
+    "manage-/ment" read out as fragments, and cells read in another order glue
+    two of them together ("sup" + "make" -> "supmake"). Every such piece
+    answers to a word the other side prints whole."""
+    def piece(t: str) -> bool:
+        return len(t) >= 2 and any(len(o) > len(t) and (o.startswith(t) or o.endswith(t)) for o in others)
+    if token in others or piece(token):
+        return True
+    # Two pieces run together where the other side reads them apart.
+    return any((a in others or piece(a)) and (b in others or piece(b))
+               for a, b in ((token[:i], token[i:]) for i in range(2, len(token) - 1)))
+
+
+def _accounted_for(named: list[str], other: Counter, joined: Counter,
+                   others: set[str] | None = None) -> bool:
+    """Is every word this finding names printed on the other side anyway?
+
+    Counted, not merely looked up, so a block printed twice here and once
+    there is still short. A word split over a line end on one side only
+    ("Receiv-" / "er" in Production's narrow table column, "Receiver" in
+    Staging's wide one) is the same word differently broken: the two halves
+    answer to the whole, and the whole to the two halves."""
+    left, pairs = +other, +joined
+    i = 0
+    while i < len(named):
+        t = named[i]
+        if left[t] > 0:
+            left[t] -= 1
+        elif pairs[t] > 0:  # the other side breaks this word over a line end
+            pairs[t] -= 1
+        elif i + 1 < len(named) and left[t + named[i + 1]] > 0:
+            left[t + named[i + 1]] -= 1  # THIS side breaks it; the other prints it whole
+            i += 1
+        elif others is not None and _hyphen_piece(t, others):
+            pass  # a hyphenated piece of a word the other side prints whole
+        else:
+            return False
+        i += 1
+    return bool(named)
+
+
+def drop_reflow_noise(chapter: "Chapter", exp_lines: list[dict], act_lines: list[dict],
+                      exp_at, act_at) -> None:
+    """Drop the text findings that are the same content, set differently.
+
+    Two documents set the same table in different column widths: Production
+    hyphenates "connect-/ing", "Receiv-/er", "sup-/ply" and reads its cells in
+    another order, Staging does neither. Compared as a stream of words that
+    reads as dozens of missing and extra fragments, and a reader cannot find
+    the few real differences among them. A finding survives only where a word
+    it names is genuinely not printed on the other side under the same
+    heading - order, wrapping and hyphenation aside."""
+    def tokens(lines, at) -> tuple[dict[str, Counter], dict[str, Counter]]:
+        seq: dict[str, list[str]] = {}
+        for ln in lines:
+            topic = at(ln["page"], ln["bbox"][1])
+            if topic:
+                seq.setdefault(topic, []).extend(_audit_tokens(ln["text"]))
+        whole = {k: Counter(v) for k, v in seq.items()}
+        joined = {k: Counter(x + y for x, y in zip(v, v[1:])) for k, v in seq.items()}
+        return whole, joined
+
+    exp_w, exp_j = tokens(exp_lines, exp_at)
+    act_w, act_j = tokens(act_lines, act_at)
+    empty = Counter()
+    # A finding whose heading the other side has no copy of is still checked,
+    # against that side's whole chapter: hyphenated pieces are the typesetting
+    # of the page they are printed on, wherever the two split their headings.
+    exp_all = sum(exp_w.values(), Counter())
+    act_all = sum(act_w.values(), Counter())
+    exp_all_j = sum(exp_j.values(), Counter())
+    act_all_j = sum(act_j.values(), Counter())
+    kept = []
+    for diff in chapter.differences:
+        if diff.get("type") not in _REFLOW_CHECKED or diff.get("block"):
+            kept.append(diff)
+            continue
+        topic = diff.get("section")
+        prod, stage = _named_words(diff)
+        # Each side's words against the OTHER document's copy of this topic.
+        here_act, here_exp = act_w.get(topic), exp_w.get(topic)
+        said_prod = not prod or _accounted_for(
+            prod, here_act if here_act is not None else act_all,
+            act_j.get(topic, act_all_j) if here_act is not None else act_all_j, set(act_all))
+        said_stage = not stage or _accounted_for(
+            stage, here_exp if here_exp is not None else exp_all,
+            exp_j.get(topic, exp_all_j) if here_exp is not None else exp_all_j, set(exp_all))
+        if (prod or stage) and said_prod and said_stage:
+            continue  # the same content on both sides, only set differently
+        kept.append(diff)
+    chapter.differences = kept
+
+
+_REFLOW_CHECKED = {"text", "missing", "added", "table-cell"}
+
+
+def _already_said(chapter: "Chapter", topic: str) -> set[str]:
+    """Every word the findings already made about this topic name - a block
+    another check has reported is not reported again as a block."""
+    said: list[str] = []
+    for d in chapter.differences:
+        if d.get("section") not in (topic, None, ""):
+            continue
+        said += [d.get("summary", ""), str(d.get("detail") or "")]
+        for key in ("exp", "act"):
+            el = d.get(key)
+            if el is not None:
+                said.append(getattr(el, "text", "") or "")
+    return set(_TOKEN_RE.findall(_normalise(" ".join(said))))
+
+
+def repeated_block_changes(chapter: "Chapter", exp_lines: list[dict], act_lines: list[dict],
+                           exp_at, act_at, exp_figs: list[Element] | None = None,
+                           act_figs: list[Element] | None = None,
+                           expected: "fitz.Document | None" = None,
+                           actual: "fitz.Document | None" = None) -> list[dict]:
+    """A whole block of content one side prints and the other does not - most
+    often a procedure Staging repeats twice under one heading where Production
+    prints it once.
+
+    `word_audit_changes` cannot see this: it compares how often each WORD is
+    printed, and a duplicated block is the same words again, so its counts
+    very nearly cancel and what survives is a handful of loose words pointing
+    at scattered lines instead of the repeated block itself."""
+    out: list[dict] = []
+    exp_t, act_t = _topic_tokens(exp_lines, exp_at), _topic_tokens(act_lines, act_at)
+    # What each side prints only inside its pictures counts as printed there.
+    drawn = {"missing": _pictured_words(act_figs, actual),
+             "added": _pictured_words(exp_figs, expected)}
+    # The same words counted over the WHOLE chapter: content the other side
+    # prints under a NEIGHBOURING heading is there to read, wherever the two
+    # documents happen to split their headings, and reporting it "missing"
+    # was wrong. Only what no topic of the other side prints is reported.
+    whole = {"missing": Counter(t for ts in exp_t.values() for t, _ in ts),
+             "added": Counter(t for ts in act_t.values() for t, _ in ts)}
+    whole["missing"].subtract(Counter(t for ts in act_t.values() for t, _ in ts))
+    whole["added"].subtract(Counter(t for ts in exp_t.values() for t, _ in ts))
+    for topic in dict.fromkeys(list(exp_t) + list(act_t)):
+        a, b = exp_t.get(topic, []), act_t.get(topic, [])
+        covered = _already_said(chapter, topic)
+        for mine, theirs, kind in ((a, b, "missing"), (b, a, "added")):
+            # Words this side genuinely prints more often, counted over the
+            # whole topic. A run only reads as extra in the order it happens
+            # to be printed in - a table read column-first on one side, a word
+            # hyphenated over a line break on the other - is the same content,
+            # and every one of its words is already there on the other side.
+            surplus = Counter(t for t, _ in mine)
+            surplus.subtract(Counter(t for t, _ in theirs))
+            for start, end in _extra_runs([t for t, _ in mine], [t for t, _ in theirs]):
+                span = mine[start:end + 1]
+                enough = True
+                for counts in (surplus - drawn[kind].get(topic, Counter()),
+                               whole[kind] - sum(drawn[kind].values(), Counter())):
+                    left = +counts
+                    if sum(1 for t, _ in span
+                           if left[t] > 0 and not left.subtract({t: 1})) < len(span) * _BLOCK_SURPLUS:
+                        enough = False  # printed on the other side too - reordered, or under another heading
+                        break
+                if not enough:
+                    continue
+                # Trimmed to the words this side really prints more often:
+                # a run can open or close on ordinary words both sides print
+                # (the sentence around Production's picture captions), and
+                # quoting those named the wrong text and boxed the wrong lines.
+                core = [k for k, (t, _) in enumerate(span) if surplus[t] > 0]
+                if core:
+                    span = span[core[0]:core[-1] + 1]
+                if sum(1 for t, _ in span if t in covered) >= len(span) * _BLOCK_SAID:
+                    continue  # another finding already reports this content
+                words = " ".join(t for t, _ in span)
+                boxes, seen = [], set()
+                for _, ln in span:
+                    at = (ln["page"], tuple(ln["bbox"]))
+                    if at not in seen:
+                        seen.add(at)
+                        boxes.append(at)
+                # Printed twice on this side, once on the other: a repeat, not
+                # content the other side is missing outright.
+                head = tuple(t for t, _ in span[:_BLOCK_GRAM])
+                all_mine = [t for t, _ in mine]
+                repeat = sum(1 for i in range(len(all_mine) - _BLOCK_GRAM + 1)
+                             if tuple(all_mine[i:i + _BLOCK_GRAM]) == head) > 1
+                side = "Staging" if kind == "added" else "Production"
+                shown = words[:120] + ("..." if len(words) > 120 else "")
+                out.append({
+                    "type": kind, "kind": KIND_TEXT, "section": topic, "block": True,
+                    "summary": (
+                        f"Block repeated in {side} — {side} prints this block twice under this heading, "
+                        f"the other document prints it once: “{shown}”."
+                        if repeat else
+                        (f"Block of text missing in Staging — printed in Production, not in Staging: “{shown}”."
+                         if kind == "missing" else
+                         f"Block of text extra in Staging — printed in Staging, not in Production: “{shown}”.")
+                    ),
+                    "detail": words[:400],
+                    "exp": (Element(kind=KIND_TEXT, text=words, key=words, section=topic,
+                                    boxes=boxes[:12]) if kind == "missing" else None),
+                    "act": (Element(kind=KIND_TEXT, text=words, key=words, section=topic,
+                                    boxes=boxes[:12]) if kind == "added" else None),
+                })
+    return out
+
+
+def word_audit_changes(chapter: "Chapter", exp_lines: list[dict], act_lines: list[dict],
+                       exp_at, act_at, exp_figs: list[Element] | None = None,
+                       act_figs: list[Element] | None = None, expected: fitz.Document | None = None,
+                       actual: fitz.Document | None = None) -> list[dict]:
+    """The final safety net: every word printed in each topic, counted on both
+    sides straight off the page (OCR for a scanned page), with no element,
+    pairing or noise filter in between. A word Production prints more often
+    than Staging in the same topic - or the reverse - that no other finding
+    already names is reported. Order and wrapping cannot matter: only counts
+    are compared.
+
+    Words the other side prints only as part of a picture (Staging's
+    dimension drawing with "241.3" in its artwork, Production's as text) are
+    read off that side's figures by OCR and count as printed there - they
+    can settle a shortfall, never raise one."""
+    exp_pictured = _pictured_words(exp_figs, expected)
+    act_pictured = _pictured_words(act_figs, actual)
+
+    def table_tops(elements) -> dict[int, list[tuple]]:
+        tops: dict[int, list[tuple]] = {}
+        for e in elements or []:
+            if e.kind == KIND_TABLE:
+                for page_index, bbox in e.boxes:
+                    tops.setdefault(page_index, []).append(tuple(bbox))
+        return tops
+
+    header_words: dict[str, set] = {}
+
+    def by_topic(lines, at, tops, doc=None):
+        out: dict[str, list] = {}
+        first_seen: dict[tuple, int] = {}
+        for ln in lines:
+            topic = at(ln["page"], ln["bbox"][1])
+            if not topic:
+                continue
+            # A callout's label ("Note", "TIP:") is its styling, never content.
+            if _BARE_CALLOUT_RE.match(ln["text"]):
+                continue
+            if _is_artwork_callout(doc, ln):
+                continue  # a number printed on a diagram, not a word of the topic
+            tokens = _audit_tokens(ln["text"])
+            # A table's header reprinted at the top of its continuation page
+            # ("Item | Descriptions" again on p.35) is the page break's, not
+            # the text's: the other side may not break the table there.
+            # Its words are left out of the count on BOTH sides - skipping the
+            # line on one side only unbalanced the counts.
+            seen = first_seen.setdefault((topic, tuple(tokens)), ln["page"])
+            x0, y0, x1, y1 = ln["bbox"]
+            near_top = False
+            if doc is not None:
+                try:
+                    near_top = y0 <= doc[ln["page"]].rect.height * _HEADER_REPEAT_BAND
+                except Exception:
+                    near_top = False
+            if seen < ln["page"] and 0 < len(tokens) <= _HEADER_REPEAT_TOKENS and (near_top or any(
+                    b[0] - 2 <= x0 and x1 <= b[2] + 2 and b[1] - 3 <= y0 <= b[1] + _HEADER_REPEAT_REACH
+                    for b in tops.get(ln["page"], ()))):
+                header_words.setdefault(topic, set()).update(tokens)
+            out.setdefault(topic, []).append((ln, tokens))
+        return out
+
+    exp_t = by_topic(_rejoin_hyphens(_rejoin_page_refs(exp_lines)), exp_at, table_tops(getattr(chapter, "exp_elements", None)), expected)
+    act_t = by_topic(_rejoin_hyphens(_rejoin_page_refs(act_lines)), act_at, table_tops(getattr(chapter, "act_elements", None)), actual)
+    # The same count over the WHOLE chapter, not just the topic. The topic
+    # boundaries the two sides fall into are not identical - a heading one
+    # side bookmarks and the other does not, a step whose boilerplate
+    # ("...to go to a sub menu, and then use...", printed seven times in both
+    # documents) lands on the far side of a boundary - and a word counted in
+    # topic A here and topic B there then shows as missing from A and extra in
+    # B, though the chapter prints it exactly as often on both sides. The
+    # question this check exists to answer is whether the words are printed at
+    # all; the chapter-wide count is what answers it.
+    chapter_exp = Counter(_audit_tokens(_join_audit_lines([ln for lines in exp_t.values() for ln, _ in lines])))
+    chapter_act = Counter(_audit_tokens(_join_audit_lines([ln for lines in act_t.values() for ln, _ in lines])))
+    out: list[dict] = []
+    for topic in dict.fromkeys(list(exp_t) + list(act_t)):
+        a, b = exp_t.get(topic, []), act_t.get(topic, [])
+        # Counted over the topic's whole text, so a page reference wrapped
+        # over two lines ("on" / "page 26") is still recognised and dropped.
+        ta = _audit_tokens(_join_audit_lines([ln for ln, _ in a]))
+        tb = _audit_tokens(_join_audit_lines([ln for ln, _ in b]))
+        ca, cb = Counter(ta), Counter(tb)
+        covered: set[str] = set()
+        for d in chapter.differences:
+            if d.get("section") not in (topic, None, ""):
+                continue
+            said = " ".join([d.get("summary", ""), str(d.get("detail") or "")]
+                            + [str(x) for x in (d.get("gone") or [])] + [str(x) for x in (d.get("extra") or [])])
+            for key in ("exp", "act"):
+                el = d.get(key)
+                if el is not None:
+                    said += " " + (getattr(el, "text", "") or "")
+            covered |= set(_TOKEN_RE.findall(_normalise(said)))
+        for mine, theirs, own, other, lines, kind, drawn, mine_all, theirs_all in (
+            (ca, cb, ta, tb, a, "missing", act_pictured.get(topic, Counter()), chapter_exp, chapter_act),
+            (cb, ca, tb, ta, b, "added", exp_pictured.get(topic, Counter()), chapter_act, chapter_exp),
+        ):
+            short = {t: min(n - theirs[t] - drawn[t], mine_all[t] - theirs_all[t]) for t, n in mine.items()
+                     if n > theirs[t] + drawn[t] and mine_all[t] > theirs_all[t] and t not in covered
+                     and t not in header_words.get(topic, ())}
+            short = {t: n for t, n in short.items() if n > 0}
+            if not short:
+                continue
+            # A word hyphenated or split at a line end on one side only
+            # ("con-" / "tents"): the same letters, differently broken.
+            other_joined = {x + y for x, y in zip(other, other[1:])}
+            other_set = set(other)
+            for x, y in zip(own, own[1:]):
+                if x + y in other_set:
+                    short.pop(x, None); short.pop(y, None)
+            short = {t: n for t, n in short.items() if t not in other_joined}
+            if not short:
+                continue
+            words = [t for t in dict.fromkeys(own) if t in short]
+            boxes, seen = [], set()
+            # Only the lines the other side does not print: "Some of the
+            # accessories may vary by region." holds "region" too, but Staging
+            # prints that sentence - the caption "(Varies by region)" is the
+            # missing one.
+            other_text = " " + " ".join(other) + " "
+            other_doc = actual if kind == "missing" else expected
+            for ln, ts in lines:
+                if ts and f" {' '.join(ts)} " in other_text:
+                    continue
+                # The line IS printed in the other document, just not under
+                # the topic this side files it under - the two outlines
+                # disagree about where a boilerplate step belongs, or a
+                # heading one side bookmarks splits a topic the other keeps
+                # whole. The words are there; only the filing differs, and
+                # this check is about whether the content is printed at all.
+                if _printed_anywhere_in(other_doc, ln["text"]):
+                    continue
+                if any(t in short for t in ts) and (ln["page"], ln["bbox"]) not in seen:
+                    seen.add((ln["page"], ln["bbox"]))
+                    boxes.append((ln["page"], tuple(ln["bbox"])))
+            # Every line that would have been boxed turned out to be printed in
+            # the other document: nothing of this topic's content is missing.
+            if not boxes:
+                continue
+            shown = ", ".join(f"“{w}”" + (f" ×{short[w]}" if short[w] > 1 else "") for w in words[:40])
+            if len(words) > 40:
+                shown += f" and {len(words) - 40} more"
+            ocr_page = any(ln.get("ocr") for ln, ts in lines if any(t in short for t in ts))
+            place = Element(kind=KIND_TEXT, text=" ".join(words), key=" ".join(words),
+                            boxes=boxes[:12], section=topic, ocr=ocr_page)
+            out.append({
+                "type": kind, "kind": KIND_TEXT, "section": topic, "audit": True,
+                "summary": (f"Words missing in Staging — printed in Production in this topic, not in Staging: {shown}."
+                            if kind == "missing" else
+                            f"Words extra in Staging — printed in Staging in this topic, not in Production: {shown}."),
+                "detail": " ".join(ln["text"] for ln, ts in lines if any(t in short for t in ts)
+                                   and not (ts and f" {' '.join(ts)} " in other_text)
+                                   and not _printed_anywhere_in(other_doc, ln["text"]))[:400],
+                "exp": place if kind == "missing" else None,
+                "act": place if kind == "added" else None,
+                **({"ocr_sides": ["Production" if kind == "missing" else "Staging"]} if ocr_page else {}),
+            })
+    return out
+
+
+_ROW_NUMBER_RE = re.compile(r"^\d{1,3}\.$")  # "8." - a bare "8" is a diagram callout
+
+
+def _numbered_cell_labels(lines: list[dict]) -> dict[tuple, dict]:
+    """`{(row number, label): line}` - the first text of each numbered table
+    row ("8." | "YouTube"), with `drop`: how far below the row number's own
+    line it starts. Level with the number when an icon sits beside the label;
+    a line or more down when the icon is stacked above it."""
+    out: dict[tuple, dict] = {}
+    nums = [ln for ln in lines if _ROW_NUMBER_RE.match(ln["text"].strip())]
+    for num in nums:
+        page, (nx0, ny0, nx1, ny1) = num["page"], num["bbox"]
+        h = max(1.0, ny1 - ny0)
+        # Up to the next row number in the same column, the cell to the right.
+        below = [m["bbox"][1] for m in nums if m["page"] == page and abs(m["bbox"][0] - nx0) < 4
+                 and m["bbox"][1] > ny0 + 1]
+        limit = min(below, default=ny0 + 6 * h)
+        cell = sorted((ln for ln in lines if ln["page"] == page and ln is not num
+                       and ln["bbox"][0] >= nx1 - 1 and ln["bbox"][0] < nx1 + 160
+                       and ny0 - 2 <= ln["bbox"][1] < limit - 1
+                       and _audit_tokens(ln["text"])),
+                      key=lambda ln: (ln["bbox"][1], ln["bbox"][0]))
+        if not cell:
+            continue
+        first = cell[0]
+        label = " ".join(_audit_tokens(first["text"]))
+        key = (num["text"].strip().rstrip("."), label)
+        out.setdefault(key, {**first, "drop": (first["bbox"][1] - ny0) / h})
+    return out
+
+
+def table_icon_layout_changes(exp_lines: list[dict], act_lines: list[dict],
+                              exp_at, act_at) -> list[dict]:
+    """A numbered table row's icon printed beside its label on one side
+    ("[icon] YouTube" on the row's first line) and stacked above it on the
+    other (the icon on one line, "YouTube" on the next) - same words, but the
+    icon and its label no longer line up. One finding per topic, every such
+    row boxed on both sides."""
+    def by_topic(lines, at):
+        out: dict[str, list] = {}
+        for ln in lines:
+            topic = at(ln["page"], ln["bbox"][1])
+            if topic:
+                out.setdefault(topic, []).append(ln)
+        return out
+
+    exp_t, act_t = by_topic(exp_lines, exp_at), by_topic(act_lines, act_at)
+    out: list[dict] = []
+    for topic in exp_t:
+        if topic not in act_t:
+            continue
+        a, b = _numbered_cell_labels(exp_t[topic]), _numbered_cell_labels(act_t[topic])
+        stacked, beside = [], []
+        for key in a.keys() & b.keys():
+            la, lb = a[key], b[key]
+            if la["drop"] < 0.5 and lb["drop"] >= 1.2:
+                stacked.append((key, la, lb))
+            elif lb["drop"] < 0.5 and la["drop"] >= 1.2:
+                beside.append((key, la, lb))
+        for rows, in_staging in ((stacked, "stacked above its label"), (beside, "beside its label")):
+            if not rows:
+                continue
+            rows.sort(key=lambda r: int(r[0][0]))
+            names = ", ".join(f"{n}. {la['text'].strip()}" for (n, _), la, _ in rows[:12])
+            other = "beside it on the same line" if in_staging.startswith("stacked") else "stacked above it"
+            mk = lambda side: Element(kind=KIND_TABLE, text=names, key=names, section=topic,
+                                      boxes=[(ln["page"], tuple(ln["bbox"])) for ln in side][:12])
+            out.append({
+                "type": "table-cell-layout", "kind": KIND_TABLE, "section": topic,
+                "summary": (f"Icon and label misaligned in table — in Staging the icon is {in_staging}, "
+                            f"Production prints it {other}: {names}."),
+                "detail": "",
+                "exp": mk([la for _, la, _ in rows]), "act": mk([lb for _, _, lb in rows]),
+            })
+    return out
+
+
 _PLAIN_TEXT_KINDS_EXCLUDED = {KIND_FIGURE, KIND_TABLE}
 
 
@@ -7298,7 +8962,7 @@ def _book_stream(chapter_elements: list[list[Element]]) -> list[tuple[str, Eleme
         for el in sorted(elements, key=lambda e: e.order):
             if el.kind == KIND_FIGURE:
                 continue
-            for token in _TOKEN_RE.findall(_normalise(el.text or "")):
+            for token in _TOKEN_RE.findall(_normalise(_xref_free(el.text))):
                 if _BARE_CALLOUT_RE.match(token):
                     continue
                 out.append((token, el))
@@ -7378,6 +9042,8 @@ def plain_text_scan(chapters: list["Chapter"], expected: fitz.Document,
         ):
             if len(run) < _COVERAGE_MIN_TOKENS or _CJK_RE.search("".join(run)):
                 continue
+            if set(run) <= _PAGE_REF_WORDS:
+                continue  # what is left of a page reference Staging drops (the user's rule)
             if f" {' '.join(run)} " in other:
                 continue  # the exact phrase, printed elsewhere in the book
             if "".join(run) in solid:
@@ -7386,11 +9052,44 @@ def plain_text_scan(chapters: list["Chapter"], expected: fitz.Document,
                 set(run) <= covered or all(counts[t] >= n for t, n in Counter(run).items())
             ):
                 continue  # already reported, or every word printed in the book - just in another order or place
+            # The same content, broken differently: a narrow table column
+            # hyphenates ("Receiv-/er", "sup-/ply") and its cells read out in
+            # another order, so the run is pieces of words the other side
+            # prints whole. Only a run carrying such a piece is tested this
+            # way - a run of real words missing outright still reports.
+            vocab = set(counts)
+            debris = [t for t in set(run) if counts[t] == 0 and _hyphen_piece(t, vocab)]
+            if debris and all(counts[t] >= n or _hyphen_piece(t, vocab)
+                              for t, n in Counter(run).items()):
+                continue
             if f" {' '.join(run)} " in raw_other:
                 continue  # on the page, just classified differently (a table cell, a heading)
             el = source[start][1]
             ch = owner.get(id(el))
             if ch is None:
+                continue
+            # A short run whose every word the other side prints inside THIS
+            # chapter is the same content read in another order - a table's
+            # cells taken column-first on one side and row-first on the other.
+            # Only short runs: a whole sentence or paragraph that happens to
+            # reuse the chapter's vocabulary is still a real loss.
+            if len(run) <= _COVERAGE_REORDER_MAX_TOKENS:
+                pages = (ch.act_pages if kind == "missing" else ch.exp_pages) or []
+                here = _chapter_word_counts(actual if kind == "missing" else expected, tuple(pages))
+                if all(here[t] >= n for t, n in Counter(run).items()):
+                    continue
+            # Already reported as part of a sentence one side lacks: the same
+            # loss, not a second finding pinned at the chapter's first page.
+            side = "exp" if kind == "missing" else "act"
+            phrase = f" {' '.join(run)} "
+            def names(d: dict) -> str:
+                if d.get("type") == "text":
+                    runs = d.get("gone" if kind == "missing" else "extra") or []
+                    return " " + " ".join(runs) + " "
+                if d.get("type") == kind and d.get(side) is not None:
+                    return " " + " ".join(_TOKEN_RE.findall(_normalise(getattr(d[side], "text", "") or ""))) + " "
+                return ""
+            if any(phrase in names(d) for d in ch.differences):
                 continue
             other_doc = actual if kind == "missing" else expected
             other_pages = (ch.act_pages if kind == "missing" else ch.exp_pages) or []
@@ -7514,6 +9213,170 @@ _WORD_RE = re.compile(r"\s+")
 # on those; then map back. One shared instance since it is stateless per call.
 _WORD_DMP = diff_match_patch()
 
+# Ordinary sentence punctuation only - never a symbol that carries its own
+# meaning. "©", "®", "™", "°", "±", "%", a currency sign: losing one of
+# these is losing real content (a missing "©" is a missing copyright notice;
+# "100°C" missing its "°" is a different, wrong number), not a trivial
+# formatting difference the way a dropped comma or a period swapped for a
+# dash can be. `_TOKEN_RE` (word characters only) used to gate this and
+# swallowed every one of those symbols along with genuine punctuation, since
+# neither is alnum - this explicit set is deliberately narrow instead.
+# "/" joins two words ("and/or", "components/equipment") far more often than
+# it means anything on its own, and sits right where a line wraps often
+# enough that a compound term wrapping at the slash on one side and not the
+# other left a stray space next to it - "components/ equipment" against
+# "components/equipment" - which is nothing but that wrap, not a changed
+# symbol, and must not be judged as one just because "/" is attached to it.
+_TRIVIAL_PUNCT_CHARS = set(".,;:!?'\"‘’“”()[]{}–—-…*/")
+
+
+_CALLOUT_WORD_RE = re.compile(r"(?i)note|notes|tip|tips|warning|caution|important|attention|danger")
+_BULLET_GLYPH_RE = re.compile(r"[•●○◦▪▫■□►▸‣⁃∙]")
+_MARK_SPLIT_RE = re.compile(r"([^\W_]+)", re.UNICODE)
+
+
+def _mark_change(where: str, x: str, y: str) -> str | None:
+    """One gap's difference in plain words: which marks Staging lacks or adds,
+    or - the marks being the same - a space missing or extra."""
+    ca, cb = Counter(x.replace(" ", "")), Counter(y.replace(" ", ""))
+    lost, added = "".join((ca - cb).elements()), "".join((cb - ca).elements())
+    said = []
+    if lost:
+        said.append("“" + " ".join(lost) + "” missing in Staging")
+    if added:
+        said.append("“" + " ".join(added) + "” extra in Staging")
+    if not said:
+        if x.count(" ") > y.count(" "):
+            said.append("space missing in Staging")
+        elif y.count(" ") > x.count(" "):
+            said.append("extra space in Staging")
+        elif x != y:
+            said.append(f"“{x.strip()}” in Production, “{y.strip()}” in Staging")
+    return f"{where}: {', '.join(said)}" if said else None
+
+
+_LEAD_DASH_RE = re.compile(r"[-\u2013\u2014](?=\s*$)")
+
+
+def mark_changes(a_text: str, b_text: str, wraps_a=(), wraps_b=()) -> list[str]:
+    """Punctuation, quote marks and spaces that differ between the SAME words
+    on both sides: a period dropped after "drive", quotes lost around a
+    cross-reference, a space missing in "drive.Next". Words themselves are the
+    word check's business - only what sits between two words both sides
+    print, in the same order, is compared here. Curly and straight quotes
+    are the same mark; line wrapping is only whitespace and never counts:
+    `wraps_a` / `wraps_b` name the (word, next word) pairs each side prints
+    across a line or page break, where the space is the wrap's own - Production
+    breaking "Support." / "BenQ.com" over two lines is not a space in the text."""
+    def parts(text: str) -> tuple[list[str], list[str]]:
+        text = _PAGE_REF_RE.sub("", _CONTROL_RE.sub("", text or "")).translate(_QUOTES)
+        text = _INLINE_CALLOUT_RE.sub(" ", text)  # a callout glyph one side draws and the other sets
+        # The list marker itself, and the gap between it and the step's first
+        # word: "2.Remove" against "2. Remove" is the marker set tight, not a
+        # space added to the sentence. Marker style is the marker checks'
+        # business (see `_LIST_MARKER_TOKEN_RE`); reported here it turned every
+        # numbered step in the manual into a spacing finding of its own.
+        text = _LIST_MARKER_TOKEN_RE.sub(" ", text)
+        # A line break after a hyphen or slash ("power- saving", "and/ or",
+        # "support. benq") is wrapping, not a space in the text.
+        text = re.sub(r"(\w[-/])\s+(?=\w)|(\w\.)\s+(?=[a-z])", lambda m: m.group(1) or m.group(2), text)
+        bits = _MARK_SPLIT_RE.split(text)
+        # Bullet glyphs are list markers, the marker checks' business - never punctuation.
+        words, gaps = bits[1::2], [re.sub(r"\s+", " ", _BULLET_GLYPH_RE.sub(" ", g)) for g in bits[0::2]]
+        return words, gaps  # gaps[i] sits before words[i]; gaps[-1] after the last word
+
+    wa, ga = parts(a_text)
+    wb, gb = parts(b_text)
+    out: list[str] = []
+    fold_a, fold_b = [w.casefold() for w in wa], [w.casefold() for w in wb]
+    wrap_a, wrap_b = set(wraps_a or ()), set(wraps_b or ())
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=fold_a, b=fold_b, autojunk=False).get_opcodes():
+        if tag != "equal":
+            continue
+        # The gaps strictly between the matched words, plus the one after the
+        # run when both runs end their text (a sentence's final period).
+        for k in range(1, i2 - i1):
+            x, y = ga[i1 + k], gb[j1 + k]
+            if x != y and x.replace(" ", "") == y.replace(" ", ""):
+                # Only a space differs: not one when that side breaks the line there.
+                if (" " in x and (fold_a[i1 + k - 1], fold_a[i1 + k]) in wrap_a) \
+                        or (" " in y and (fold_b[j1 + k - 1], fold_b[j1 + k]) in wrap_b):
+                    continue
+            if x != y and _LEAD_DASH_RE.sub("", x).replace(" ", "") == _LEAD_DASH_RE.sub("", y).replace(" ", ""):
+                # A dash opening a new line is that line's list marker ("- a
+                # wireless device..." against Staging's bullet), not punctuation.
+                if ((fold_a[i1 + k - 1], fold_a[i1 + k]) in wrap_a and _LEAD_DASH_RE.search(x)) \
+                        or ((fold_b[j1 + k - 1], fold_b[j1 + k]) in wrap_b and _LEAD_DASH_RE.search(y)):
+                    continue
+            if x != y and not _CALLOUT_WORD_RE.fullmatch(wa[i1 + k - 1]):  # "Tip:" / "Note:" is callout styling
+                out.append(_mark_change(f"between “{wa[i1 + k - 1]}” and “{wa[i1 + k]}”", x, y))
+        if i2 == len(wa) and j2 == len(wb):
+            x, y = ga[-1].strip(), gb[-1].strip()
+            if x != y:
+                out.append(_mark_change(f"after “{wa[-1]}”", x, y))
+        if i1 == 0 and j1 == 0:
+            x, y = ga[0].strip(), gb[0].strip()
+            # a leading list marker / bullet is the marker checks' business
+            if x != y and any(ch in "\"'([" for ch in x + y):
+                out.append(_mark_change(f"before “{wa[0]}”", x, y))
+    out = [m for m in out if m]
+    return out
+
+
+def _is_trivial_punct(text: str) -> bool:
+    """True when `text` is nothing but ordinary punctuation and whitespace -
+    safe to treat as unchanged regardless of which side has it. False for
+    anything else, including a symbol that is not a letter or digit but is
+    not mere punctuation either."""
+    stripped = text.replace(" ", "")
+    return not stripped or all(ch in _TRIVIAL_PUNCT_CHARS for ch in stripped)
+
+
+def _only_bullet_glyphs(text: str) -> bool:
+    """The whole change is list-bullet characters - Production's "\u2022" against
+    Staging's "\u25cf". That is a marker-style change across a list, which
+    `bullet_glyph_changes` reports once for the whole list; reported again here
+    it reads as a CONTENT difference on every bullet, and the box lands on the
+    item's words rather than on the marker that actually changed."""
+    if not (text or "").strip():
+        return False
+    return not _BULLET_GLYPH_RE.sub("", text).strip()
+
+
+def _has_symbol(text: str) -> bool:
+    """A real symbol - ©, ®, °, ±, %, a currency mark, anything that is
+    neither a letter/digit nor ordinary sentence punctuation - appears in
+    `text`. Used to tell "the wording is the same, only a comma moved" apart
+    from "the wording is the same, but a copyright mark disappeared" - the
+    second one is content lost, not a formatting nuance, however small it
+    looks on the page."""
+    return any(not ch.isspace() and not ch.isalnum() and ch not in _TRIVIAL_PUNCT_CHARS for ch in text)
+
+
+def _unwrap_hyphens(words: list[str], other: list[str]) -> list[str]:
+    """A word broken over a line end ("man-" / "agement") put back together,
+    the way the other side prints it: "management", or "power-saving" when
+    the hyphen is the word's own. Wrapping is never a wording change."""
+    printed = {w.casefold().strip(".,;:()\"“”") for w in other}
+    out: list[str] = []
+    i = 0
+    while i < len(words):
+        w = words[i]
+        if w.endswith("-") and len(w) > 1 and i + 1 < len(words) and words[i + 1][:1].islower():
+            joined, kept = w[:-1] + words[i + 1], w + words[i + 1]
+            core = lambda x: x.casefold().strip(".,;:()\"“”")  # noqa: E731
+            if core(joined) in printed:
+                out.append(joined)
+                i += 2
+                continue
+            if core(kept) in printed:
+                out.append(kept)
+                i += 2
+                continue
+        out.append(w)
+        i += 1
+    return out
+
 
 def _word_diff(before: str, after: str) -> list[dict]:
     """The wording change, word by word, for the report to mark up."""
@@ -7522,6 +9385,7 @@ def _word_diff(before: str, after: str) -> list[dict]:
     # in wording and must never be boxed as a missing word.
     a = [w for w in _WORD_RE.split(before.strip()) if w and not _LIST_MARKER_TOKEN_RE.fullmatch(w)]
     b = [w for w in _WORD_RE.split(after.strip()) if w and not _LIST_MARKER_TOKEN_RE.fullmatch(w)]
+    a, b = _unwrap_hyphens(a, b), _unwrap_hyphens(b, a)
     # Curly and straight quotes are the same character to a reader: “display’s”
     # against "display's" is no wording change.
     fa, fb = [w.translate(_QUOTES) for w in a], [w.translate(_QUOTES) for w in b]
@@ -7562,10 +9426,12 @@ def _word_diff(before: str, after: str) -> list[dict]:
             rop, rchunk = diffs[i]
             (run_del if rop == -1 else run_ins).extend(orig_a[c] if rop == -1 else orig_b[c] for c in rchunk)
             i += 1
-        # A run of punctuation or spacing alone ("." / "—") is never boxed:
-        # boxes and insertion marks are for missing words.
-        # "&" is a word ("og", "and"), not punctuation: "& (EU)" -> "og (EU)" is a change.
-        if not _TOKEN_RE.search(" ".join(run_del + run_ins).replace("&", "and")):
+        # A run of ordinary punctuation or spacing alone ("." / "—") is never
+        # boxed: boxes and insertion marks are for missing words - but never
+        # for a missing SYMBOL either, which is content, not formatting
+        # (see `_is_trivial_punct`). "&" is a word ("og", "and"), never
+        # punctuation: "& (EU)" -> "og (EU)" is a change.
+        if "&" not in run_del and "&" not in run_ins and _is_trivial_punct(" ".join(run_del + run_ins)):
             if run_del or run_ins:
                 ops.append({"type": "equal", "text": " ".join(run_del or run_ins)})
             continue
@@ -7649,9 +9515,135 @@ def _listing_page(doc: fitz.Document, page_index: int) -> str | None:
         return None
     if _looks_like_qa_index_page(texts):
         return "Q&A index"
-    if sum(1 for t in texts if looks_like_toc_listing(t)) >= _TOC_PAGE_MIN_ENTRIES:
+    # Counted line by line: a contents page can print every entry in one block.
+    lines = [ln.strip() for t in texts for ln in t.splitlines() if ln.strip()]
+    if sum(1 for t in texts if looks_like_toc_listing(t)) >= _TOC_PAGE_MIN_ENTRIES \
+            or sum(1 for ln in lines if looks_like_toc_listing(ln)) >= _TOC_PAGE_MIN_ENTRIES:
         return "Table of contents"
     return None
+
+
+# --- what a PRINTED contents page itself lists ------------------------------
+#
+# `_listing_page` correctly keeps a printed "Table of Contents" page out of
+# every chapter's own span: the two documents paginate differently, so the
+# NUMBER beside every single entry always differs, and comparing the page as
+# ordinary prose would flood the report with false "page number changed"
+# findings. But the page number is not the only thing printed there - the
+# ENTRY NAMES are a real list of sections a reader sees before the manual
+# even starts, and Staging silently gaining or dropping one (a "Disclaimer"
+# entry that only its own copy lists, say) is real content one document
+# promises and the other does not - invisible everywhere else, since the
+# whole page is skipped rather than compared. Checked once for the whole
+# document, page numbers stripped, never inside a normal chapter span.
+
+_TOC_ENTRY_TRAILER_RE = re.compile(r"[.\s]{2,}\d{1,4}\s*$")
+_TOC_ENTRY_SPLIT_RE = re.compile(r"\.{3,}\s*\d{1,4}(?=\s|$)")  # one entry's dot leader and page number
+_TOC_LISTED = 6  # entries shown by name before the rest fold into "N more"
+_TOC_RENAMED_RATIO = 0.9  # two entries this alike are one entry, changed
+
+
+def _toc_page_titles(doc: fitz.Document, page_index: int) -> list[str]:
+    """Every entry name printed on this contents page, its own trailing dot
+    leader and page number stripped, in reading order."""
+    try:
+        blocks = [b[4] for b in doc[page_index].get_text("blocks") if b[4].strip()]
+    except Exception:
+        return []
+    out: list[str] = []
+    for block in blocks:
+        # An entry too long for one line wraps, and only its last line carries
+        # the dot leader and page number: "Download SmartRemoote for BenQ
+        # Projector app to your" / "mobile device.....37" is one entry, not
+        # "mobile device".
+        pending: list[str] = []
+        for line in block.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if not looks_like_toc_listing(line):
+                pending.append(line)
+                continue
+            # One extracted line can hold several entries, each ending in its
+            # own dot leader and page number ("...via LAN.....33 Logging into
+            # ... wireless network.....35").
+            pieces = [p.strip(" .") for p in _TOC_ENTRY_SPLIT_RE.split(line) if p.strip(" .")]
+            for n, piece in enumerate(pieces):
+                title = (" ".join(pending + [piece]) if n == 0 else piece).strip(" .")
+                if title and title.lower() not in ("table of contents", "table of content"):
+                    out.append(title)
+            pending = []
+    return out
+
+
+def printed_toc_changes(expected: fitz.Document, actual: fitz.Document) -> list[dict]:
+    """Every printed contents page's own entries, Production against Staging,
+    across the whole document."""
+    exp_titles: list[str] = []
+    for page_index in range(expected.page_count):
+        if _listing_page(expected, page_index) == "Table of contents":
+            exp_titles.extend(_toc_page_titles(expected, page_index))
+    act_titles: list[str] = []
+    for page_index in range(actual.page_count):
+        if _listing_page(actual, page_index) == "Table of contents":
+            act_titles.extend(_toc_page_titles(actual, page_index))
+    if not exp_titles and not act_titles:
+        return []
+    if not exp_titles or not act_titles:
+        # One side has no printed contents page at all - not a handful of
+        # entries changed, the WHOLE page is new (or gone), reported once.
+        side = "Staging" if exp_titles else "Production"
+        count = len(exp_titles or act_titles)
+        return [{
+            "type": "section-added" if exp_titles else "section-missing", "kind": KIND_TEXT,
+            "summary": (f"Table of contents printed in {'Production' if exp_titles else 'Staging'} only — "
+                        f"{'Staging has' if exp_titles else 'Production has'} no such page at all, "
+                        f"listing {count} entries."),
+            "detail": ", ".join((exp_titles or act_titles)[:_TOC_LISTED]),
+        }]
+    exp_keys = [_normalise(t) for t in exp_titles]
+    act_keys = [_normalise(t) for t in act_titles]
+    gone = [t for t, k in zip(exp_titles, exp_keys) if k not in act_keys]
+    extra = [t for t, k in zip(act_titles, act_keys) if k not in exp_keys]
+    if not gone and not extra:
+        return []
+    out: list[dict] = []
+    # An entry reworded or respelled ("SmartRemoote" -> "SmartRemote") is one
+    # changed entry, not one dropped and another added.
+    renamed: list[tuple[str, str]] = []
+    for t in list(gone):
+        best = max(extra, key=lambda e: _ratio(_normalise(t), _normalise(e)), default=None)
+        if best is not None and _ratio(_normalise(t), _normalise(best)) >= _TOC_RENAMED_RATIO:
+            renamed.append((t, best))
+            gone.remove(t)
+            extra.remove(best)
+    if renamed:
+        shown = "; ".join(f"“{t}” → “{e}”" for t, e in renamed[:_TOC_LISTED])
+        more = f" and {len(renamed) - _TOC_LISTED} more" if len(renamed) > _TOC_LISTED else ""
+        out.append({
+            "type": "text", "kind": KIND_TEXT,
+            "summary": f"Table of contents entry changed in Staging — {shown}{more}.",
+            "detail": "",
+        })
+    if gone:
+        shown = ", ".join(f"“{t}”" for t in gone[:_TOC_LISTED])
+        more = f" and {len(gone) - _TOC_LISTED} more" if len(gone) > _TOC_LISTED else ""
+        out.append({
+            "type": "text", "kind": KIND_TEXT,
+            "summary": (f"Table of contents drops an entry in Staging — Production's printed contents page "
+                        f"lists {shown}{more}, Staging's does not."),
+            "detail": "",
+        })
+    if extra:
+        shown = ", ".join(f"“{t}”" for t in extra[:_TOC_LISTED])
+        more = f" and {len(extra) - _TOC_LISTED} more" if len(extra) > _TOC_LISTED else ""
+        out.append({
+            "type": "text", "kind": KIND_TEXT,
+            "summary": (f"Table of contents adds an entry in Staging — its printed contents page lists "
+                        f"{shown}{more} that Production's does not."),
+            "detail": "",
+        })
+    return out
 
 
 def _top_level(entries: list[TocEntry]) -> int:
@@ -7798,6 +9790,20 @@ def _near_a_figure(el: "Element", figures: list["Element"], reach: float = _ARTW
     return False
 
 
+_TABLE_ROWS_PRINTED = 0.8  # share of an unpaired table's rows the other side must print nearby
+_SQUASHED_PAGES: dict[tuple, str] = {}
+
+
+def _nearby_squashed(doc: fitz.Document, pages: list[int]) -> str:
+    """The text of these pages and two either side, as one run of letters and
+    digits - page references and bracketed cross-references taken out."""
+    want = tuple(sorted({p + d for p in pages for d in range(-2, 3) if 0 <= p + d < doc.page_count}))
+    key = (id(doc), want)
+    if key not in _SQUASHED_PAGES:
+        _SQUASHED_PAGES[key] = "".join(_audit_tokens(" ".join(doc[p].get_text("text") for p in want)))
+    return _SQUASHED_PAGES[key]
+
+
 def _drop_printed_nearby(chapter: "Chapter", expected: fitz.Document, actual: fitz.Document) -> None:
     """A "missing" / "added" finding whose words are printed on the OTHER
     document's own pages RIGHT AROUND WHERE THIS ELEMENT ITSELF SITS is not
@@ -7824,7 +9830,9 @@ def _drop_printed_nearby(chapter: "Chapter", expected: fitz.Document, actual: fi
     def page_words(doc: fitz.Document, pages: list[int], cache: dict[tuple[int, ...], str]) -> str:
         key = tuple(pages)
         if key not in cache:
-            want = sorted({p + d for p in pages for d in (-1, 0, 1) if 0 <= p + d < doc.page_count})
+            # Two pages either way: the page offset between the documents is
+            # one number for the chapter, and drifts by a page or two along it.
+            want = sorted({p + d for p in pages for d in (-2, -1, 0, 1, 2) if 0 <= p + d < doc.page_count})
             cache[key] = " " + " ".join(
                 " ".join(_TOKEN_RE.findall(_normalise(doc[p].get_text("text")))) for p in want
             ) + " "
@@ -7875,6 +9883,25 @@ def _drop_printed_nearby(chapter: "Chapter", expected: fitz.Document, actual: fi
                     # beside a figure, not any missing text on the page.
                     drop = True
                 el = None
+            if el is not None and el.kind == KIND_TABLE and el.cells and not drop:
+                # A table the two documents divide differently (Staging's third
+                # piece holding rows 7-9 of one table and row 20 of another)
+                # pairs with neither piece - yet every row of it is printed
+                # there. Row by row, spacing, page references and section-link
+                # wording aside.
+                own_pages = sorted({p for p, _ in el.boxes}) or [el.page]
+                valid = (chapter.act_pages if lost else chapter.exp_pages) or own_pages
+                target = [min(max(p + (page_offset if lost else -page_offset), valid[0]), valid[-1])
+                          for p in own_pages]
+                other_doc = actual if lost else expected
+                printed = _nearby_squashed(other_doc, target)
+                # Cell by cell: one printed row can hold two tables' rows side
+                # by side ("7. Digital zoom out" beside "20. Projector Assistant").
+                rows = ["".join(_audit_tokens(c)) for row in el.cells for c in row if c]
+                rows = [r for r in rows if len(r) >= 3]
+                if rows and sum(1 for r in rows if r in printed) >= _TABLE_ROWS_PRINTED * len(rows):
+                    drop = True
+                el = None
             if el is not None and el.text:
                 toks = _TOKEN_RE.findall(_normalise(el.text))
                 half = len(toks) // 2
@@ -7892,7 +9919,12 @@ def _drop_printed_nearby(chapter: "Chapter", expected: fitz.Document, actual: fi
                               for p in own_pages]
                     other_doc = actual if lost else expected
                     cache = act_cache if lost else exp_cache
-                    if f" {phrase} " in page_words(other_doc, target, cache):
+                    printed = page_words(other_doc, target, cache)
+                    squashed = phrase.replace(" ", "")
+                    if f" {phrase} " in printed or (
+                            len(squashed) >= _SQUASHED_MIN_CHARS and squashed in printed.replace(" ", "")):
+                        # ... or the same characters spaced or hyphenated
+                        # differently ("Touchback" / "Touch-back").
                         drop = True
                     else:
                         # A single-word phrase is normally too coincidental for
@@ -7985,6 +10017,21 @@ def _ocr_confirms(doc: fitz.Document, pages: list[int], toks: list[str], allow_s
         return False
     want = [w for w in (ocr.normalize_word(t) for t in toks) if w]
     if not want:
+        return False
+    # In order and together, on one page: most of the words merely turning up
+    # somewhere across five pages confirmed any ordinary sentence ("Go to
+    # Wi-Fi menu of the mobile device, and you can find the SSID...") from the
+    # common words of the paragraphs around it, and a sentence Staging really
+    # dropped was reported only as two stray words.
+    pages_seen = sorted({p + d for p in pages for d in range(-2, 3) if 0 <= p + d < doc.page_count})
+    if len(want) > 2:
+        need = max(2, round(0.7 * len(want)))
+        for p in pages_seen:
+            read = [w for w in (ocr.normalize_word(x[4]) for x in _page_words(doc).ocr_words(p)) if w]
+            blocks = [b for b in difflib.SequenceMatcher(a=want, b=read, autojunk=False).get_matching_blocks() if b.size]
+            matched = sum(b.size for b in blocks)
+            if matched >= need and blocks[-1].b + blocks[-1].size - blocks[0].b <= 2 * len(want) + 2:
+                return True
         return False
     seen: set[str] = set()
     # A wider window than the plain-text search above: the cross-document
@@ -8080,8 +10127,41 @@ def _heading_own_bbox(doc: fitz.Document, entry: "TocEntry") -> tuple[float, flo
     return (40.0, entry.y, min(560.0, width - 40.0), entry.y + 18.0)
 
 
+_DOC_TEXT_CACHE: dict = {}
+_TOC_LEADER_RE = re.compile(r"\.{4,}.*$", re.MULTILINE)
+
+
+def _document_squashed_text(doc: fitz.Document) -> str:
+    """The whole document's printed text, lowercased with every space removed,
+    for one question: is this printed here at all? Contents-page listings (the
+    lines with dot leaders) are cut out first - a heading LISTED in the other
+    document's table of contents is not the same as its section being printed
+    there."""
+    key = (id(doc), doc.page_count)
+    if key not in _DOC_TEXT_CACHE:
+        parts = []
+        for i in range(doc.page_count):
+            try:
+                parts.append(_TOC_LEADER_RE.sub("", doc[i].get_text()))
+            except Exception:
+                continue
+        _DOC_TEXT_CACHE[key] = re.sub(r"\s+", "", "\n".join(parts).lower())
+    return _DOC_TEXT_CACHE[key]
+
+
+def _printed_anywhere_in(doc: fitz.Document | None, text: str) -> bool:
+    """`text` is printed somewhere in `doc`, ignoring all spacing - so
+    "2.Connect the S Switch" and "2. Connect the S Switch" are the same words
+    printed, which is the only question a content check asks."""
+    target = re.sub(r"\s+", "", normalize_title(text or ""))
+    if doc is None or len(target) < 8:
+        return False
+    return target in _document_squashed_text(doc)
+
+
 def _section_missing_diffs(
-    entries: list["TocEntry"], span_start: tuple, span_end: tuple | None, doc: fitz.Document, lost: bool
+    entries: list["TocEntry"], span_start: tuple, span_end: tuple | None, doc: fitz.Document, lost: bool,
+    other_doc: fitz.Document | None = None,
 ) -> list[dict]:
     """One finding per heading this side has with no counterpart at all, on
     either side, at any level - not just the L1 chapters `ChapterSpan`
@@ -8095,6 +10175,14 @@ def _section_missing_diffs(
     for entry in entries:
         pos = (entry.page, entry.y)
         if not (pos > span_start and (span_end is None or pos < span_end)):
+            continue
+        # The two sides' outlines need not agree on what deserves a bookmark:
+        # Staging bookmarks every numbered step of an assembly procedure where
+        # Production bookmarks only the chapter around them. An unmatched
+        # heading is a MISSING SECTION only when its words are genuinely not
+        # printed in the other document - otherwise the content is there, laid
+        # out the same, and only the navigation differs.
+        if _printed_anywhere_in(other_doc, entry.title):
             continue
         bbox = _heading_own_bbox(doc, entry)
         el = Element(kind=KIND_HEADING, text=entry.title, key=normalize_title(entry.title), boxes=[(entry.page, bbox)])
@@ -8194,6 +10282,33 @@ def _drop_all_validation(chapter: "Chapter") -> None:
     chapter.differences = []
 
 
+def _placed(el) -> tuple | None:
+    """Where an element prints, for telling two findings on it apart."""
+    if el is None or not getattr(el, "boxes", None):
+        return None
+    return (getattr(el, "key", "") or getattr(el, "text", ""), tuple(sorted({p for p, _ in el.boxes})))
+
+
+def _drop_repeated_findings(chapter: "Chapter", seen: set[tuple]) -> None:
+    """Keep the first of findings with the same type, summary and place,
+    `seen` carrying the keys across chapters; rows' refs follow."""
+    old = chapter.differences
+    kept: list[dict] = []
+    for d in old:
+        key = (d.get("type"), (d.get("summary") or "").casefold(), _placed(d.get("exp")), _placed(d.get("act")))
+        if key not in seen:
+            seen.add(key)
+            kept.append(d)
+    if len(kept) == len(old):
+        return
+    chapter.differences = kept
+    position = {id(d): i for i, d in enumerate(kept)}
+    dropped = {id(d) for d in old if id(d) not in position}
+    for row in getattr(chapter, "rows", []) or []:
+        row["refs"] = [position[id(old[r])] for r in row.get("refs", []) if r < len(old) and id(old[r]) in position]
+        row["differences"] = [d for d in row.get("differences", []) if id(d) not in dropped]
+
+
 def compare_chapters(
     expected: fitz.Document,
     actual: fitz.Document,
@@ -8260,6 +10375,11 @@ def compare_chapters(
         if m.actual_index is not None and m.expected_index is None
         and not is_excluded_heading(act_entries[m.actual_index].title)
     ]
+
+    from pdfval.validators import camelot_tables
+    use_camelot = bool(expected_path and actual_path) and not _VALIDATION_DISABLED and camelot_tables.available()
+    exp_camelot = camelot_tables.extract(expected, expected_path) if use_camelot else []
+    act_camelot = camelot_tables.extract(actual, actual_path) if use_camelot else []
 
     chapters: list[Chapter] = []
     for n, span in enumerate(pairs):
@@ -8337,7 +10457,25 @@ def compare_chapters(
             exp_tables_by_topic[topic] = [e for e in exp_topic if e.kind == KIND_TABLE]
             act_tables_by_topic[topic] = [e for e in act_topic if e.kind == KIND_TABLE]
         repeated: dict[tuple, int] = {}
-        for exp_group, act_group, note, container in chapter.pairs:
+        # Where one-sided content belongs on the other side: just after the
+        # last element there the pairing put before it (in the same topic),
+        # not at the topic's heading.
+        last_exp: Element | None = None
+        last_act: Element | None = None
+        gap_after: dict[int, tuple] = {}
+        for pair_index, (exp_group, act_group, _n, _c) in enumerate(chapter.pairs):
+            topic_here = (exp_group or act_group)[0].section
+            if exp_group and not act_group and last_act is not None and last_act.section == topic_here:
+                page_index, bbox = last_act.boxes[-1]
+                gap_after[pair_index] = ("act", (page_index, bbox[3] + 2))
+            if act_group and not exp_group and last_exp is not None and last_exp.section == topic_here:
+                page_index, bbox = last_exp.boxes[-1]
+                gap_after[pair_index] = ("exp", (page_index, bbox[3] + 2))
+            if exp_group and exp_group[-1].boxes:
+                last_exp = exp_group[-1]
+            if act_group and act_group[-1].boxes:
+                last_act = act_group[-1]
+        for pair_index, (exp_group, act_group, note, container) in enumerate(chapter.pairs):
             group_topic = (exp_group or act_group)[0].section
             exp_words, act_words, exp_units, act_units, exp_keys, act_keys = words[group_topic]
             spare_exp_words, spare_act_words, spare_exp_units, spare_act_units, _, _ = spare_words[group_topic]
@@ -8387,9 +10525,16 @@ def compare_chapters(
                 diffs += marker_changes(exp_group, act_group, expected, actual)
                 diffs += shading_changes(exp_group, act_group, expected, actual,
                                          exp_by_topic.get(topic, []), act_by_topic.get(topic, []))
-                diffs += page_ref_dropped_changes(exp_group, act_group)
+                # Staging dropping a cross-reference's own "on page N" is not
+                # reported: the wording still says where to look, just not
+                # the page number, which is valid.
                 diffs += list_label_layout_changes(exp_group, act_group, expected, actual)
-                diffs += stray_space_changes(exp_group, act_group)
+                # One stray space, one finding: the punctuation check already
+                # names it ("after “location”: extra space in Staging").
+                if not any(d.get("type") in ("punctuation", "symbol")
+                           and "space" in " ".join(d.get("mark_notes") or [d.get("summary", "")])
+                           for d in diffs):
+                    diffs += stray_space_changes(exp_group, act_group)
                 diffs += line_spacing_changes(exp_group, act_group, expected, actual,
                                               exp_by_topic.get(topic, []), act_by_topic.get(topic, []))
                 if not any(e.kind == KIND_TABLE for e in exp_group + act_group):
@@ -8414,6 +10559,9 @@ def compare_chapters(
                 diff.setdefault("exp", merge_elements(exp_group))
                 diff.setdefault("act", merge_elements(act_group))
                 diff.setdefault("section", (exp_group or act_group)[0].section)
+                if pair_index in gap_after:
+                    side, point = gap_after[pair_index]
+                    diff.setdefault(f"{side}_anchor", point)
                 _quote_as_printed(diff, expected, actual)
                 # Staging sets every sub-heading at 13.5pt where Production uses
                 # 16pt: one decision, printed on twenty headings. Reported once,
@@ -8495,7 +10643,15 @@ def compare_chapters(
         ) + bullet_glyph_changes(exp_elements, act_elements):
             if len(chapter.differences) < MAX_ISSUES_PER_CHAPTER:
                 chapter.differences.append(diff)
-        for diff in table_header_repeats(actual, actual_path, act_pages) + list_structure_changes(exp_elements, act_elements, expected, actual):
+        partners: dict[int, list[Element]] = {}
+        for exp_group, act_group, _note, _container in chapter.pairs:
+            if exp_group and act_group:
+                for e in exp_group:
+                    partners[id(e)] = list(act_group)
+                for e in act_group:
+                    partners[id(e)] = list(exp_group)
+        for diff in table_header_repeats(actual, actual_path, act_pages) + list_structure_changes(
+                exp_elements, act_elements, expected, actual, partners=partners):
             if len(chapter.differences) < MAX_ISSUES_PER_CHAPTER:
                 chapter.differences.append(diff)
         exp_links = collect_links(expected, exp_pages, span.exp_span, exp_entries)
@@ -8508,6 +10664,12 @@ def compare_chapters(
         for diff in page_ref_consistency_changes(act_links):
             if len(chapter.differences) < MAX_ISSUES_PER_CHAPTER:
                 chapter.differences.append(diff)
+        for diff in broken_image_changes(actual, act_pages, _section_at(act_anchors)):
+            if len(chapter.differences) < MAX_ISSUES_PER_CHAPTER:
+                chapter.differences.append(diff)
+        for diff in page_ref_in_staging_changes(act_elements, actual):
+            if len(chapter.differences) < MAX_ISSUES_PER_CHAPTER:
+                chapter.differences.append(diff)
         for diff in glyph_render_changes(act_elements, actual):
             if len(chapter.differences) < MAX_ISSUES_PER_CHAPTER:
                 chapter.differences.append(diff)
@@ -8516,15 +10678,94 @@ def compare_chapters(
         _soften_artwork_text(chapter)
         _drop_appearance_only_figures(chapter)
         for diff in (
-            _section_missing_diffs(unmatched_exp_headings, span.exp_span[0], span.exp_span[1], expected, lost=True)
-            + _section_missing_diffs(unmatched_act_headings, span.act_span[0], span.act_span[1], actual, lost=False)
+            _section_missing_diffs(unmatched_exp_headings, span.exp_span[0], span.exp_span[1], expected,
+                                   lost=True, other_doc=actual)
+            + _section_missing_diffs(unmatched_act_headings, span.act_span[0], span.act_span[1], actual,
+                                     lost=False, other_doc=expected)
         ):
             if len(chapter.differences) < MAX_ISSUES_PER_CHAPTER:
                 chapter.differences.append(diff)
+        # Every ruled table read a second time, with Camelot, and compared row
+        # by row - only what no finding above already names is added.
+        exp_span_lines = _span_lines(expected, exp_pages, span.exp_span, exp_body, all_titles, exp_skip)
+        act_span_lines = _span_lines(actual, act_pages, span.act_span, act_body, all_titles, act_skip)
+        if use_camelot:
+            exp_at_, act_at_ = _section_at(exp_anchors), _section_at(act_anchors)
+            printed_bags: dict = {}
+            for side, lines, at_ in (("prod", exp_span_lines, exp_at_), ("stage", act_span_lines, act_at_)):
+                for ln in lines:
+                    printed_bags.setdefault((side, at_(ln["page"], ln["bbox"][1])), Counter()).update(
+                        camelot_tables._norm(ln["text"]).split())
+
+            def printed_of(side: str, topic: str) -> Counter:
+                return printed_bags.get((side, topic), Counter())
+
+            def covered_of(topic: str, _chapter=chapter) -> set[str]:
+                words: set[str] = set()
+                for d in _chapter.differences:
+                    if d.get("section") != topic:
+                        continue
+                    said = " ".join([d.get("summary", ""), str(d.get("detail") or "")]
+                                    + [str(x) for x in (d.get("gone") or []) + (d.get("extra") or [])])
+                    for key in ("exp", "act"):
+                        el = d.get(key)
+                        if el is not None and d.get("type") in ("missing", "added") or (
+                                el is not None and str(d.get("type", "")).startswith("table-")):
+                            said += " " + (getattr(el, "text", "") or "")
+                    words |= set(_TOKEN_RE.findall(_normalise(said)))
+                return words
+            for diff in camelot_tables.table_changes(
+                exp_camelot, act_camelot, span.exp_span, span.act_span,
+                exp_at_, act_at_, Element, KIND_TABLE, covered_of, printed_of,
+            ) + camelot_tables.merge_changes(
+                act_camelot, span.act_span, act_at_, expected, exp_pages, Element, KIND_TABLE,
+            ):
+                if len(chapter.differences) < MAX_ISSUES_PER_CHAPTER:
+                    chapter.differences.append(diff)
+        # Every word of every topic, counted straight off the page on both
+        # sides - the net under every filter above (see `word_audit_changes`).
+        if not _ONLY_TABLE_CHECKS and not _VALIDATION_DISABLED:
+            # Whole blocks first: a repeated or dropped block reported here
+            # is `covered` when the per-word audit below runs, so the same
+            # content is not also listed a second time as loose words.
+            for diff in repeated_block_changes(
+                chapter, exp_span_lines, act_span_lines,
+                _section_at(exp_anchors), _section_at(act_anchors),
+                exp_figs, act_figs, expected, actual,
+            ):
+                if len(chapter.differences) < MAX_ISSUES_PER_CHAPTER:
+                    chapter.differences.append(diff)
+            for diff in word_audit_changes(
+                chapter,
+                exp_span_lines, act_span_lines,
+                _section_at(exp_anchors), _section_at(act_anchors),
+                exp_figs, act_figs, expected, actual,
+            ) + table_icon_layout_changes(
+                exp_span_lines, act_span_lines,
+                _section_at(exp_anchors), _section_at(act_anchors),
+            ):
+                if len(chapter.differences) < MAX_ISSUES_PER_CHAPTER:
+                    chapter.differences.append(diff)
+        # Last: the same content set differently (a table hyphenated into
+        # narrow columns on one side) is not a difference - see
+        # `drop_reflow_noise`.
+        if not _ONLY_TABLE_CHECKS and not _VALIDATION_DISABLED:
+            drop_reflow_noise(chapter, exp_span_lines, act_span_lines,
+                              _section_at(exp_anchors), _section_at(act_anchors))
         if _ONLY_TABLE_CHECKS:
             _keep_table_checks_only(chapter)
         if _VALIDATION_DISABLED:
             _drop_all_validation(chapter)
+        # Font size and text colour are never compared (the user's rule). Nor
+        # is a table's row structure on its own: Production nesting several
+        # items in one cell where Staging rules each into a row of its own is a
+        # different container for the same text. A merged cell Staging splits
+        # leaving an EMPTY cell is still reported (`camelot_tables.merge_changes`).
+        chapter.differences = [d for d in chapter.differences if d.get("type") not in _NEVER_REPORTED
+                               and not (d.get("type") == "table-merge" and not d.get("camelot"))]
+        # The same finding on the same place, raised by two checks (or by one
+        # check over two groups holding the same element), is one finding.
+        _drop_repeated_findings(chapter, set())
         # Severity decides everything downstream: the order the report lists a
         # difference in, whether its box is red or orange, whether it fails.
         for diff in chapter.differences:
@@ -8546,6 +10787,68 @@ def compare_chapters(
         diff["severity"] = severity_of(diff)
         diff["minor"] = diff["severity"] > FAILING_SEVERITY
         chapter.differences.append(diff)
+
+    # A printed "Table of Contents" page is deliberately kept out of every
+    # chapter's own span above (see `_listing_page`) - its own entry list is
+    # still real content a reader sees, so it is checked once here, for the
+    # whole document, and its findings anchored on the first chapter for lack
+    # of any topic of their own.
+    if chapters and not _VALIDATION_DISABLED and not _ONLY_TABLE_CHECKS:
+        for diff in printed_toc_changes(expected, actual):
+            if len(chapters[0].differences) < MAX_ISSUES_PER_CHAPTER:
+                diff["severity"] = severity_of(diff)
+                diff["minor"] = diff["severity"] > FAILING_SEVERITY
+                diff.setdefault("section", "")
+                chapters[0].differences.append(diff)
+    # Every hyperlink finding says where each side's link goes.
+    def _where(label: str) -> str:
+        if not label:
+            return "nowhere (no target)"
+        if label.startswith("section: "):
+            return f"the “{label[len('section: '):]}” section"
+        if label.startswith("page "):
+            return label
+        return label
+    for chapter in chapters:
+        for d in chapter.differences:
+            if not str(d.get("type", "")).startswith("link-") or d.get("_where_added"):
+                continue
+            parts = []
+            for side, key in (("Production", "exp"), ("Staging", "act")):
+                el = d.get(key)
+                if el is not None and getattr(el, "kind", "") == KIND_LINK:
+                    parts.append(f"{side} link goes to {_where(el.label)}")
+            if parts:
+                d["summary"] = d["summary"].rstrip(".") + ". " + "; ".join(parts) + "."
+                d["_where_added"] = True
+    # Every punctuation / symbol finding names the exact marks: which quote,
+    # period or space Staging lacks or adds, and between which words.
+    for chapter in chapters:
+        for d in chapter.differences:
+            if d.get("type") not in ("punctuation", "symbol") or d.get("mark_notes"):
+                continue
+            a_el, b_el = d.get("exp"), d.get("act")
+            if a_el is None or b_el is None or not a_el.text or not b_el.text:
+                continue
+            notes = mark_changes(a_el.text, b_el.text, a_el.wraps, b_el.wraps)
+            if notes:
+                d["mark_notes"] = notes
+                head = "Symbol changed" if d["type"] == "symbol" else "Punctuation or spacing changed"
+                d["summary"] = f"{head} — " + "; ".join(notes[:6]) + (
+                    f"; and {len(notes) - 6} more" if len(notes) > 6 else "") + "."
+    # Text read off a scanned page is an OCR reading, not the text layer:
+    # say so on every finding it produced, after every summary rewrite above.
+    for chapter in chapters:
+        for d in chapter.differences:
+            sides = d.get("ocr_sides")
+            if sides and d.get("summary") and "read by OCR" not in d["summary"]:
+                d["summary"] += (f" (read by OCR from a scanned page in {' and '.join(sides)}"
+                                 f" — recognition errors possible)")
+    # Last: a finding raised twice anywhere (two passes, or two chapters
+    # sharing a page) is one finding.
+    seen_all: set[tuple] = set()
+    for ch in chapters:
+        _drop_repeated_findings(ch, seen_all)
     return chapters
 
 
@@ -8571,21 +10874,22 @@ def compare_chapters(
 SEVERITY_OF = {
     # 1 - what the chapter says, and how its lists are marked
     "text": 1, "missing": 1, "added": 1, "section-missing": 1, "section-added": 1, "note-label": 1, "table-cell": 1,
-    "table-cell-sequence": 1, "text-encoding": 1, "glyph-render": 1,
+    "table-cell-sequence": 1, "text-encoding": 1, "glyph-render": 1, "symbol": 1, "page-ref-in-staging": 1, "paragraph-gap": 1,
     "numbering": 1, "list-marker-missing": 1, "list-marker-added": 1,
     # 2 - hyperlinks
     "link-missing": 2, "link-added": 2, "link-target": 2, "link-broken": 2,
     "link-page-ref-inconsistent": 2, "link-page-ref-dropped": 2,
     # 4 - images
-    "figure-missing": 4, "figure-added": 4, "figure-elsewhere": 4, "figure-different": 4,
+    "figure-missing": 4, "figure-added": 4, "figure-broken": 1, "figure-elsewhere": 4, "figure-different": 4,
     "figure-content": 4, "figure-label-missing": 4, "figure-size": 4, "figure-visual": 4,
     # 5 - emphasis
     "bold-missing": 5, "bold-added": 5, "shading": 5, "marker-size": 5,
     "underline-missing": 5, "underline-added": 5, "line-spacing": 5,
+    "italic-missing": 5, "italic-added": 5,
     "icon-missing": 4, "icon-added": 4, "icon-colour": 4, "icon-changed": 4,
     # 6 - how it is laid out, not what it says - shown, never fails the run
-    "list-indent": 6, "figure-alignment": 6, "text-space": 6, "moved": 6, "figure-wrong-section": 6,
-    "punctuation": 6,
+    "list-indent": 6, "figure-alignment": 6, "text-space": 1, "moved": 6, "figure-wrong-section": 6,
+    "punctuation": 1,
     "list-label-layout": 6, "list-marker-glyph": 6,
     # (table-header-fill is not reported: Staging's header colour is its design.
     # A background gone altogether is: table-fill-missing.)
@@ -8593,10 +10897,17 @@ SEVERITY_OF = {
     "table-shape": 6, "table-merge": 6, "table-header-repeat": 6, "table-cell-layout": 6,
     "table-row-missing": 6, "table-row-added": 6, "table-row-count": 6, "table-columns": 6, "table-as-text": 6,
 }
+_NEVER_REPORTED = {"size", "colour", "color", "marker-size", "font-size", "text-colour",
+                   # Production underlining a menu path or a cross-reference
+                   # that Staging prints plain is expected (user rule).
+                   "underline-missing",
+                   # Staging dropping "on page N" is expected (user rule); one it
+                   # keeps is reported by `page_ref_in_staging_changes` instead.
+                   "link-page-ref-dropped", "link-page-ref-inconsistent"}
 SEVERITY_LABEL = {
     1: "Content & lists", 2: "Hyperlinks", 4: "Images", 5: "Bold", 6: "Layout",
 }
-# Only what is listed above is reported at all. Font size, text colour, italic,
+# Only what is listed above is reported at all. Font size, text colour,
 # capitalisation, punctuation, word order, an element that merely moved, a
 # figure that "may differ", a table header's background colour and a table
 # read with a different grid are deliberately NOT - they are how the two
@@ -8611,6 +10922,10 @@ FAILING_SEVERITY = 5
 
 
 def severity_of(diff: dict) -> int:
+    # A finding that marks itself critical is level 1 whatever its type's usual
+    # tier - it is content-scope, not the cosmetic change the type implies.
+    if diff.get("critical"):
+        return 1
     base = SEVERITY_OF.get(diff.get("type"), 1)
     # A finding `_soften_artwork_text` could not confirm either way (a spec
     # caption plausibly baked into the other side's artwork) is shown, not
@@ -8662,6 +10977,7 @@ _TYPE_CATEGORY = {
     "marker-size": "lists", "list-label-layout": "lists", "list-marker-glyph": "lists",
     "bold-missing": "bold", "bold-added": "bold", "shading": "formatting",
     "underline-missing": "formatting", "underline-added": "formatting", "line-spacing": "formatting",
+    "italic-missing": "formatting", "italic-added": "formatting",
     "icon-missing": "images", "icon-added": "images", "icon-colour": "images", "icon-changed": "images",
     # Tables holds only how cells are merged: what a cell or row SAYS - a
     # changed word, a missing row, a lost space - is content like any other.
@@ -8671,6 +10987,7 @@ _TYPE_CATEGORY = {
     "table-cell-sequence": "content",
     "table-row-missing": "content", "table-row-added": "content", "table-row-count": "content", "table-as-text": "content",
     "text-space": "content", "text-encoding": "content", "punctuation": "content", "glyph-render": "content",
+    "symbol": "content",
     # A figure moved to the wrong section is a sequence/order problem, like a
     # paragraph out of reading order - it reads as content, not as the
     # picture's own look, so it is red like the rest of "moved", not blue.
@@ -8694,14 +11011,14 @@ def category_of(diff: dict) -> str:
 
 
 # Formatting changes that are one styling decision when they repeat.
-_REPEATABLE = {"size", "colour", "emphasis", "capitalisation", "punctuation", "word-order",
+_REPEATABLE = {"size", "colour", "emphasis", "capitalisation", "word-order",
                "table-header-fill", "shading", "list-marker-added", "list-marker-missing",
                "icon-colour", "icon-changed", "icon-missing", "icon-added", "list-label-layout",
                "list-marker-glyph"}
 
 _MINOR_TYPES = {
     "emphasis", "size", "colour", "figure-size", "figure-review", "moved", "table-extract",
-    "punctuation", "capitalisation", "word-order", "marker-size",
+    "capitalisation", "word-order", "marker-size",
 }
 
 

@@ -55,6 +55,32 @@ def validate_pages(
             details["heading"] = heading
         return details
 
+    # A scanned page has no text layer: its words are pixels, and the content
+    # comparison can only reach them through OCR. Say so once per page, so a
+    # reader knows the text findings there are OCR readings - and, when OCR is
+    # not installed, that the page's text was not compared at all.
+    from pdfval import ocr
+    ocr_ok = ocr.available()
+    for doc, side, name, entries in (
+        (expected, "prod", "Production", exp_entries), (actual, "stage", "Staging", act_entries),
+    ):
+        for i in ocr.scanned_pages(doc):
+            details = _page_shot(doc, i, side, entries)
+            details.pop("prod_screenshot_note" if side == "stage" else "stage_screenshot_note", None)
+            details["side"] = name
+            result.issues.append(
+                Issue(
+                    severity="warning" if ocr_ok else "error", page=i,
+                    message=(
+                        f"Scanned page {i + 1} in {name} — no text layer; content compared using OCR"
+                        if ocr_ok else
+                        f"Scanned page {i + 1} in {name} — no text layer and OCR is not installed; "
+                        f"its text could not be compared"
+                    ),
+                    details=details,
+                )
+            )
+
     if act_n < exp_n:
         for i in range(act_n, exp_n):
             result.issues.append(

@@ -32,15 +32,38 @@ CAPTION_PROMPT = (
     "layout. Be specific and factual, in 3-6 short sentences."
 )
 
+# The same rules the deterministic checks work to, said in words the model can
+# follow. Without them the AI reports exactly the false differences those checks
+# were taught not to: a line that wraps in a different place, a page that
+# paginates differently, a list number set tight against its word, a callout
+# number one export draws and the other sets as text. What it is being asked is
+# the same question the content check asks - is the content there or not.
+_RULES = (
+    "These two pages are the same page of the same manual, re-exported. They are "
+    "TYPESET differently on purpose, so ignore every difference that is only "
+    "typesetting:\n"
+    "- text wrapping onto a different line, or a paragraph breaking in another place;\n"
+    "- the same content sitting a little higher or lower, or the page being a "
+    "different length;\n"
+    "- a list number or bullet drawn tighter or looser against its text, or a "
+    "different bullet glyph;\n"
+    "- a number printed on a diagram in one and inside the picture in the other;\n"
+    "- fonts, sizes and margins that only differ slightly.\n"
+    "Report ONLY content that is genuinely present in one page and absent from the "
+    "other, or genuinely changed: a picture, icon, table, row or block of text that "
+    "is missing or extra, a picture that shows something else, a colour that changed."
+)
+
 DIFF_PROMPT = (
     "Here are two descriptions of the same page from two versions of a document.\n\n"
     "PRODUCTION (baseline):\n{prod}\n\n"
     "STAGING (candidate):\n{stage}\n\n"
-    "List only the VISUAL differences a reader would notice between them - a missing or "
-    "extra picture, an icon or colour that changed, something moved, resized or "
-    "misaligned, a missing table or list marker. Ignore differences that are only in how "
-    "the description is worded. Answer in short bullet points, no more than 5. If there "
-    "is no real difference, answer exactly: No visual differences."
+    + _RULES + "\n"
+    "Ignore differences that are only in how the two descriptions are worded - if "
+    "both descriptions could be describing the same page, there is no difference. "
+    "Answer in short bullet points, no more than 5, each naming what is missing, "
+    "extra or changed. If there is no real difference, answer exactly: "
+    "No visual differences."
 )
 _NO_DIFF = "no visual differences"
 
@@ -111,20 +134,61 @@ def _diff(prod_caption: str, stage_caption: str) -> str:
     })
 
 
-def review_pages(pdfview_dir: str, page_count: int, progress_cb=None) -> list[dict]:
+def page_pairs(anchors: list[dict] | None, prod_pages: int, stage_pages: int) -> list[tuple[int, int]]:
+    """Which Staging page to compare each Production page against, 1-based.
+
+    Page 1 against page 1 is only right while the two documents paginate
+    alike. They rarely do - this pair is 59 pages against 52 - and from the
+    first inserted page onwards the AI was being shown two unrelated pages and
+    asked what differed, which is a machine for producing false findings. The
+    scroll-sync waypoints already say where the same content sits on both
+    sides (matched headings, tables and paragraphs); the page mapping follows
+    them, interpolating in between and falling back to page-for-page only when
+    there are no waypoints at all.
+    """
+    placed = sorted(
+        {(h["prod"]["page"], h["stage"]["page"]) for h in (anchors or []) if h.get("stage")}
+    )
+    if not placed:
+        return [(i, i) for i in range(1, min(prod_pages, stage_pages) + 1)]
+    out: list[tuple[int, int]] = []
+    for prod in range(1, prod_pages + 1):
+        before = [p for p in placed if p[0] <= prod]
+        after = [p for p in placed if p[0] > prod]
+        if before and after:
+            (p0, s0), (p1, s1) = before[-1], after[0]
+            stage = s0 + round((prod - p0) * (s1 - s0) / max(1, p1 - p0))
+        elif before:
+            p0, s0 = before[-1]
+            stage = s0 + (prod - p0)
+        else:
+            p1, s1 = after[0]
+            stage = s1 - (p1 - prod)
+        if 1 <= stage <= stage_pages:
+            out.append((prod, stage))
+    return out
+
+
+def review_pages(pdfview_dir: str, page_count: int, progress_cb=None,
+                 pairs: list[tuple[int, int]] | None = None) -> list[dict]:
     """One entry per page pair the model found something to say about:
     [{"page": n, "note": text}]. A page whose images are missing, whose
     request errors, or that comes back reporting no difference is skipped -
-    never raised, so one bad page cannot fail the whole review."""
+    never raised, so one bad page cannot fail the whole review.
+
+    `pairs` says which Staging page each Production page is compared against
+    (see `page_pairs`); without it the two are paired page for page, which is
+    only right when both documents paginate alike."""
+    pairs = pairs or [(i, i) for i in range(1, page_count + 1)]
     out: list[dict] = []
-    for i in range(1, page_count + 1):
+    for n, (i, j) in enumerate(pairs, start=1):
         prod_image = os.path.join(pdfview_dir, f"prod_p{i}.png")
-        stage_image = os.path.join(pdfview_dir, f"stage_p{i}.png")
+        stage_image = os.path.join(pdfview_dir, f"stage_p{j}.png")
         if not (os.path.isfile(prod_image) and os.path.isfile(stage_image)):
             continue
         if progress_cb:
             try:
-                progress_cb(i, page_count)
+                progress_cb(n, len(pairs))
             except Exception:
                 pass
         try:
@@ -140,5 +204,8 @@ def review_pages(pdfview_dir: str, page_count: int, progress_cb=None) -> list[di
         except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
             continue
         if note and _NO_DIFF not in note.lower():
-            out.append({"page": i, "note": note})
+            # Both page numbers: a reader checking the note needs to know
+            # which Staging page it was actually compared against, which is
+            # not "the same number" once the two paginate differently.
+            out.append({"page": i, "stage_page": j, "note": note})
     return out

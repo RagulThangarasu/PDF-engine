@@ -379,6 +379,11 @@ def get_figures(doc: fitz.Document, page_index: int, print_ready: bool = False) 
         # table) - that picture is a small fraction of the table's own area, not
         # a vector tracing of the table's ruling, so it is only dropped here
         # when the figure itself accounts for most of the table(s) it sits in.
+        # A row's or cell's own shading and rules - a handful of shapes lying
+        # inside a table - are the table, however small a share of it they
+        # are: Staging's grey-banded rows each traced as a "figure beside 50".
+        if fig.primitives <= _TABLE_TRACE_MAX_PRIMITIVES and _covered_fraction(fig.bbox, table_bboxes) > 0.9:
+            continue
         if _covered_fraction(fig.bbox, table_bboxes) > 0.6:
             covering = [b for b in table_bboxes if _overlap_fraction(fig.bbox, b) > 0.05]
             table_area = sum((b[2] - b[0]) * (b[3] - b[1]) for b in covering)
@@ -556,6 +561,78 @@ def _strip_blank_edge_columns(rows: list, cells: list) -> tuple[list, list]:
     return new_rows, new_cells
 
 
+def _rows_by_whole_words(page, table, cells: list) -> list | None:
+    """The table's cell text with every word kept whole, in the cell holding
+    the word's centre - or None when no word crosses a column rule and
+    pdfplumber's own reading stands.
+
+    pdfplumber files each CHARACTER by its own centre, so a column rule drawn
+    a few points inside the text it separates cuts words in two: Production's
+    remote-control table rules its columns at x=253 while "Microphone" starts
+    at x=248, and read "10. M" / "icrophone & remote control", "6. Di" /
+    "gital zoom in" - words no other copy of the table prints."""
+    try:
+        x0, top, x1, bottom = table.bbox
+        words = page.crop((x0, top, x1, bottom)).extract_words(keep_blank_chars=False, use_text_flow=False)
+    except Exception:
+        return None
+    edges = sorted({round(c[0], 1) for row in cells for c in row if c} | {round(c[2], 1) for row in cells for c in row if c})
+    inner = [e for e in edges if x0 + 1 < e < x1 - 1]
+    if not any(w["x0"] < e - 0.5 and w["x1"] > e + 0.5 for w in words for e in inner):
+        return None
+    def lines_of(ws: list) -> str:
+        ws = sorted(ws, key=lambda w: (round(w["top"]), w["x0"]))
+        lines: list[list] = []
+        for w in ws:
+            if lines and abs(w["top"] - lines[-1][0]["top"]) <= 2:
+                lines[-1].append(w)
+            else:
+                lines.append([w])
+        return "\n".join(" ".join(w["text"] for w in sorted(ln, key=lambda w: w["x0"])) for ln in lines)
+
+    rows: list[list] = []
+    for row in cells:
+        live = [c for c in row if c]
+        if not live:
+            rows.append([None] * len(row))
+            continue
+        top, bottom = min(c[1] for c in live), max(c[3] for c in live)
+        in_row = [w for w in words if top <= (w["top"] + w["bottom"]) / 2 < bottom]
+        placed: dict[int, list] = {k: [] for k, c in enumerate(row) if c}
+        for w in in_row:
+            mid = (w["x0"] + w["x1"]) / 2
+            home = next((k for k, c in enumerate(row) if c and c[0] <= mid < c[2]), None)
+            if home is None:
+                continue
+            nxt = next((k for k in range(home + 1, len(row)) if row[k]), None)
+            if nxt is not None and w["x1"] > row[nxt][0] + 0.5:
+                # A word crossing into the next column after another word of
+                # its line ("4." then "OK") is the next column's text, printed
+                # a little left of its rule.
+                if any(o is not w and abs(o["top"] - w["top"]) <= 2 and o["x1"] <= w["x0"] for o in in_row):
+                    home = nxt
+            placed[home].append(w)
+        rows.append([lines_of(placed[k]) if c else None for k, c in enumerate(row)])
+    return rows
+
+
+def _drop_repeated_below(rows: list) -> list:
+    """A cell whose text ends with the whole text of the cell right below it
+    in the same column loses that tail: beside a label merged over two rows,
+    pdfplumber sizes the first value cell over both rows and reads the second
+    row's line twice ("Operating... Storage..." above "Storage...")."""
+    rows = [list(r) if r is not None else r for r in rows]
+    for i in range(len(rows) - 1):
+        above, below = rows[i], rows[i + 1]
+        if not above or not below:
+            continue
+        for k in range(min(len(above), len(below))):
+            a, b = (above[k] or "").rstrip(), (below[k] or "").strip()
+            if b and a != b and a.endswith(b):
+                above[k] = a[: -len(b)].rstrip()
+    return rows
+
+
 class _PageTableCache:
     """pdfplumber has to parse the whole document to open it, so calling
     `pdfplumber.open` once per page - which the validators do, repeatedly, for
@@ -583,9 +660,10 @@ class _PageTableCache:
             else:
                 found = []
                 try:
-                    for t in pdf.pages[page_index].find_tables():
-                        rows = t.extract()
+                    page = pdf.pages[page_index]
+                    for t in page.find_tables():
                         cells = [list(row.cells) for row in t.rows]
+                        rows = _drop_repeated_below(_rows_by_whole_words(page, t, cells) or t.extract())
                         rows, cells = _strip_blank_edge_columns(rows, cells)
                         found.append(
                             {

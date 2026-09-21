@@ -657,6 +657,10 @@ def _check_list_markers(
 _MARKER_SIZE_RATIO = 0.15
 
 
+# Font size is not compared anywhere - marker glyphs included.
+_CHECK_MARKER_SIZE = False
+
+
 def _marker_size_changed(exp_it: dict, act_it: dict) -> bool:
     exp_size, act_size = exp_it.get("marker_size"), act_it.get("marker_size")
     if not exp_size or not act_size:
@@ -712,6 +716,7 @@ def _check_marker_size(
             _list_items(exp_lines, exp_blocks), _list_items(act_lines, act_blocks)
         )
         if exp_it["kind"] == act_it["kind"] and _marker_size_changed(exp_it, act_it)
+        and _CHECK_MARKER_SIZE
     ]
     for run in _size_runs(pairs):
         if not _budget(counts, "marker_size"):
