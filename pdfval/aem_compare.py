@@ -217,6 +217,7 @@ def pdf_sections(pdf_path: str) -> list[dict]:
     out = []
     for entry, start, stop in spans:
         text, notes, items, tables = [], 0, 0, []
+        raw_blocks: list[str] = []
         for page in range(start[0], min(stop[0] + 1, doc.page_count)):
             try:
                 blocks = doc[page].get_text("dict").get("blocks", [])
@@ -228,12 +229,22 @@ def pdf_sections(pdf_path: str) -> list[dict]:
                     continue
                 if page == stop[0] and y > stop[1]:
                     continue
+                # One BLOCK is one paragraph. Its lines are joined: a sentence
+                # wrapped over three lines is one sentence, not three
+                # fragments, and a sentence never runs on into the paragraph
+                # below it either.
+                block_lines = []
                 for line in b.get("lines", []):
                     line_text = "".join(s.get("text", "") for s in line.get("spans", []))
                     if line_text.strip():
                         text.append(line_text)
+                        block_lines.append(line_text)
                         if _MARKER_LINE.match(line_text.strip()):
                             items += 1
+                joined_block = clean(" ".join(block_lines))
+                if joined_block and not _TOC_LEADER.match(joined_block) \
+                        and not _PAGE_NUMBER.match(joined_block):
+                    raw_blocks.append(joined_block)
         try:
             tables = [t.row_count for p in range(start[0], min(stop[0] + 1, doc.page_count))
                       for t in doc[p].find_tables().tables]
@@ -242,14 +253,17 @@ def pdf_sections(pdf_path: str) -> list[dict]:
         # The heading itself and the page number printed at the top of the page
         # are furniture, not the section's words - left in, every section
         # opens with a red mark for its own title.
-        lines = [ln for ln in text if not _TOC_LEADER.match(ln.strip())]
+        lines = [ln for ln in text
+                 if not _TOC_LEADER.match(ln.strip()) and not _PAGE_NUMBER.match(ln.strip())]
         while lines and (lines[0].strip().isdigit()
                          or _key(lines[0]) == _key(entry.title)
                          or _key(lines[0]).startswith(_key(entry.title)[:24])):
             lines.pop(0)
         joined = clean(" ".join(lines))
+        blocks = raw_blocks
         notes = len(_NOTE_LABEL.findall(joined))
         out.append({"title": entry.title, "page": entry.page + 1, "text": joined,
+                    "blocks": blocks,
                     "level": entry.level, "start": start, "stop": stop,
                     "notes": notes, "list_items": items, "tables": tables})
     return out
@@ -269,6 +283,9 @@ _BULLETS = re.compile("[\u2022\u25cf\u25aa\u25e6\u2023\u2043]")
 # pages carry no bookmark of their own, so they fall inside whichever section
 # precedes them and read as content that topic failed to write.
 _TOC_LEADER = re.compile(r"^.*\.{4,}.*$", re.MULTILINE)
+# The page number printed at the foot of every page, and the date stamp beside
+# it, belong to the template, not to any section.
+_PAGE_NUMBER = re.compile(r"^\d{1,3}$|^\d{4}/\d{2}/\d{2}$")
 
 
 def clean(text: str) -> str:
@@ -354,24 +371,74 @@ def _words(text: str):
     return Counter(w.casefold() for w in _WORD_RE.findall(text or "") if len(w) >= _MIN_WORD)
 
 
-def only_in(mine: str, theirs: str) -> list:
-    """Every word `mine` prints more often than `theirs` does - all of them.
+# A difference is a SENTENCE one side prints and the other does not - not a
+# word one side prints more often. Counting words said "and" appears 48 times
+# in the PDF and 42 in the topic, and called the other six a gap: 108 of 203
+# "differences" on one chapter were words BOTH sides print. A reviewer cannot
+# act on that, and worse, the real gaps are buried in it.
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?:])\s+(?=[A-Z\u00c0-\u024f])|\s{2,}")
+_MIN_SENTENCE_WORDS = 4     # shorter runs are labels and fragments, not content
+_SAME_SENTENCE = 0.80       # two sentences this alike are the same sentence
 
-    The report names them all. A clipped list ("and 109 more") cannot be
-    checked against anything, which is the one thing a reviewer has to do
-    with it.
+
+def sentences(text, blocks: list | None = None) -> list:
+    """The text as sentences, short fragments dropped.
+
+    Wrapping, hyphens and bullet glyphs are already closed up by `clean`, so
+    a sentence reads the same whichever side it came from. Given `blocks`,
+    each one is split on its own - a sentence never runs from the end of a
+    paragraph into the heading below it.
     """
-    a, b = _words(mine), _words(theirs)
-    return sorted(w for w, n in a.items() if n > b.get(w, 0))
+    out = []
+    source = blocks if blocks else [text]
+    for chunk in source:
+        out += _split_one(chunk)
+    return out
+
+
+def _split_one(text: str) -> list:
+    out = []
+    for piece in _SENTENCE_SPLIT.split(clean(text) or ""):
+        piece = piece.strip()
+        if len(_WORD_RE.findall(piece)) >= _MIN_SENTENCE_WORDS:
+            out.append(piece)
+    return out
+
+
+def _sentence_key(text: str) -> str:
+    return " ".join(w.casefold() for w in _WORD_RE.findall(text or ""))
+
+
+def only_in(mine, theirs, mine_blocks=None, theirs_blocks=None) -> list:
+    """Sentences `mine` has that `theirs` does not print anywhere.
+
+    Matched against EVERY sentence on the other side, not the one opposite
+    it: the two documents order and chunk their content differently, and a
+    paragraph that moved is not a paragraph lost.
+    """
+    theirs_keys = [_sentence_key(x) for x in sentences(theirs, theirs_blocks)]
+    theirs_blob = " ".join(theirs_keys)
+    out = []
+    for sentence in sentences(mine, mine_blocks):
+        key = _sentence_key(sentence)
+        if not key:
+            continue
+        if key in theirs_blob:                      # printed verbatim somewhere
+            continue
+        best = max((difflib.SequenceMatcher(None, key, k).ratio() for k in theirs_keys),
+                   default=0.0)
+        if best < _SAME_SENTENCE:
+            out.append(sentence)
+    return out
 
 
 def _only_in(mine: str, theirs: str) -> str:
-    """The same words as one sentence, for the finding's headline."""
-    words = only_in(mine, theirs)
-    if not words:
+    """The same gaps as one sentence, for the finding's headline."""
+    found = only_in(mine, theirs)
+    if not found:
         return ""
-    shown = ", ".join(f"“{w}”" for w in words[:WORDS_SHOWN])
-    return shown + (f" and {len(words) - WORDS_SHOWN} more" if len(words) > WORDS_SHOWN else "")
+    shown = "; ".join(f"\u201c{_clip(x, 70)}\u201d" for x in found[:3])
+    return shown + (f" and {len(found) - 3} more" if len(found) > 3 else "")
 
 
 def _covers(outer: dict, inner: dict) -> bool:
@@ -384,9 +451,18 @@ def _covers(outer: dict, inner: dict) -> bool:
 _PDF_PATH = [""]   # the PDF the sections came from, for the style comparison
 
 
+def _all_topic_text(topics: list) -> str:
+    """Every topic's words as one blob, for the question "does the map carry
+    this anywhere at all?". A paragraph the PDF prints under one heading and
+    a topic carries under another has MOVED, not gone - and the two sides
+    chunk their chapters differently by design."""
+    return " ".join(_sentence_key(t.text) for t in topics)
+
+
 def compare(topics: list, sections: list, pdf_path: str = "") -> list[dict]:
     """Every difference between the topics and the PDF built from them."""
     _PDF_PATH[0] = pdf_path or _PDF_PATH[0]
+    everywhere = _all_topic_text(topics)
     out: list[dict] = []
     pairs = match(topics, sections)
     matched = [sec for topic, sec in pairs if topic is not None and sec is not None]
@@ -409,9 +485,14 @@ def compare(topics: list, sections: list, pdf_path: str = "") -> list[dict]:
                         "detail": (f"The PDF prints “{sec['title']}” on page {sec['page']}, and no "
                                    f"topic in the map carries that heading.")})
             continue
-        missing_words = only_in(sec["text"], topic.text)
-        extra_words = only_in(topic.text, sec["text"])
-        missing, extra = _only_in(sec["text"], topic.text), _only_in(topic.text, sec["text"])
+        blocks = sec.get("blocks")
+        missing_words = [x for x in only_in(sec["text"], topic.text, blocks, None)
+                         if _sentence_key(x) not in everywhere]
+        extra_words = only_in(topic.text, sec["text"], None, blocks)
+        missing = "; ".join(f"\u201c{_clip(x, 70)}\u201d" for x in missing_words[:3]) + (
+            f" and {len(missing_words) - 3} more" if len(missing_words) > 3 else "")
+        extra = "; ".join(f"\u201c{_clip(x, 70)}\u201d" for x in extra_words[:3]) + (
+            f" and {len(extra_words) - 3} more" if len(extra_words) > 3 else "")
         if missing or extra:
             topic_parts, pdf_parts = diff_parts(topic.text, sec["text"])
             said = []
