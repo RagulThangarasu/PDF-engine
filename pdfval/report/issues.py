@@ -308,13 +308,14 @@ def _marker_box(doc: fitz.Document, point: tuple, note: str) -> dict | None:
         rect = doc[page_index].rect
     except Exception:
         return None
-    # In the MARGIN, below the anchor line. Drawn where the anchor itself
-    # points, a 90pt-wide pin landed square on the section's heading, which
-    # reads as "this heading is wrong" - the one thing it does not mean. A
-    # thin tab clear of the text column says "the content belongs along here"
-    # without marking any words as changed.
-    x0 = rect.x0 + 8
-    x1 = min(rect.x1 - 8, x0 + 12)
+    # At the start of the text column, below the anchor line - never in the
+    # page margin, and never over the heading the anchor points at. The pin is
+    # not drawn on the page at all (see `.box.pin` in pdf_template.html): it
+    # exists so the comment beside the page has a place to draw its line to,
+    # and that line must land where a line of text would begin, not out in the
+    # blank margin beside it.
+    x0 = rect.x0 + 36
+    x1 = min(rect.x1 - 8, x0 + 2)
     y0 = min(max(rect.y0, y + _MARKER_DROP), max(rect.y0, rect.y1 - 18))
     return {"page": page_index + 1, "bbox": [round(x0, 2), round(y0, 2), round(x1, 2), round(y0 + 18, 2)],
             "note": note, "marker": True}

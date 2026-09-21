@@ -1336,6 +1336,15 @@ def build_toc_report(expected: fitz.Document, actual: fitz.Document) -> dict:
     rows: list[dict] = []
     counts = {"matched": 0, "missing": 0, "extra": 0, "level_changed": 0, "page_shifted": 0}
 
+    def side(entry) -> dict | None:
+        """One document's own view of a heading - its title, its OWN nesting
+        level and its OWN page - so the two structures can be printed beside
+        each other exactly as each document has them, rather than merged into
+        one list that belongs to neither."""
+        if entry is None:
+            return None
+        return {"title": entry.title, "level": entry.level, "page": entry.page + 1}
+
     for m in matches:
         if m.expected_index is not None and m.actual_index is not None:
             e, a = exp_entries[m.expected_index], act_entries[m.actual_index]
@@ -1351,8 +1360,18 @@ def build_toc_report(expected: fitz.Document, actual: fitz.Document) -> dict:
                 notes.append(f"nesting level {e.level} → {a.level}")
             if page_delta != 0:
                 notes.append(f"page {e.page + 1} → {a.page + 1} ({page_delta:+d})")
+            # "Matching" is about the STRUCTURE the two tables of contents
+            # describe - the same heading at the same nesting level. A page
+            # number that moved is not a structural difference: the documents
+            # paginate differently by design, and calling that "not matching"
+            # would mark nearly every heading in a repaginated manual.
             rows.append({
                 "heading": e.title,
+                "prod": side(e),
+                "stage": side(a),
+                "match": not level_changed,
+                "reason": (f"nesting level L{e.level} in Production, L{a.level} in Staging"
+                           if level_changed else ""),
                 "expected_level": e.level,
                 "actual_level": a.level,
                 "expected_page": e.page + 1,
@@ -1367,6 +1386,10 @@ def build_toc_report(expected: fitz.Document, actual: fitz.Document) -> dict:
             counts["missing"] += 1
             rows.append({
                 "heading": e.title,
+                "prod": side(e),
+                "stage": None,
+                "match": False,
+                "reason": "not in Staging's table of contents",
                 "expected_level": e.level,
                 "actual_level": None,
                 "expected_page": e.page + 1,
@@ -1381,6 +1404,10 @@ def build_toc_report(expected: fitz.Document, actual: fitz.Document) -> dict:
             counts["extra"] += 1
             rows.append({
                 "heading": a.title,
+                "prod": None,
+                "stage": side(a),
+                "match": False,
+                "reason": "not in Production's table of contents",
                 "expected_level": None,
                 "actual_level": a.level,
                 "expected_page": None,
@@ -1397,5 +1424,12 @@ def build_toc_report(expected: fitz.Document, actual: fitz.Document) -> dict:
         "expected_headings": sum(1 for e in exp_entries if not e.excluded),
         "actual_headings": sum(1 for e in act_entries if not e.excluded),
         "counts": counts,
+        # How many headings line up structurally, said once for the page head.
+        "matching": sum(1 for r in rows if r["match"]),
+        "not_matching": sum(1 for r in rows if not r["match"]),
+        # The deepest level either document nests to, so the page can show a
+        # column per level it actually uses rather than a fixed L1-L3.
+        "max_level": max([r["prod"]["level"] for r in rows if r["prod"]]
+                         + [r["stage"]["level"] for r in rows if r["stage"]] + [1]),
         "rows": rows,
     }

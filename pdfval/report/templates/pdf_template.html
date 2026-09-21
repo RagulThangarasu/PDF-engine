@@ -176,6 +176,13 @@
   .box.ghost { border-color: transparent; opacity: 1; box-shadow: none; }
   .box.ghost:hover, .box.ghost.hover { border-color: transparent; box-shadow: none; }
   .box.ghost.on { border: 2px dashed #c0392b; box-shadow: none; }
+  /* A PIN (`_marker_box`) is never drawn, in any state. It marks roughly where
+     content that is only in the OTHER document would belong - there is nothing
+     on this page at that spot, so any box there outlines innocent text, or
+     blank margin, and reads as "this is wrong". It exists only so the comment
+     beside the page has something to draw its line to. */
+  .box.pin, .box.pin.on, .box.pin:hover, .box.pin.hover {
+    border-color: transparent; background: none; box-shadow: none; }
   /* Only text that is missing or extra gets a highlight, and it is always
      red; every other finding is an outline with no background at all. */
   .box.fill { border-width: 1px; border-color: #c0392b; background: rgba(192, 57, 43, .30); }
@@ -398,7 +405,7 @@ function buildPane(side, pages) {
       // A synthetic marker (`_marker_box`) is a PIN at roughly where the
       // content belongs - there is nothing wrong with the text it lands on,
       // usually the topic's heading, so it is never tinted like changed words.
-      const box = el('div', 'box ' + (imageIssue ? 'imgbox ' : boxed || bigBox || absentHere || b.marker ? 'ghost ' : 'fill ') + 'cat-' + it.category + (it.minor ? ' minor' : '') + (it.critical ? ' critical' : '') + (it.noise ? ' noise-' + it.noise : ''));
+      const box = el('div', 'box ' + (b.marker ? 'pin ' : imageIssue ? 'imgbox ' : boxed || bigBox || absentHere ? 'ghost ' : 'fill ') + 'cat-' + it.category + (it.minor ? ' minor' : '') + (it.critical ? ' critical' : '') + (it.noise ? ' noise-' + it.noise : ''));
       box.style.left = ((x0 - pad) / pg.w * 100) + '%';
       box.style.top = ((y0 - pad) / pg.h * 100) + '%';
       box.style.width = ((x1 - x0 + 2 * pad) / pg.w * 100) + '%';
