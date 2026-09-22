@@ -9,3 +9,4 @@ sample/*.pdf
 .playwright-mcp/
 /sec18_*.png
 /sections_sec*.png
+js-engine/node_modules/

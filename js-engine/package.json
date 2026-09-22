@@ -1,0 +1,10 @@
+{
+  "name": "pdfval-js",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "PDF-to-PDF comparison engine in JavaScript. Runs on its own, no Python.",
+  "bin": { "pdfval-js": "./compare.mjs" },
+  "scripts": { "compare": "node compare.mjs" },
+  "dependencies": { "pdfjs-dist": "^4.10.38" }
+}
