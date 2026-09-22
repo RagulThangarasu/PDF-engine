@@ -78,11 +78,16 @@ comparison, and open the side-by-side report.
 python -m pdfval.web
 ```
 
-Then open http://127.0.0.1:5000, upload both PDFs, and click **Run Comparison**.
+Then open http://127.0.0.1:5001, upload both PDFs, and click **Run Comparison**.
+
+> Port 5001, not 5000: macOS runs AirPlay Receiver on port 5000, which answers
+> HTTP requests with `403 Access denied`. The server refuses to start on a port
+> something else already owns, and says so, rather than leaving you with a 403
+> from a stranger.
 The results page shows a pass/fail summary per check plus download buttons for
 the HTML, PDF and JSON reports. Each run is stored under `runs/<run_id>/`.
 
 ```
-python -m pdfval.web [--host 127.0.0.1] [--port 5000] [--debug]
+python -m pdfval.web [--host 127.0.0.1] [--port 5001] [--debug]
 ```
 
